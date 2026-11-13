@@ -1,9 +1,11 @@
+from contextlib import contextmanager
 import json
 import math
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Iterator
 
 DB_PATH = Path(__file__).parent / "youtube_personal.db"
 
@@ -38,18 +40,25 @@ def classify_region(title: str, handle: str = "", country: str = "", default_lan
     return "Belum diketahui"
 
 
-def get_conn() -> sqlite3.Connection:
-    # ponytail: sqlite connection per request with WAL, sufficient for personal single-user app
+@contextmanager
+def get_conn() -> Iterator[sqlite3.Connection]:
+    # Close connection reliably on context exit to prevent fd/lock retention.
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def duration_to_seconds(dur_str: str) -> int:
     if not dur_str:
         return 0
-    parts = [int(p) for p in dur_str.split(":") if p.isdigit()]
+    parts = [int(p.strip()) for p in dur_str.split(":") if p.strip().isdigit()]
     if len(parts) == 3:
         return parts[0] * 3600 + parts[1] * 60 + parts[2]
     if len(parts) == 2:
@@ -61,6 +70,7 @@ def duration_to_seconds(dur_str: str) -> int:
 
 def init_db() -> None:
     with get_conn() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -202,24 +212,32 @@ def upsert_channel(
                     handle=CASE WHEN excluded.handle != '' THEN excluded.handle ELSE channels.handle END,
                     thumbnail_url=CASE WHEN excluded.thumbnail_url != '' THEN excluded.thumbnail_url ELSE channels.thumbnail_url END,
                     uploads_playlist_id=excluded.uploads_playlist_id,
-                    region=CASE WHEN channels.region IS NULL OR channels.region = '' THEN excluded.region ELSE channels.region END
+                    region=CASE WHEN channels.region IS NULL OR channels.region = '' OR channels.region = 'Belum diketahui' THEN excluded.region ELSE channels.region END
                 """,
                 (channel_id, title, handle, thumbnail_url, uploads_playlist_id, source, now_iso, region, status, now_iso),
             )
 
 
+def _read_unsub_map(conn: sqlite3.Connection) -> dict:
+    row = conn.execute("SELECT value FROM settings WHERE key = 'unsubscribed_map_json'").fetchone()
+    if not row:
+        return {}
+    try:
+        parsed = json.loads(row["value"])
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
 def delete_channel(channel_id: str) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
-    raw = get_setting("unsubscribed_map_json", "{}")
-    try:
-        unsub_map = json.loads(raw)
-        if not isinstance(unsub_map, dict):
-            unsub_map = {}
-    except Exception:
-        unsub_map = {}
-    unsub_map[channel_id] = now_iso
-    set_setting("unsubscribed_map_json", json.dumps(unsub_map))
     with get_conn() as conn:
+        unsub_map = _read_unsub_map(conn)
+        unsub_map[channel_id] = now_iso
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('unsubscribed_map_json', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (json.dumps(unsub_map),),
+        )
         conn.execute("DELETE FROM videos WHERE channel_id = ?", (channel_id,))
         row = conn.execute("SELECT channel_id FROM channels WHERE channel_id = ?", (channel_id,)).fetchone()
         if row:
@@ -239,15 +257,14 @@ def delete_channel(channel_id: str) -> None:
 
 def subscribe_channel(channel_id: str) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
-    raw = get_setting("unsubscribed_map_json", "{}")
-    try:
-        unsub_map = json.loads(raw)
-        if isinstance(unsub_map, dict) and channel_id in unsub_map:
-            del unsub_map[channel_id]
-            set_setting("unsubscribed_map_json", json.dumps(unsub_map))
-    except Exception:
-        pass
     with get_conn() as conn:
+        unsub_map = _read_unsub_map(conn)
+        if channel_id in unsub_map:
+            del unsub_map[channel_id]
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES ('unsubscribed_map_json', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(unsub_map),),
+            )
         conn.execute(
             "UPDATE channels SET status = 'subscribed', updated_at = ? WHERE channel_id = ?",
             (now_iso, channel_id),
@@ -463,19 +480,50 @@ def list_channels_for_refresh(rotating_offset: int = 0) -> list[dict]:
         return unsynced + top_active + rotated
 
 
+def _normalize_utc_iso(raw: str) -> str | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def period_bounds(period: str, now: datetime | None = None) -> tuple[str | None, str | None]:
-    now = now or datetime.now(timezone.utc)
+    local_now = now if now is not None else datetime.now().astimezone()
+    if local_now.tzinfo is None:
+        local_now = local_now.replace(tzinfo=timezone.utc)
+    utc_now = local_now.astimezone(timezone.utc)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    if period == "today":
+        start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_local = start_local + timedelta(days=1)
+        return (
+            start_local.astimezone(timezone.utc).strftime(fmt),
+            end_local.astimezone(timezone.utc).strftime(fmt),
+        )
     if period == "week":
-        return (now - timedelta(days=7)).isoformat(), None
+        start_local = (local_now - timedelta(days=local_now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return start_local.astimezone(timezone.utc).strftime(fmt), None
     if period == "month":
-        return (now - timedelta(days=30)).isoformat(), None
+        start_local = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return start_local.astimezone(timezone.utc).strftime(fmt), None
     if period == "year":
-        return (now - timedelta(days=365)).isoformat(), None
+        start_local = local_now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        return start_local.astimezone(timezone.utc).strftime(fmt), None
     if period.endswith("y") and period[:-1].isdigit():
         years = int(period[:-1])
         if years >= 1:
-            start_dt = (now - timedelta(days=365 * years)).isoformat()
-            end_dt = (now - timedelta(days=365 * (years - 1))).isoformat() if years > 1 else None
+            start_dt = (utc_now - timedelta(days=365 * years)).strftime(fmt)
+            end_dt = (utc_now - timedelta(days=365 * (years - 1))).strftime(fmt) if years > 1 else None
             return start_dt, end_dt
     return None, None
 
@@ -491,6 +539,8 @@ def query_videos(
     min_minutes: int = 0,
     max_minutes: int = 120,
     now: datetime | None = None,
+    start_at: str = "",
+    end_at: str = "",
 ) -> dict:
     limit = limit if limit in (25, 50, 100) else 25
     page = max(1, page)
@@ -501,15 +551,23 @@ def query_videos(
         "local_views": "videos.views_total DESC, videos.view_count DESC, videos.published_at DESC",
         "likes": "videos.like_count DESC, videos.view_count DESC",
         "time": "videos.published_at DESC",
+        "oldest": "CASE WHEN COALESCE(videos.published_at, '') = '' THEN 1 ELSE 0 END ASC, videos.published_at ASC",
     }
     order_sql = order_map.get(sort_by, "videos.published_at DESC")
-    start_iso, end_iso = period_bounds(period, now=now)
+    norm_start = _normalize_utc_iso(start_at)
+    norm_end = _normalize_utc_iso(end_at)
+    if norm_start or norm_end:
+        start_iso, end_iso = norm_start, norm_end
+    else:
+        start_iso, end_iso = period_bounds(period, now=now)
 
     clauses = [
         "videos.channel_id NOT IN (SELECT channel_id FROM channels WHERE status = 'unfollowed')"
     ]
     params: list = []
 
+    if start_iso or end_iso:
+        clauses.append("COALESCE(videos.published_at, '') != ''")
     if start_iso:
         clauses.append("videos.published_at >= ?")
         params.append(start_iso)
@@ -587,6 +645,15 @@ def _is_newer_or_equal_ts(incoming_ts: str, existing_ts: str) -> bool:
     return incoming_ts >= existing_ts
 
 
+def _safe_nonneg_int(val: object) -> int:
+    if val is None:
+        return 0
+    try:
+        return max(0, int(float(val)))
+    except (ValueError, TypeError):
+        return 0
+
+
 def sync_device_data(payload: dict) -> dict:
     """
     Sinkronisasi 2 arah antara HP dan Laptop (via Kabel USB / JSON Bundle):
@@ -594,7 +661,8 @@ def sync_device_data(payload: dict) -> dict:
     - Rekonsiliasi status unfollowed vs subscribed menggunakan timestamp updated_at terbaru.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
-    incoming_device = str(payload.get("device", "hp")).lower()
+    raw_device = str(payload.get("device", "hp")).strip().lower()
+    incoming_device = raw_device if raw_device in ("hp", "laptop", "bundle") else "bundle"
     incoming_videos = payload.get("videos", []) or []
     incoming_channels = payload.get("channels", []) or []
 
@@ -607,8 +675,8 @@ def sync_device_data(payload: dict) -> dict:
             vid = str(v.get("video_id", "")).strip()
             if not vid:
                 continue
-            v_hp = int(v.get("views_hp", 0) or 0)
-            v_laptop = int(v.get("views_laptop", 0) or 0)
+            v_hp = _safe_nonneg_int(v.get("views_hp", 0))
+            v_laptop = _safe_nonneg_int(v.get("views_laptop", 0))
             v_upd = str(v.get("updated_at", "") or now_iso)
             if incoming_device == "hp":
                 cur = conn.execute(
@@ -645,19 +713,19 @@ def sync_device_data(payload: dict) -> dict:
             if not cid:
                 continue
             c_title = str(c.get("title") or c.get("channel_name") or cid).strip()
-            c_hp = int(c.get("views_hp", 0) or 0)
-            c_laptop = int(c.get("views_laptop", 0) or 0)
+            c_hp = _safe_nonneg_int(c.get("views_hp", 0))
+            c_laptop = _safe_nonneg_int(c.get("views_laptop", 0))
             c_status = str(c.get("status", "subscribed") or "subscribed")
             c_region = str(c.get("region", "") or "")
             c_upd = str(c.get("updated_at", "") or "")
 
             existing = local_ch_map.get(cid)
             if existing:
-                new_hp = max(int(existing["views_hp"]), c_hp) if incoming_device in ("hp", "bundle") else int(existing["views_hp"])
-                new_laptop = max(int(existing["views_laptop"]), c_laptop) if incoming_device in ("laptop", "bundle") else int(existing["views_laptop"])
+                new_hp = max(_safe_nonneg_int(existing["views_hp"]), c_hp) if incoming_device in ("hp", "bundle") else _safe_nonneg_int(existing["views_hp"])
+                new_laptop = max(_safe_nonneg_int(existing["views_laptop"]), c_laptop) if incoming_device in ("laptop", "bundle") else _safe_nonneg_int(existing["views_laptop"])
                 new_status = existing["status"] or "subscribed"
                 new_upd = existing["updated_at"] or ""
-                new_region = existing["region"] or "Nasional"
+                new_region = existing["region"] or "Belum diketahui"
 
                 # Gunakan timestamp updated_at terbaru untuk rekonsiliasi status unfollowed vs subscribed
                 if _is_newer_or_equal_ts(c_upd, new_upd):

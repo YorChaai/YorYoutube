@@ -3,7 +3,10 @@ import csv
 import io
 import json
 from pathlib import Path
+import re
 import threading
+from urllib.parse import parse_qs, urlparse
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -28,6 +31,11 @@ app.add_middleware(
 SESSION_UI_STATE: dict = {
     "sort_by": "time",
     "period": "all",
+    "custom_date": "",
+    "range_start": "",
+    "range_end": "",
+    "start_at": "",
+    "end_at": "",
     "region": "all",
     "channel_id": "",
     "q": "",
@@ -50,6 +58,36 @@ REFRESH_STATE: dict = {
     "error": "",
     "rotation_offset": 0,
 }
+
+_STATE_LOCK = threading.Lock()
+
+
+def _extract_yt_video_id(raw_value: str) -> str:
+    val = (raw_value or "").strip()
+    if val.startswith("demo_") and val.count("_") >= 2:
+        val = val.split("_", 2)[2].strip()
+    if not val:
+        return ""
+    if "://" in val or "youtube.com" in val or "youtu.be" in val:
+        url = val if "://" in val else f"https://{val}"
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if host in ("youtu.be", "www.youtu.be"):
+            cand = parsed.path.strip("/").split("/")[0]
+            if cand:
+                val = cand
+        elif "youtube.com" in host:
+            if parsed.path == "/watch":
+                cand = (parse_qs(parsed.query).get("v") or [""])[0]
+                if cand:
+                    val = cand
+            else:
+                parts = [p for p in parsed.path.strip("/").split("/") if p]
+                if len(parts) >= 2 and parts[0] in ("shorts", "embed", "live"):
+                    val = parts[1]
+    val = val.split("?")[0].split("&")[0].split("#")[0].strip()
+    m = re.match(r"^[A-Za-z0-9_-]{11}$", val)
+    return m.group(0) if m else val
 
 
 def _get_permanent_limits() -> tuple[int, dict[str, int]]:
@@ -111,6 +149,11 @@ class RefreshYouTubePayload(BaseModel):
 class UiStatePayload(BaseModel):
     sort_by: str | None = None
     period: str | None = None
+    custom_date: str | None = None
+    range_start: str | None = None
+    range_end: str | None = None
+    start_at: str | None = None
+    end_at: str | None = None
     region: str | None = None
     channel_id: str | None = None
     q: str | None = None
@@ -144,52 +187,67 @@ def get_state() -> dict:
     api_key = db.get_setting("api_key", "")
     oauth_token = db.get_setting("oauth_token", "")
     default_limit, tab_limits = _get_permanent_limits()
-    current_tab_key = SESSION_UI_STATE.get("channel_id") or "home"
+    with _STATE_LOCK:
+        session_copy = dict(SESSION_UI_STATE)
+        refresh_copy = dict(REFRESH_STATE)
+    current_tab_key = session_copy.get("channel_id") or "home"
     active_limit = tab_limits.get(current_tab_key, default_limit)
     return {
         "channels": channels,
         "has_api_key": bool(api_key),
         "api_key_preview": (api_key[:6] + "..." + api_key[-4:]) if len(api_key) > 10 else ("Terpasang" if api_key else ""),
         "has_oauth_token": bool(oauth_token),
-        "session_state": SESSION_UI_STATE,
+        "session_state": session_copy,
         "default_limit": default_limit,
         "tab_limits": tab_limits,
         "active_limit": active_limit,
-        "refresh_state": REFRESH_STATE,
+        "refresh_state": refresh_copy,
     }
 
 
 @app.post("/api/ui-state")
 def update_ui_state(payload: UiStatePayload) -> dict:
-    if payload.sort_by is not None:
-        SESSION_UI_STATE["sort_by"] = payload.sort_by
-    if payload.period is not None:
-        SESSION_UI_STATE["period"] = payload.period
-    if payload.region is not None:
-        SESSION_UI_STATE["region"] = payload.region
-    if payload.channel_id is not None:
-        SESSION_UI_STATE["channel_id"] = payload.channel_id
-    if payload.q is not None:
-        SESSION_UI_STATE["q"] = payload.q
-    if payload.page is not None:
-        SESSION_UI_STATE["page"] = max(1, payload.page)
-    if payload.min_minutes is not None:
-        SESSION_UI_STATE["min_minutes"] = payload.min_minutes
-    if payload.max_minutes is not None:
-        SESSION_UI_STATE["max_minutes"] = payload.max_minutes
-    if payload.sidebar_mode is not None:
-        SESSION_UI_STATE["sidebar_mode"] = payload.sidebar_mode
-    if payload.filter_minimized is not None:
-        SESSION_UI_STATE["filter_minimized"] = payload.filter_minimized
-    if payload.limit is not None and payload.limit in (25, 50, 100):
-        tab_key = SESSION_UI_STATE.get("channel_id") or "home"
-        _save_permanent_limit(tab_key, payload.limit)
+    with _STATE_LOCK:
+        if payload.sort_by is not None:
+            SESSION_UI_STATE["sort_by"] = payload.sort_by
+        if payload.period is not None:
+            SESSION_UI_STATE["period"] = payload.period
+        if payload.custom_date is not None:
+            SESSION_UI_STATE["custom_date"] = payload.custom_date
+        if payload.range_start is not None:
+            SESSION_UI_STATE["range_start"] = payload.range_start
+        if payload.range_end is not None:
+            SESSION_UI_STATE["range_end"] = payload.range_end
+        if payload.start_at is not None:
+            SESSION_UI_STATE["start_at"] = payload.start_at
+        if payload.end_at is not None:
+            SESSION_UI_STATE["end_at"] = payload.end_at
+        if payload.region is not None:
+            SESSION_UI_STATE["region"] = payload.region
+        if payload.channel_id is not None:
+            SESSION_UI_STATE["channel_id"] = payload.channel_id
+        if payload.q is not None:
+            SESSION_UI_STATE["q"] = payload.q
+        if payload.page is not None:
+            SESSION_UI_STATE["page"] = max(1, payload.page)
+        if payload.min_minutes is not None:
+            SESSION_UI_STATE["min_minutes"] = payload.min_minutes
+        if payload.max_minutes is not None:
+            SESSION_UI_STATE["max_minutes"] = payload.max_minutes
+        if payload.sidebar_mode is not None:
+            SESSION_UI_STATE["sidebar_mode"] = payload.sidebar_mode
+        if payload.filter_minimized is not None:
+            SESSION_UI_STATE["filter_minimized"] = payload.filter_minimized
+        if payload.limit is not None and payload.limit in (25, 50, 100):
+            tab_key = SESSION_UI_STATE.get("channel_id") or "home"
+            _save_permanent_limit(tab_key, payload.limit)
+        session_copy = dict(SESSION_UI_STATE)
 
     default_limit, tab_limits = _get_permanent_limits()
-    current_tab_key = SESSION_UI_STATE.get("channel_id") or "home"
+    current_tab_key = session_copy.get("channel_id") or "home"
     return {
         "status": "ok",
-        "session_state": SESSION_UI_STATE,
+        "session_state": session_copy,
         "default_limit": default_limit,
         "tab_limits": tab_limits,
         "active_limit": tab_limits.get(current_tab_key, default_limit),
@@ -207,16 +265,30 @@ def get_videos(
     page: int = 1,
     min_minutes: int = 0,
     max_minutes: int = 120,
+    start_at: str = "",
+    end_at: str = "",
+    custom_date: str = "",
+    range_start: str = "",
+    range_end: str = "",
 ) -> dict:
     # Simpan kondisi terakhir ke SESSION_UI_STATE agar saat Refresh halaman (F5) tidak hilang
-    SESSION_UI_STATE["sort_by"] = sort_by
-    SESSION_UI_STATE["period"] = period
-    SESSION_UI_STATE["region"] = region
-    SESSION_UI_STATE["channel_id"] = channel_id
-    SESSION_UI_STATE["q"] = q
-    SESSION_UI_STATE["page"] = max(1, page)
-    SESSION_UI_STATE["min_minutes"] = min_minutes
-    SESSION_UI_STATE["max_minutes"] = max_minutes
+    with _STATE_LOCK:
+        SESSION_UI_STATE["sort_by"] = sort_by
+        SESSION_UI_STATE["period"] = period
+        SESSION_UI_STATE["start_at"] = start_at
+        SESSION_UI_STATE["end_at"] = end_at
+        if custom_date or period == "custom_date":
+            SESSION_UI_STATE["custom_date"] = custom_date
+        if range_start or period == "custom_range":
+            SESSION_UI_STATE["range_start"] = range_start
+        if range_end or period == "custom_range":
+            SESSION_UI_STATE["range_end"] = range_end
+        SESSION_UI_STATE["region"] = region
+        SESSION_UI_STATE["channel_id"] = channel_id
+        SESSION_UI_STATE["q"] = q
+        SESSION_UI_STATE["page"] = max(1, page)
+        SESSION_UI_STATE["min_minutes"] = min_minutes
+        SESSION_UI_STATE["max_minutes"] = max_minutes
     if limit in (25, 50, 100):
         _save_permanent_limit(channel_id or "home", limit)
 
@@ -230,6 +302,8 @@ def get_videos(
         page=page,
         min_minutes=min_minutes,
         max_minutes=max_minutes,
+        start_at=start_at,
+        end_at=end_at,
     )
     # Jika user mengetik pencarian (misal 'saat stop') untuk video lama yang belum ada di cache lokal,
     # cari di YouTube khusus dari daftar 927 channel yang di-subscribe user
@@ -253,6 +327,8 @@ def get_videos(
                 page=page,
                 min_minutes=min_minutes,
                 max_minutes=max_minutes,
+                start_at=start_at,
+                end_at=end_at,
             )
             # Jika masih 0 karena user tidak sengaja sedang mengklik 1 channel tertentu di sidebar (misal 2Nine Fit),
             # otomatis cari di seluruh 927 channel Subscriptions agar video yang dicari tetap ketemu!
@@ -273,7 +349,12 @@ def get_videos(
                     page=page,
                     min_minutes=min_minutes,
                     max_minutes=max_minutes,
+                    start_at=start_at,
+                    end_at=end_at,
                 )
+                if res["total"] > 0:
+                    with _STATE_LOCK:
+                        SESSION_UI_STATE["channel_id"] = ""
 
     # Jika user klik salah satu dari 930 channel di sidebar yang videonya belum pernah ditarik sama sekali (0 video), tarik 1x
     if channel_id and res["total"] == 0 and period == "all" and not q and page == 1 and min_minutes == 0 and max_minutes >= 120:
@@ -327,22 +408,26 @@ def _run_background_refresh(channel_id: str, api_key: str, oauth_token: str) -> 
 
         if channel_id:
             target_chs = [c for c in all_chs if c["channel_id"] == channel_id]
-            REFRESH_STATE["total_channels"] = len(target_chs)
-            REFRESH_STATE["done_channels"] = 0
-            REFRESH_STATE["progress"] = 10
+            with _STATE_LOCK:
+                REFRESH_STATE["total_channels"] = len(target_chs)
+                REFRESH_STATE["done_channels"] = 0
+                REFRESH_STATE["progress"] = 10
             for idx, ch in enumerate(target_chs):
                 youtube_sync.sync_channel_videos(ch, api_key=api_key, oauth_token=oauth_token, max_videos=250)
-                REFRESH_STATE["done_channels"] = idx + 1
-                REFRESH_STATE["progress"] = min(99, int((idx + 1) * 100 / max(1, len(target_chs))))
+                with _STATE_LOCK:
+                    REFRESH_STATE["done_channels"] = idx + 1
+                    REFRESH_STATE["progress"] = min(99, int((idx + 1) * 100 / max(1, len(target_chs))))
         else:
             # Cek 100% SELURUH channel (semua 927+ channel tanpa terkecuali, termasuk yang jarang upload 1 bulan/tahun sekali!)
-            REFRESH_STATE["total_channels"] = len(all_chs)
-            REFRESH_STATE["done_channels"] = 0
-            REFRESH_STATE["progress"] = 5
+            with _STATE_LOCK:
+                REFRESH_STATE["total_channels"] = len(all_chs)
+                REFRESH_STATE["done_channels"] = 0
+                REFRESH_STATE["progress"] = 5
 
             def _on_prog(done: int, total: int) -> None:
-                REFRESH_STATE["done_channels"] = done
-                REFRESH_STATE["progress"] = min(99, max(5, int(done * 95 / max(1, total))))
+                with _STATE_LOCK:
+                    REFRESH_STATE["done_channels"] = done
+                    REFRESH_STATE["progress"] = min(99, max(5, int(done * 95 / max(1, total))))
 
             added_new = youtube_sync.refresh_all_channels_comprehensive(
                 all_chs,
@@ -352,15 +437,17 @@ def _run_background_refresh(channel_id: str, api_key: str, oauth_token: str) -> 
             )
 
         after_total = db.query_videos(limit=25, page=1)["total"]
-        REFRESH_STATE["new_videos"] = max(0, after_total - before_total) if channel_id else max(added_new, after_total - before_total)
-        REFRESH_STATE["total_videos"] = after_total
-        REFRESH_STATE["progress"] = 100
-        REFRESH_STATE["done_ready"] = True
-        REFRESH_STATE["running"] = False
+        with _STATE_LOCK:
+            REFRESH_STATE["new_videos"] = max(0, after_total - before_total) if channel_id else max(added_new, after_total - before_total)
+            REFRESH_STATE["total_videos"] = after_total
+            REFRESH_STATE["progress"] = 100
+            REFRESH_STATE["done_ready"] = True
+            REFRESH_STATE["running"] = False
     except Exception as e:
-        REFRESH_STATE["error"] = str(e)
-        REFRESH_STATE["running"] = False
-        REFRESH_STATE["done_ready"] = False
+        with _STATE_LOCK:
+            REFRESH_STATE["error"] = str(e)
+            REFRESH_STATE["running"] = False
+            REFRESH_STATE["done_ready"] = False
 
 
 @app.post("/api/refresh-youtube")
@@ -371,16 +458,18 @@ def refresh_youtube(payload: RefreshYouTubePayload) -> dict:
     if not api_key and not oauth_token:
         raise HTTPException(status_code=400, detail="API Key belum terpasang.")
 
-    if REFRESH_STATE["running"]:
-        return {"status": "running", **REFRESH_STATE}
+    with _STATE_LOCK:
+        if REFRESH_STATE["running"]:
+            return {"status": "running", **REFRESH_STATE}
 
-    REFRESH_STATE["running"] = True
-    REFRESH_STATE["progress"] = 2
-    REFRESH_STATE["done_ready"] = False
-    REFRESH_STATE["done_channels"] = 0
-    REFRESH_STATE["total_channels"] = 0
-    REFRESH_STATE["new_videos"] = 0
-    REFRESH_STATE["error"] = ""
+        REFRESH_STATE["running"] = True
+        REFRESH_STATE["progress"] = 2
+        REFRESH_STATE["done_ready"] = False
+        REFRESH_STATE["done_channels"] = 0
+        REFRESH_STATE["total_channels"] = 0
+        REFRESH_STATE["new_videos"] = 0
+        REFRESH_STATE["error"] = ""
+        snapshot = dict(REFRESH_STATE)
 
     t = threading.Thread(
         target=_run_background_refresh,
@@ -388,20 +477,22 @@ def refresh_youtube(payload: RefreshYouTubePayload) -> dict:
         daemon=True,
     )
     t.start()
-    return {"status": "started", **REFRESH_STATE}
+    return {"status": "started", **snapshot}
 
 
 @app.get("/api/refresh-youtube/status")
 def refresh_youtube_status() -> dict:
-    return REFRESH_STATE
+    with _STATE_LOCK:
+        return dict(REFRESH_STATE)
 
 
 @app.post("/api/refresh-youtube/consume")
 def refresh_youtube_consume() -> dict:
     """Dipanggil ketika tombol Refresh warna HIJAU (100%) ditekan untuk menampilkan video baru."""
-    summary = dict(REFRESH_STATE)
-    REFRESH_STATE["done_ready"] = False
-    REFRESH_STATE["progress"] = 0
+    with _STATE_LOCK:
+        summary = dict(REFRESH_STATE)
+        REFRESH_STATE["done_ready"] = False
+        REFRESH_STATE["progress"] = 0
     return {"status": "ok", **summary}
 
 
@@ -430,6 +521,8 @@ def add_channel(payload: AddChannelPayload) -> dict:
         return {"status": "ok", "channel": ch, "videos_synced": synced}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except (httpx.HTTPError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=502, detail=f"Gagal menghubungi YouTube: {e}")
 
 
 @app.post("/api/videos/{video_id}/watch")
@@ -442,40 +535,73 @@ def watch_video(video_id: str, payload: WatchPayload | None = None) -> dict:
 
 @app.get("/api/videos/{video_id}/transcript")
 def get_video_transcript(video_id: str) -> dict:
-    clean_id = (video_id or "").strip()
-    if clean_id.startswith("demo_") and clean_id.count("_") >= 2:
-        clean_id = clean_id.split("_", 2)[2]
+    clean_id = _extract_yt_video_id(video_id)
     if not clean_id:
         raise HTTPException(status_code=400, detail="Video ID tidak valid.")
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
+        from youtube_transcript_api import _errors as yt_errors
+        import requests
     except ImportError:
         raise HTTPException(status_code=500, detail="Paket youtube-transcript-api belum terpasang di backend.")
 
-    api = YouTubeTranscriptApi()
-    try:
-        try:
-            rows = api.fetch(clean_id, languages=["id", "en"])
-        except Exception as first:
-            tracks = api.list(clean_id)
-            track = next(iter(tracks))
-            rows = track.fetch()
-    except Exception as exc:
-        msg = str(exc)
-        err_name = type(exc).__name__
-        if (
-            "IpBlocked" in err_name
-            or "RequestBlocked" in err_name
-            or "blocking requests from your IP" in msg
-        ):
-            raise HTTPException(
-                status_code=404,
-                detail="IP internet saat ini sedang dibatasi sementara oleh YouTube. Centang TubeTranscript.com untuk mengambil transkrip lewat browser.",
-            )
-        raise HTTPException(status_code=404, detail=f"Gagal mengambil transkrip: {exc}")
+    def _rows_to_segments(fetched_rows) -> list[str]:
+        segs = [str(row.text).replace("\n", " ").strip() for row in fetched_rows]
+        return [s for s in segs if s]
 
-    segments = [str(row.text).replace("\n", " ").strip() for row in rows]
-    segments = [s for s in segments if s]
+    def _pick_ordered_tracks(track_list) -> list:
+        all_tracks = list(track_list)
+        if not all_tracks:
+            return []
+        ordered = []
+        used = set()
+        for pref in ("id", "en"):
+            for tr in all_tracks:
+                code = (getattr(tr, "language_code", "") or "").lower()
+                if (code == pref or code.startswith(f"{pref}-")) and id(tr) not in used:
+                    ordered.append(tr)
+                    used.add(id(tr))
+        for tr in all_tracks:
+            if id(tr) not in used:
+                ordered.append(tr)
+        return ordered
+
+    segments: list[str] = []
+    with requests.Session() as sess:
+        api = YouTubeTranscriptApi(http_client=sess)
+        try:
+            transcript_list = api.list(clean_id)
+            ordered_tracks = _pick_ordered_tracks(transcript_list)
+            if not ordered_tracks:
+                raise HTTPException(status_code=404, detail="Video tidak memiliki subtitle/transkrip.")
+            last_exc: Exception | None = None
+            for tr in ordered_tracks:
+                try:
+                    segments = _rows_to_segments(tr.fetch())
+                    if segments:
+                        break
+                except (yt_errors.IpBlocked, yt_errors.RequestBlocked):
+                    raise
+                except Exception as exc:
+                    last_exc = exc
+            if not segments and last_exc is not None:
+                raise last_exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            msg = str(exc)
+            err_name = type(exc).__name__
+            if (
+                "IpBlocked" in err_name
+                or "RequestBlocked" in err_name
+                or "blocking requests from your IP" in msg
+            ):
+                raise HTTPException(
+                    status_code=429,
+                    detail="IP internet saat ini sedang dibatasi sementara oleh YouTube. Centang TubeTranscript.com untuk mengambil transkrip lewat browser.",
+                )
+            raise HTTPException(status_code=404, detail=f"Gagal mengambil transkrip: {exc}")
+
     if not segments:
         raise HTTPException(status_code=404, detail="Video tidak memiliki teks transkrip.")
     return {
@@ -508,16 +634,18 @@ def subscribe_channel_endpoint(channel_id: str) -> dict:
 @app.post("/api/channels/{channel_id}/unfollow")
 def unfollow_channel_endpoint(channel_id: str) -> dict:
     db.delete_channel(channel_id)
-    if SESSION_UI_STATE.get("channel_id") == channel_id:
-        SESSION_UI_STATE["channel_id"] = ""
+    with _STATE_LOCK:
+        if SESSION_UI_STATE.get("channel_id") == channel_id:
+            SESSION_UI_STATE["channel_id"] = ""
     return {"ok": True, "channel_id": channel_id, "status": "unfollowed"}
 
 
 @app.delete("/api/channels/{channel_id}")
 def remove_channel(channel_id: str) -> dict:
     db.delete_channel(channel_id)
-    if SESSION_UI_STATE.get("channel_id") == channel_id:
-        SESSION_UI_STATE["channel_id"] = ""
+    with _STATE_LOCK:
+        if SESSION_UI_STATE.get("channel_id") == channel_id:
+            SESSION_UI_STATE["channel_id"] = ""
     return {"status": "ok"}
 
 
@@ -560,20 +688,28 @@ def restore_demo() -> dict:
 def sync_all(payload: SyncPayload) -> dict:
     api_key = db.get_setting("api_key", "")
     oauth_token = db.get_setting("oauth_token", "")
+    if not api_key and not oauth_token:
+        raise HTTPException(status_code=400, detail="API Key atau OAuth Token belum terpasang.")
     imported_channels = 0
 
     try:
         if payload.import_mode in ("subscriptions", "subscribers") and oauth_token:
             imported_channels = youtube_sync.import_oauth_subscriptions(oauth_token, mode=payload.import_mode)
 
-        if not REFRESH_STATE["running"]:
-            REFRESH_STATE["running"] = True
-            REFRESH_STATE["progress"] = 2
-            REFRESH_STATE["done_ready"] = False
-            REFRESH_STATE["done_channels"] = 0
-            REFRESH_STATE["total_channels"] = 0
-            REFRESH_STATE["new_videos"] = 0
-            REFRESH_STATE["error"] = ""
+        started = False
+        with _STATE_LOCK:
+            if not REFRESH_STATE["running"]:
+                started = True
+                REFRESH_STATE["running"] = True
+                REFRESH_STATE["progress"] = 2
+                REFRESH_STATE["done_ready"] = False
+                REFRESH_STATE["done_channels"] = 0
+                REFRESH_STATE["total_channels"] = 0
+                REFRESH_STATE["new_videos"] = 0
+                REFRESH_STATE["error"] = ""
+            snapshot = dict(REFRESH_STATE)
+
+        if started:
             t = threading.Thread(
                 target=_run_background_refresh,
                 args=("", api_key, oauth_token),
@@ -582,13 +718,15 @@ def sync_all(payload: SyncPayload) -> dict:
             t.start()
 
         return {
-            "status": "started",
+            "status": "started" if started else "running",
             "imported_channels": imported_channels,
             "synced_videos": 0,
-            **REFRESH_STATE,
+            **snapshot,
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except (httpx.HTTPError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=502, detail=f"Gagal menghubungi YouTube: {e}")
 
 
 @app.get("/api/channels/export-csv")
@@ -633,14 +771,24 @@ def import_channels_csv(payload: ImportCsvPayload) -> dict:
         if not row:
             continue
         first = row[0].strip()
-        if first.lower() in ("channel id", "channel_id", "id", "nama channel"):
+        if not first or first.lower() in ("channel id", "channel_id", "id", "nama channel"):
             continue
-        if first.startswith("UC") and len(row) >= 3:
+        if first.startswith("UC") and len(row) >= 2:
             cid = first
-            title = row[2].strip() or cid
+            col1 = row[1].strip()
+            col2 = row[2].strip() if len(row) >= 3 else ""
+            # Google Takeout format: [Channel Id, Channel Url, Channel Title]
+            # App CSV export format: [Channel ID, Nama Channel, Handle, URL Channel, ...]
+            if col1.startswith("http"):
+                title = col2 or cid
+                handle = ""
+            else:
+                title = col1 or col2 or cid
+                handle = col2 if col2.startswith("@") else ""
             db.upsert_channel(
                 channel_id=cid,
                 title=title,
+                handle=handle,
                 uploads_playlist_id="UU" + cid[2:],
                 source="csv",
             )
@@ -649,7 +797,7 @@ def import_channels_csv(payload: ImportCsvPayload) -> dict:
             try:
                 youtube_sync.resolve_and_add_channel(first, api_key=api_key, oauth_token=oauth_token)
                 added += 1
-            except ValueError:
+            except (ValueError, httpx.HTTPError, json.JSONDecodeError):
                 pass
     return {"status": "ok", "added": added}
 

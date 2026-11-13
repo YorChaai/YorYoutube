@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 import re
 import time
 from typing import Callable
@@ -12,23 +13,34 @@ YT_API_BASE = "https://www.googleapis.com/youtube/v3"
 def parse_iso_duration(iso_dur: str) -> str:
     if not iso_dur:
         return ""
-    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso_dur)
-    if not m:
+    m = re.match(r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$", iso_dur.strip())
+    if not m or not any(m.groups()):
         return ""
-    h, mins, s = (int(x) if x else 0 for x in m.groups())
-    if h > 0:
-        return f"{h}:{mins:02d}:{s:02d}"
+    d, h, mins, s = (int(x) if x else 0 for x in m.groups())
+    total_h = d * 24 + h
+    if total_h > 0:
+        return f"{total_h}:{mins:02d}:{s:02d}"
     return f"{mins}:{s:02d}"
 
 
 def _auth_params_headers(api_key: str, oauth_token: str) -> tuple[dict, dict]:
     params = {}
     headers = {}
-    if api_key:
-        params["key"] = api_key
-    elif oauth_token:
-        headers["Authorization"] = f"Bearer {oauth_token}"
+    clean_key = (api_key or "").strip()
+    clean_tok = (oauth_token or "").strip()
+    if clean_key:
+        params["key"] = clean_key
+    elif clean_tok:
+        headers["Authorization"] = f"Bearer {clean_tok}"
     return params, headers
+
+
+def _safe_json(resp: httpx.Response) -> dict:
+    try:
+        parsed = resp.json()
+        return parsed if isinstance(parsed, dict) else {}
+    except (ValueError, json.JSONDecodeError):
+        return {}
 
 
 def resolve_and_add_channel(identifier: str, api_key: str = "", oauth_token: str = "") -> dict:
@@ -36,12 +48,17 @@ def resolve_and_add_channel(identifier: str, api_key: str = "", oauth_token: str
     if not raw:
         raise ValueError("Masukkan @handle, URL channel, atau Channel ID (UC...)")
 
-    # Extract @handle or UC... from full youtube URL if pasted
+    # Extract @handle, UC..., or custom/user slug from full youtube URL if pasted
     if "youtube.com/" in raw:
-        if "/@" in raw:
-            raw = "@" + raw.split("/@")[1].split("/")[0].split("?")[0]
-        elif "/channel/" in raw:
-            raw = raw.split("/channel/")[1].split("/")[0].split("?")[0]
+        no_frag = raw.split("#")[0]
+        if "/@" in no_frag:
+            raw = "@" + no_frag.split("/@")[1].split("/")[0].split("?")[0]
+        elif "/channel/" in no_frag:
+            raw = no_frag.split("/channel/")[1].split("/")[0].split("?")[0]
+        elif "/c/" in no_frag:
+            raw = no_frag.split("/c/")[1].split("/")[0].split("?")[0]
+        elif "/user/" in no_frag:
+            raw = no_frag.split("/user/")[1].split("/")[0].split("?")[0]
 
     params, headers = _auth_params_headers(api_key, oauth_token)
     if not params and not headers:
@@ -57,25 +74,34 @@ def resolve_and_add_channel(identifier: str, api_key: str = "", oauth_token: str
             req_params["forHandle"] = "@" + raw.lstrip("@")
 
         resp = client.get(f"{YT_API_BASE}/channels", params=req_params, headers=headers)
-        data = resp.json()
+        data = _safe_json(resp)
+        if resp.status_code != 200 or "error" in data:
+            err_msg = data.get("error", {}).get("message", f"YouTube API error ({resp.status_code})")
+            raise ValueError(err_msg)
         items = data.get("items", [])
 
         # Fallback: search channel by name if handle not found
-        if not items and not raw.startswith("UC"):
+        if not items and not (raw.startswith("UC") and len(raw) >= 20):
             s_resp = client.get(
                 f"{YT_API_BASE}/search",
                 params={**params, "part": "snippet", "q": raw, "type": "channel", "maxResults": 1},
                 headers=headers,
             )
-            s_items = s_resp.json().get("items", [])
+            s_data = _safe_json(s_resp)
+            if s_resp.status_code != 200 or "error" in s_data:
+                err_msg = s_data.get("error", {}).get("message", f"YouTube search error ({s_resp.status_code})")
+                raise ValueError(err_msg)
+            s_items = s_data.get("items", [])
             if s_items:
-                cid = s_items[0]["snippet"]["channelId"]
-                c_resp = client.get(
-                    f"{YT_API_BASE}/channels",
-                    params={**params, "part": "snippet,contentDetails", "id": cid},
-                    headers=headers,
-                )
-                items = c_resp.json().get("items", [])
+                cid = s_items[0].get("snippet", {}).get("channelId", "")
+                if cid:
+                    c_resp = client.get(
+                        f"{YT_API_BASE}/channels",
+                        params={**params, "part": "snippet,contentDetails", "id": cid},
+                        headers=headers,
+                    )
+                    c_data = _safe_json(c_resp)
+                    items = c_data.get("items", [])
 
         if not items:
             err_msg = data.get("error", {}).get("message", f"Channel '{identifier}' tidak ditemukan.")
@@ -84,8 +110,8 @@ def resolve_and_add_channel(identifier: str, api_key: str = "", oauth_token: str
         ch = items[0]
         cid = ch["id"]
         snippet = ch.get("snippet", {})
-        title = snippet.get("title", raw)
-        handle = snippet.get("customUrl", raw if raw.startswith("@") else "")
+        title = snippet.get("title") or raw
+        handle = snippet.get("customUrl") or (raw if raw.startswith("@") else "")
         country = snippet.get("country", "")
         default_lang = snippet.get("defaultLanguage", "")
         region = db.classify_region(title, handle, country=country, default_lang=default_lang)
@@ -139,9 +165,9 @@ def import_oauth_subscriptions(oauth_token: str, mode: str = "subscriptions") ->
                 params["pageToken"] = page_token
 
             resp = client.get(f"{YT_API_BASE}/subscriptions", params=params, headers=headers)
-            data = resp.json()
-            if "error" in data:
-                raise ValueError(data["error"].get("message", "Gagal mengambil subscriptions via OAuth."))
+            data = _safe_json(resp)
+            if resp.status_code != 200 or "error" in data:
+                raise ValueError(data.get("error", {}).get("message", f"Gagal mengambil subscriptions via OAuth ({resp.status_code})."))
 
             for item in data.get("items", []):
                 snippet = item.get("snippet", {})
@@ -161,7 +187,7 @@ def import_oauth_subscriptions(oauth_token: str, mode: str = "subscriptions") ->
                     # Filter Masuk (Ingress Gate): buang jika berstatus unfollowed di lokal
                     if cid in unfollowed_map:
                         unsub_at = unfollowed_map[cid]
-                        if not sub_pub or (unsub_at and sub_pub <= unsub_at):
+                        if not sub_pub or (unsub_at and not db._is_newer_or_equal_ts(sub_pub, unsub_at)):
                             continue
                     thumb_url = (thumbs.get("medium") or thumbs.get("default") or {}).get("url", "")
                     db.upsert_channel(
@@ -170,6 +196,7 @@ def import_oauth_subscriptions(oauth_token: str, mode: str = "subscriptions") ->
                         thumbnail_url=thumb_url,
                         uploads_playlist_id="UU" + cid[2:] if cid.startswith("UC") else cid,
                         source=mode,
+                        force_subscribe=True,
                     )
                     added += 1
 
@@ -219,9 +246,9 @@ def sync_public_subscriptions_by_channel(my_channel_id: str, api_key: str = "") 
                 params["pageToken"] = page_token
 
             resp = client.get(f"{YT_API_BASE}/subscriptions", params=params)
-            data = resp.json()
-            if "error" in data:
-                raise ValueError(data["error"].get("message", "Gagal mengambil daftar subscriptions."))
+            data = _safe_json(resp)
+            if resp.status_code != 200 or "error" in data:
+                raise ValueError(data.get("error", {}).get("message", f"Gagal mengambil daftar subscriptions ({resp.status_code})."))
 
             for item in data.get("items", []):
                 snippet = item.get("snippet", {})
@@ -237,7 +264,7 @@ def sync_public_subscriptions_by_channel(my_channel_id: str, api_key: str = "") 
                 if cid not in existing_cids:
                     # Filter Masuk (Ingress Gate): jika di lokal berstatus unfollowed, lewati kecuali baru di-subscribe ulang di YouTube
                     unsub_at = unfollowed_db_map.get(cid) or unsub_map.get(cid, "")
-                    if unsub_at and (not sub_pub or sub_pub <= unsub_at):
+                    if unsub_at and (not sub_pub or not db._is_newer_or_equal_ts(sub_pub, unsub_at)):
                         continue
                     thumb_url = (thumbs.get("medium") or thumbs.get("default") or {}).get("url", "")
                     uploads_pid = "UU" + cid[2:] if cid.startswith("UC") else cid
@@ -385,27 +412,37 @@ def sync_channel_videos(
                 req_params["pageToken"] = page_token
 
             resp = client.get(f"{YT_API_BASE}/playlistItems", params=req_params, headers=headers)
-            data = resp.json()
+            data = _safe_json(resp)
+            if resp.status_code != 200 or "error" in data:
+                err_msg = data.get("error", {}).get("message", f"YouTube playlist API error ({resp.status_code})")
+                if not video_ids:
+                    raise RuntimeError(err_msg)
+                break
             items = data.get("items", [])
             if not items:
                 break
 
             reached_cutoff = False
             for it in items:
+                if len(video_ids) >= max_videos:
+                    break
                 vid = it.get("contentDetails", {}).get("videoId")
                 pub_str = it.get("contentDetails", {}).get("videoPublishedAt") or it.get("snippet", {}).get("publishedAt", "")
-                if vid:
-                    video_ids.append(vid)
                 if pub_str and len(video_ids) >= 50:
                     try:
                         pub_dt = datetime.fromisoformat(pub_str.replace("Z", "+00:00"))
+                        if pub_dt.tzinfo is None:
+                            pub_dt = pub_dt.replace(tzinfo=timezone.utc)
                         if pub_dt < cutoff:
                             reached_cutoff = True
-                    except ValueError:
+                            break
+                    except (ValueError, TypeError):
                         pass
+                if vid:
+                    video_ids.append(vid)
 
             page_token = data.get("nextPageToken")
-            if reached_cutoff or not page_token:
+            if reached_cutoff or not page_token or len(video_ids) >= max_videos:
                 break
 
         # Batch fetch statistics (viewCount, likeCount) & duration in chunks of 50 (only 1 unit per 50 videos!)
@@ -421,7 +458,13 @@ def sync_channel_videos(
                 },
                 headers=headers,
             )
-            for v_item in v_resp.json().get("items", []):
+            v_data = _safe_json(v_resp)
+            if v_resp.status_code != 200 or "error" in v_data:
+                if rows_to_save:
+                    break
+                err_msg = v_data.get("error", {}).get("message", f"YouTube videos API error ({v_resp.status_code})")
+                raise RuntimeError(err_msg)
+            for v_item in v_data.get("items", []):
                 vid = v_item["id"]
                 snip = v_item.get("snippet", {})
                 stats = v_item.get("statistics", {})
@@ -498,40 +541,41 @@ def refresh_all_channels_comprehensive(
         if on_progress:
             on_progress(done_count, total_chs)
 
-    # 2. Cek seluruh 15 item RSS terbaru untuk channel lainnya (dengan retry jika kena timeout/429)
+    # 2. Cek seluruh 15 item RSS terbaru untuk channel lainnya (dengan koneksi pool & retry jika kena timeout/429)
     vid_to_cid: dict[str, str] = {}
 
-    def _check_channel(ch: dict) -> list[tuple[str, str]]:
-        cid = ch["channel_id"]
-        found: list[tuple[str, str]] = []
-        url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
-        for attempt in range(2):
-            try:
-                r = httpx.get(url, timeout=10.0)
-                if r.status_code == 200:
-                    vids = re.findall(r"<yt:videoId>([^<]+)</yt:videoId>", r.text)
-                    for v in vids:
-                        if v not in known_old_vids:
-                            found.append((v, cid))
-                    return found
-                if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-                    time.sleep(0.4)
-                    continue
-                return found
-            except Exception:
-                if attempt == 0:
-                    time.sleep(0.4)
-        return found
-
     if rss_chs:
-        with ThreadPoolExecutor(max_workers=20) as pool:
-            futures = [pool.submit(_check_channel, ch) for ch in rss_chs]
-            for fut in as_completed(futures):
-                done_count += 1
-                if on_progress:
-                    on_progress(done_count, total_chs)
-                for vid, cid in fut.result():
-                    vid_to_cid[vid] = cid
+        with httpx.Client(timeout=10.0, follow_redirects=True) as rss_client:
+            def _check_channel(ch: dict) -> list[tuple[str, str]]:
+                cid = ch["channel_id"]
+                found: list[tuple[str, str]] = []
+                url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
+                for attempt in range(2):
+                    try:
+                        r = rss_client.get(url)
+                        if r.status_code == 200:
+                            vids = re.findall(r"<yt:videoId>([^<]+)</yt:videoId>", r.text)
+                            for v in vids:
+                                if v not in known_old_vids:
+                                    found.append((v, cid))
+                            return found
+                        if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                            time.sleep(0.4)
+                            continue
+                        return found
+                    except Exception:
+                        if attempt == 0:
+                            time.sleep(0.4)
+                return found
+
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                futures = [pool.submit(_check_channel, ch) for ch in rss_chs]
+                for fut in as_completed(futures):
+                    done_count += 1
+                    if on_progress:
+                        on_progress(done_count, total_chs)
+                    for vid, cid in fut.result():
+                        vid_to_cid[vid] = cid
 
     if not vid_to_cid:
         if unsynced_chs:
@@ -541,7 +585,6 @@ def refresh_all_channels_comprehensive(
         return 0
 
     all_vids = list(vid_to_cid.keys())
-    rows_to_save: list[dict] = []
     with httpx.Client(timeout=25.0) as client:
         for i in range(0, len(all_vids), 50):
             chunk = all_vids[i : i + 50]
@@ -554,10 +597,11 @@ def refresh_all_channels_comprehensive(
                 },
                 headers=headers,
             )
-            v_data = v_resp.json()
+            v_data = _safe_json(v_resp)
             if v_resp.status_code != 200 or "error" in v_data:
                 err_msg = v_data.get("error", {}).get("message", f"YouTube API error ({v_resp.status_code})")
                 raise RuntimeError(err_msg)
+            chunk_rows: list[dict] = []
             for v_item in v_data.get("items", []):
                 vid = v_item["id"]
                 snip = v_item.get("snippet", {})
@@ -572,7 +616,8 @@ def refresh_all_channels_comprehensive(
                 )
                 if vid not in all_existing_vids:
                     newly_inserted_count += 1
-                rows_to_save.append(
+                    all_existing_vids.add(vid)
+                chunk_rows.append(
                     {
                         "video_id": vid,
                         "channel_id": cid,
@@ -587,8 +632,8 @@ def refresh_all_channels_comprehensive(
                         "is_demo": 0,
                     }
                 )
+            db.upsert_videos(chunk_rows)
 
-    db.upsert_videos(rows_to_save)
     if unsynced_chs:
         with db.get_conn() as conn:
             after_count = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
@@ -632,7 +677,10 @@ def search_and_cache_subscribed_videos(
     try:
         with httpx.Client(timeout=15.0) as client:
             resp = client.get(f"{YT_API_BASE}/search", params=search_params, headers=headers)
-            items = resp.json().get("items", [])
+            data = _safe_json(resp)
+            if resp.status_code != 200 or "error" in data:
+                return 0
+            items = data.get("items", [])
             for it in items:
                 vid = it.get("id", {}).get("videoId", "")
                 cid = it.get("snippet", {}).get("channelId", "")
@@ -640,14 +688,21 @@ def search_and_cache_subscribed_videos(
                 if vid and cid in ch_map:
                     vid_to_cid[vid] = cid
 
-            if not vid_to_cid:
-                # Jika user baru saja subscribe channel baru di YouTube (misal 'casan' / '@catursan') dan langsung mencarinya,
-                # otomatis tambahkan channel tersebut beserta videonya!
+            is_explicit_channel = (
+                q_clean.startswith("@")
+                or (q_clean.startswith("UC") and len(q_clean) >= 20)
+                or "youtube.com/" in q_clean
+            )
+            if not vid_to_cid and not channel_id and is_explicit_channel:
+                # Jika user mencari langsung dengan @handle / UC... / URL channel baru, tambahkan & sync videonya.
                 try:
                     new_ch = resolve_and_add_channel(q_clean, api_key=api_key, oauth_token=oauth_token)
                     return sync_channel_videos(new_ch, api_key=api_key, oauth_token=oauth_token, max_videos=100)
                 except Exception:
                     return 0
+
+            if not vid_to_cid:
+                return 0
 
             v_resp = client.get(
                 f"{YT_API_BASE}/videos",
@@ -658,8 +713,11 @@ def search_and_cache_subscribed_videos(
                 },
                 headers=headers,
             )
+            v_data = _safe_json(v_resp)
+            if v_resp.status_code != 200 or "error" in v_data:
+                return 0
             rows_to_save: list[dict] = []
-            for v_item in v_resp.json().get("items", []):
+            for v_item in v_data.get("items", []):
                 vid = v_item["id"]
                 snip = v_item.get("snippet", {})
                 stats = v_item.get("statistics", {})

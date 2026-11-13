@@ -72,9 +72,12 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
   // Filter & Pagination State
-  String sortBy = 'time'; // 'views' | 'likes' | 'time'
+  String sortBy = 'time'; // 'views' | 'likes' | 'time' | 'oldest'
   String period =
-      'all'; // 'all' | 'week' | 'month' | 'year' | '2y' | '3y' | '4y'
+      'all'; // 'all' | 'today' | 'week' | 'month' | 'year' | '2y' | ... | 'custom_date' | 'custom_range'
+  DateTime? customDate;
+  DateTime? customRangeStart;
+  DateTime? customRangeEnd;
   String selectedRegion = 'all'; // 'all' | 'Nasional' | 'Internasional'
   String selectedChannelId = '';
   String searchQuery = '';
@@ -595,22 +598,52 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         final db = await _openStandaloneDatabase();
         final savedChannels = await db.query('channels', orderBy: 'rowid');
         final savedVideos = await db.query('videos', orderBy: 'rowid');
-        if (savedChannels.isNotEmpty || savedVideos.isNotEmpty) {
+        if (savedChannels.isNotEmpty) {
+          final chById = <String, Map<String, dynamic>>{
+            for (final c in _localChannels)
+              if ((c['channel_id'] ?? '').toString().isNotEmpty)
+                (c['channel_id'] ?? '').toString(): c,
+          };
+          for (final row in savedChannels) {
+            final parsedCh = Map<String, dynamic>.from(
+              jsonDecode(row['data']! as String) as Map,
+            );
+            final cid = (parsedCh['channel_id'] ?? '').toString();
+            if (cid.isNotEmpty) {
+              chById[cid] = parsedCh;
+            }
+          }
           _localChannels
             ..clear()
-            ..addAll(
-              savedChannels.map(
-                (e) => jsonDecode(e['data']! as String) as Map<String, dynamic>,
-              ),
+            ..addAll(chById.values);
+        }
+        if (savedVideos.isNotEmpty) {
+          final vidById = <String, Map<String, dynamic>>{
+            for (final v in _localVideos)
+              if ((v['video_id'] ?? '').toString().isNotEmpty)
+                (v['video_id'] ?? '').toString(): v,
+          };
+          for (final row in savedVideos) {
+            final parsedVid = Map<String, dynamic>.from(
+              jsonDecode(row['data']! as String) as Map,
             );
+            final vid = (parsedVid['video_id'] ?? '').toString();
+            if (vid.isNotEmpty) {
+              vidById[vid] = parsedVid;
+            }
+          }
           _localVideos
             ..clear()
-            ..addAll(
-              savedVideos.map(
-                (e) => jsonDecode(e['data']! as String) as Map<String, dynamic>,
-              ),
-            );
+            ..addAll(vidById.values);
         }
+        _localUnsubscribedIds.clear();
+        for (final c in _localChannels) {
+          if ((c['status'] ?? 'subscribed') == 'unfollowed') {
+            final cid = (c['channel_id'] ?? '').toString();
+            if (cid.isNotEmpty) _localUnsubscribedIds.add(cid);
+          }
+        }
+        _sortChannelsByWatchedDesc(_localChannels);
         final savedSettings = await db.query('settings');
         for (final row in savedSettings) {
           final k = (row['key'] ?? '').toString();
@@ -661,18 +694,24 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         await txn.delete('videos');
         final channelBatch = txn.batch();
         for (final channel in _localChannels) {
-          channelBatch.insert('channels', {
-            'id': (channel['channel_id'] ?? '').toString(),
-            'data': jsonEncode(channel),
-          });
+          final cid = (channel['channel_id'] ?? '').toString();
+          if (cid.isEmpty) continue;
+          channelBatch.insert(
+            'channels',
+            {'id': cid, 'data': jsonEncode(channel)},
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
         }
         await channelBatch.commit(noResult: true);
         final videoBatch = txn.batch();
         for (final video in _localVideos) {
-          videoBatch.insert('videos', {
-            'id': (video['video_id'] ?? '').toString(),
-            'data': jsonEncode(video),
-          });
+          final vid = (video['video_id'] ?? '').toString();
+          if (vid.isEmpty) continue;
+          videoBatch.insert(
+            'videos',
+            {'id': vid, 'data': jsonEncode(video)},
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
         }
         await videoBatch.commit(noResult: true);
         if (localApiKey.isNotEmpty) {
@@ -695,35 +734,178 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     }
   }
 
-  void _applyLocalFilterAndPagination() {
-    final now = DateTime.now().toUtc();
-    String? startIso;
-    String? endIso;
+  static const List<String> _idShortMonths = [
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'Mei',
+    'Jun',
+    'Jul',
+    'Agu',
+    'Sep',
+    'Okt',
+    'Nov',
+    'Des',
+  ];
+
+  DateTime _dateOnly(DateTime dt) => DateTime(dt.year, dt.month, dt.day);
+
+  String _formatDateId(DateTime dt) {
+    final dd = dt.day.toString().padLeft(2, '0');
+    final mm = _idShortMonths[dt.month - 1];
+    return '$dd $mm ${dt.year}';
+  }
+
+  String _toDateIso(DateTime? dt) {
+    if (dt == null) return '';
+    final y = dt.year.toString().padLeft(4, '0');
+    final m = dt.month.toString().padLeft(2, '0');
+    final d = dt.day.toString().padLeft(2, '0');
+    return '$y-$m-$d';
+  }
+
+  DateTime? _parseDateIso(dynamic raw) {
+    final text = (raw ?? '').toString().trim();
+    if (text.isEmpty) return null;
+    final parts = text.split('-');
+    if (parts.length != 3) return null;
+    final y = int.tryParse(parts[0]);
+    final m = int.tryParse(parts[1]);
+    final d = int.tryParse(parts[2]);
+    if (y == null || m == null || d == null) return null;
+    final today = _dateOnly(DateTime.now());
+    final candidate = DateTime(y, m, d);
+    if (candidate.isAfter(today)) return today;
+    return candidate;
+  }
+
+  String _formatUtcIso(DateTime dt) {
+    final u = dt.toUtc();
+    final y = u.year.toString().padLeft(4, '0');
+    final m = u.month.toString().padLeft(2, '0');
+    final d = u.day.toString().padLeft(2, '0');
+    final hh = u.hour.toString().padLeft(2, '0');
+    final mm = u.minute.toString().padLeft(2, '0');
+    final ss = u.second.toString().padLeft(2, '0');
+    return '$y-$m-${d}T$hh:$mm:${ss}Z';
+  }
+
+  (String?, String?) _computePeriodUtcBounds() {
+    final nowLocal = DateTime.now();
+    final todayStart = DateTime(nowLocal.year, nowLocal.month, nowLocal.day);
+    final nowUtc = nowLocal.toUtc();
+    if (period == 'today') {
+      final tomorrowStart = todayStart.add(const Duration(days: 1));
+      return (_formatUtcIso(todayStart), _formatUtcIso(tomorrowStart));
+    }
     if (period == 'week') {
-      startIso = now.subtract(const Duration(days: 7)).toIso8601String();
-    } else if (period == 'month') {
-      startIso = now.subtract(const Duration(days: 30)).toIso8601String();
-    } else if (period == 'year') {
-      startIso = now.subtract(const Duration(days: 365)).toIso8601String();
-    } else if (period.endsWith('y') &&
+      final weekStart = todayStart.subtract(
+        Duration(days: todayStart.weekday - 1),
+      );
+      return (_formatUtcIso(weekStart), null);
+    }
+    if (period == 'month') {
+      final monthStart = DateTime(nowLocal.year, nowLocal.month, 1);
+      return (_formatUtcIso(monthStart), null);
+    }
+    if (period == 'year') {
+      final yearStart = DateTime(nowLocal.year, 1, 1);
+      return (_formatUtcIso(yearStart), null);
+    }
+    if (period == 'custom_date' && customDate != null) {
+      final d = _dateOnly(customDate!);
+      final endExclusive = DateTime(d.year, d.month, d.day).add(
+        const Duration(days: 1),
+      );
+      return (null, _formatUtcIso(endExclusive));
+    }
+    if (period == 'custom_range' &&
+        customRangeStart != null &&
+        customRangeEnd != null) {
+      final s = _dateOnly(customRangeStart!);
+      final e = _dateOnly(customRangeEnd!);
+      final startDt = s.isAfter(e) ? e : s;
+      final endDt = s.isAfter(e) ? s : e;
+      return (
+        _formatUtcIso(startDt),
+        _formatUtcIso(endDt.add(const Duration(days: 1))),
+      );
+    }
+    if (period.endsWith('y') &&
         int.tryParse(period.substring(0, period.length - 1)) != null) {
       final yrs = int.parse(period.substring(0, period.length - 1));
       if (yrs >= 1) {
-        startIso = now.subtract(Duration(days: 365 * yrs)).toIso8601String();
-        if (yrs > 1) {
-          endIso = now
-              .subtract(Duration(days: 365 * (yrs - 1)))
-              .toIso8601String();
-        }
+        final startIso = _formatUtcIso(
+          nowUtc.subtract(Duration(days: 365 * yrs)),
+        );
+        final endIso = yrs > 1
+            ? _formatUtcIso(nowUtc.subtract(Duration(days: 365 * (yrs - 1))))
+            : null;
+        return (startIso, endIso);
       }
     }
+    return (null, null);
+  }
+
+  String _periodDisplayLabel() {
+    if (period == 'all') return 'All Time';
+    if (period == 'today') return 'Today';
+    if (period == 'week') return 'This Week';
+    if (period == 'month') return 'This Month';
+    if (period == 'year') return 'This Year';
+    if (period == 'custom_date') {
+      return customDate != null
+          ? 'Custom Date (≤ ${_formatDateId(customDate!)})'
+          : 'Custom Date';
+    }
+    if (period == 'custom_range') {
+      if (customRangeStart != null && customRangeEnd != null) {
+        return 'Range (${_formatDateId(customRangeStart!)} – ${_formatDateId(customRangeEnd!)})';
+      }
+      return 'Custom Date Range';
+    }
+    if (period.endsWith('y') &&
+        int.tryParse(period.substring(0, period.length - 1)) != null) {
+      return '${period.substring(0, period.length - 1)} Tahun Lalu';
+    }
+    return 'All Time';
+  }
+
+  void _applyLocalFilterAndPagination() {
+    final bounds = _computePeriodUtcBounds();
+    final startDt = bounds.$1 != null
+        ? DateTime.tryParse(bounds.$1!)?.toUtc()
+        : null;
+    final endDt = bounds.$2 != null
+        ? DateTime.tryParse(bounds.$2!)?.toUtc()
+        : null;
+
+    int safeIntVal(dynamic raw) {
+      if (raw is int) return raw;
+      if (raw is num) return raw.toInt();
+      return int.tryParse((raw ?? '0').toString()) ?? 0;
+    }
+
+    final unfollowedCids = <String>{
+      ..._localUnsubscribedIds,
+      for (final c in _localChannels)
+        if ((c['status'] ?? 'subscribed') == 'unfollowed')
+          (c['channel_id'] ?? '').toString(),
+    };
+    final visibleChannels = _localChannels
+        .where((c) => !unfollowedCids.contains((c['channel_id'] ?? '').toString()))
+        .toList();
 
     final qLower = searchQuery.trim().toLowerCase();
     final minSec = durationRange.start.round() * 60;
     final maxSec = durationRange.end.round() * 60;
     final filtered = _localVideos.where((v) {
-      if (selectedChannelId.isNotEmpty &&
-          v['channel_id'] != selectedChannelId) {
+      final vCid = (v['channel_id'] ?? '').toString();
+      if (unfollowedCids.contains(vCid)) {
+        return false;
+      }
+      if (selectedChannelId.isNotEmpty && vCid != selectedChannelId) {
         return false;
       }
       if (selectedRegion != 'all') {
@@ -731,9 +913,10 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         if (reg != selectedRegion) return false;
       }
       if (minSec > 0 || durationRange.end.round() < 120) {
-        final durSec =
-            (v['duration_seconds'] as int?) ??
-            _durationToSeconds((v['duration'] ?? '').toString());
+        final rawDurSec = v['duration_seconds'];
+        final durSec = rawDurSec != null
+            ? safeIntVal(rawDurSec)
+            : _durationToSeconds((v['duration'] ?? '').toString());
         if (minSec > 0 && durSec < minSec) return false;
         if (durationRange.end.round() < 120 && durSec > maxSec) return false;
       }
@@ -742,41 +925,47 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         final ct = (v['channel_title'] ?? '').toString().toLowerCase();
         if (!t.contains(qLower) && !ct.contains(qLower)) return false;
       }
-      if (startIso != null || endIso != null) {
+      if (startDt != null || endDt != null) {
         final pubStr = (v['published_at'] ?? '').toString();
-        if (pubStr.isEmpty) return false;
-        if (startIso != null && pubStr.compareTo(startIso) < 0) return false;
-        if (endIso != null && pubStr.compareTo(endIso) >= 0) return false;
+        final pubDt = DateTime.tryParse(pubStr)?.toUtc();
+        if (pubDt == null) return false;
+        if (startDt != null && pubDt.isBefore(startDt)) return false;
+        if (endDt != null && !pubDt.isBefore(endDt)) return false;
       }
       return true;
     }).toList();
 
     filtered.sort((a, b) {
       if (sortBy == 'views') {
-        final va =
-            ((a['view_count'] ?? 0) as int) + ((a['views_total'] ?? 0) as int);
-        final vb =
-            ((b['view_count'] ?? 0) as int) + ((b['views_total'] ?? 0) as int);
+        final va = safeIntVal(a['view_count']) + safeIntVal(a['views_total']);
+        final vb = safeIntVal(b['view_count']) + safeIntVal(b['views_total']);
         return vb.compareTo(va);
       } else if (sortBy == 'likes') {
-        return ((b['like_count'] ?? 0) as int).compareTo(
-          (a['like_count'] ?? 0) as int,
-        );
+        return safeIntVal(b['like_count']).compareTo(safeIntVal(a['like_count']));
+      } else {
+        final pa = (a['published_at'] ?? '').toString().trim();
+        final pb = (b['published_at'] ?? '').toString().trim();
+        if (pa.isEmpty && pb.isEmpty) return 0;
+        if (pa.isEmpty) return 1;
+        if (pb.isEmpty) return -1;
+        final da = DateTime.tryParse(pa)?.toUtc();
+        final db = DateTime.tryParse(pb)?.toUtc();
+        if (da != null && db != null) {
+          return sortBy == 'oldest' ? da.compareTo(db) : db.compareTo(da);
+        }
+        return sortBy == 'oldest' ? pa.compareTo(pb) : pb.compareTo(pa);
       }
-      return (b['published_at'] ?? '').toString().compareTo(
-        (a['published_at'] ?? '').toString(),
-      );
     });
 
     final total = filtered.length;
     final pages = total == 0 ? 1 : ((total + limit - 1) ~/ limit);
-    final safePage = currentPage > pages ? pages : currentPage;
+    final safePage = currentPage.clamp(1, pages);
     final startIdx = (safePage - 1) * limit;
     final endIdx = (startIdx + limit > total) ? total : startIdx + limit;
 
     setState(() {
       isStandaloneMode = true;
-      channels = List<Map<String, dynamic>>.from(_localChannels);
+      channels = visibleChannels;
       totalVideos = total;
       totalPages = pages;
       currentPage = safePage;
@@ -838,6 +1027,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         final rProg = (rState['progress'] as int?) ?? 0;
         final rNewVids = (rState['new_videos'] as int?) ?? 0;
 
+        if (!mounted) return;
         setState(() {
           isStandaloneMode = false;
           channels = List<Map<String, dynamic>>.from(sData['channels'] ?? []);
@@ -848,6 +1038,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           tabLimits = parsedTabLimits;
           sortBy = (sess['sort_by'] ?? 'time').toString();
           period = (sess['period'] ?? 'all').toString();
+          customDate = _parseDateIso(sess['custom_date']);
+          customRangeStart = _parseDateIso(sess['range_start']);
+          customRangeEnd = _parseDateIso(sess['range_end']);
           selectedRegion = (sess['region'] ?? 'all').toString();
           if (period.endsWith('y') &&
               int.tryParse(period.substring(0, period.length - 1)) != null) {
@@ -944,6 +1137,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       tabLimits[tabKey] = newLimit;
     }
     if (!isStandaloneMode) {
+      final bounds = _computePeriodUtcBounds();
       try {
         await http.post(
           Uri.parse('$baseUrl/api/ui-state'),
@@ -951,6 +1145,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           body: jsonEncode({
             'sort_by': sortBy,
             'period': period,
+            'custom_date': _toDateIso(customDate),
+            'range_start': _toDateIso(customRangeStart),
+            'range_end': _toDateIso(customRangeEnd),
+            'start_at': bounds.$1 ?? '',
+            'end_at': bounds.$2 ?? '',
             'region': selectedRegion,
             'channel_id': selectedChannelId,
             'q': searchQuery,
@@ -975,6 +1174,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         } catch (_) {}
       }
       final addedCount = refreshNewVideosCount;
+      if (!mounted) return;
       setState(() {
         refreshReadyGreen = false;
         refreshProgress = 0;
@@ -1023,6 +1223,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     }
 
     // 3. Tombol MERAH ditekan -> Mulai sinkronisasi di latar belakang (0% -> 100%) tanpa harus ditunggu
+    if (!mounted) return;
     setState(() {
       refreshingYouTube = true;
       refreshProgress = 2;
@@ -1040,12 +1241,15 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           await _standaloneSyncSubscriptionsByMyChannel();
         }
         final targetChs = _localChannels
-            .where(
-              (ch) =>
-                  !(ch['channel_id'] ?? '').toString().startsWith('UC_demo_') &&
-                  (selectedChannelId.isEmpty ||
-                      ch['channel_id'] == selectedChannelId),
-            )
+            .where((ch) {
+              final cid = (ch['channel_id'] ?? '').toString();
+              if (cid.startsWith('UC_demo_')) return false;
+              if ((ch['status'] ?? 'subscribed') == 'unfollowed' ||
+                  _localUnsubscribedIds.contains(cid)) {
+                return false;
+              }
+              return selectedChannelId.isEmpty || cid == selectedChannelId;
+            })
             .toList();
         await _standaloneRefreshChannelRegions(targetChs);
         await _standaloneFastRefreshChannels(targetChs);
@@ -1101,10 +1305,16 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       final stateRes = await http
           .get(Uri.parse('$baseUrl/api/state'))
           .timeout(const Duration(seconds: 4));
+      final bounds = _computePeriodUtcBounds();
       final uri = Uri.parse('$baseUrl/api/videos').replace(
         queryParameters: {
           'sort_by': sortBy,
           'period': period,
+          'custom_date': _toDateIso(customDate),
+          'range_start': _toDateIso(customRangeStart),
+          'range_end': _toDateIso(customRangeEnd),
+          'start_at': bounds.$1 ?? '',
+          'end_at': bounds.$2 ?? '',
           'region': selectedRegion,
           'channel_id': selectedChannelId,
           'q': searchQuery,
@@ -1143,6 +1353,55 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             }
           }
         }
+        if (!mounted) return;
+        final nextTotalVideos =
+            int.tryParse((vData['total'] ?? 0).toString()) ?? 0;
+        final nextTotalPages =
+            (int.tryParse((vData['total_pages'] ?? 1).toString()) ?? 1).clamp(
+              1,
+              999999,
+            );
+        if (fetchedVideos.isEmpty &&
+            nextTotalVideos > 0 &&
+            currentPage > nextTotalPages) {
+          currentPage = nextTotalPages;
+          final clampedUri = uri.replace(
+            queryParameters: {
+              ...uri.queryParameters,
+              'page': currentPage.toString(),
+            },
+          );
+          final retryRes = await http
+              .get(clampedUri)
+              .timeout(const Duration(seconds: 15));
+          if (retryRes.statusCode == 200 && mounted) {
+            final retryData = jsonDecode(retryRes.body);
+            final retryVideos = List<Map<String, dynamic>>.from(
+              retryData['items'] ?? [],
+            );
+            for (final fetched in retryVideos) {
+              for (final saved in _localVideos) {
+                if ((saved['video_id'] ?? '').toString() ==
+                    (fetched['video_id'] ?? '').toString()) {
+                  _mergeUsageCounts(fetched, saved);
+                  break;
+                }
+              }
+            }
+            setState(() {
+              isStandaloneMode = false;
+              channels = fetchedChannels;
+              _sortChannelsByWatchedDesc(channels);
+              hasApiKey = sData['has_api_key'] ?? false;
+              apiKeyPreview = sData['api_key_preview'] ?? '';
+              videos = retryVideos;
+              totalVideos = nextTotalVideos;
+              totalPages = nextTotalPages;
+              loading = false;
+            });
+            return;
+          }
+        }
         setState(() {
           isStandaloneMode = false;
           channels = fetchedChannels;
@@ -1150,8 +1409,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           hasApiKey = sData['has_api_key'] ?? false;
           apiKeyPreview = sData['api_key_preview'] ?? '';
           videos = fetchedVideos;
-          totalVideos = vData['total'] ?? 0;
-          totalPages = vData['total_pages'] ?? 1;
+          totalVideos = nextTotalVideos;
+          totalPages = nextTotalPages;
+          currentPage = currentPage.clamp(1, nextTotalPages);
           loading = false;
         });
         return;
@@ -1486,7 +1746,10 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       '/youtube/v3/channels',
       queryParams,
     );
-    final chRes = await http.get(chUri);
+    final chRes = await http.get(chUri).timeout(const Duration(seconds: 12));
+    if (chRes.statusCode != 200) {
+      throw Exception('Gagal mengambil info channel (${chRes.statusCode}).');
+    }
     final chData = jsonDecode(chRes.body);
     final items = (chData['items'] as List?) ?? [];
     if (items.isEmpty) {
@@ -1516,6 +1779,14 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                 (cid.startsWith('UC') ? 'UU${cid.substring(2)}' : cid))
             .toString();
 
+    _localUnsubscribedIds.remove(cid);
+    Map<String, dynamic>? prevCh;
+    for (final c in _localChannels) {
+      if ((c['channel_id'] ?? '').toString() == cid) {
+        prevCh = c;
+        break;
+      }
+    }
     _localChannels.removeWhere((c) => c['channel_id'] == cid);
     _localChannels.add({
       'channel_id': cid,
@@ -1524,7 +1795,12 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       'thumbnail_url': thumbUrl,
       'uploads_playlist_id': uploadsPid,
       'source': 'manual',
-      'video_count': 0,
+      'video_count': prevCh?['video_count'] ?? 0,
+      'watched_count': prevCh?['watched_count'] ?? 0,
+      'views_hp': prevCh?['views_hp'] ?? 0,
+      'views_laptop': prevCh?['views_laptop'] ?? 0,
+      'views_total': prevCh?['views_total'] ?? 0,
+      'status': 'subscribed',
       'region': region,
     });
 
@@ -1535,7 +1811,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       'maxResults': '50',
       'key': localApiKey,
     });
-    final plRes = await http.get(plUri);
+    final plRes = await http.get(plUri).timeout(const Duration(seconds: 12));
+    if (plRes.statusCode != 200) {
+      await _saveStandaloneData();
+      return;
+    }
     final plItems = (jsonDecode(plRes.body)['items'] as List?) ?? [];
     final videoIds = plItems
         .map((e) => (e['contentDetails']?['videoId'] ?? '').toString())
@@ -1548,8 +1828,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         'id': videoIds.join(','),
         'key': localApiKey,
       });
-      final vRes = await http.get(vUri);
-      final vItems = (jsonDecode(vRes.body)['items'] as List?) ?? [];
+      final vRes = await http.get(vUri).timeout(const Duration(seconds: 12));
+      if (vRes.statusCode == 200) {
+        final vItems = (jsonDecode(vRes.body)['items'] as List?) ?? [];
       for (final v in vItems) {
         final vid = v['id'].toString();
         final vsnip = v['snippet'] ?? {};
@@ -1594,19 +1875,28 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           _localVideos.add(nextVideo);
         }
       }
+      }
     }
     await _saveStandaloneData();
   }
 
   String _parseIsoDuration(String iso) {
-    final reg = RegExp(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?');
-    final m = reg.firstMatch(iso);
+    final reg = RegExp(r'^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$');
+    final m = reg.firstMatch(iso.trim());
     if (m == null) return '';
-    final h = int.tryParse(m.group(1) ?? '0') ?? 0;
-    final mins = int.tryParse(m.group(2) ?? '0') ?? 0;
-    final s = int.tryParse(m.group(3) ?? '0') ?? 0;
-    if (h > 0) {
-      return '$h:${mins.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+    if (m.group(1) == null &&
+        m.group(2) == null &&
+        m.group(3) == null &&
+        m.group(4) == null) {
+      return '';
+    }
+    final d = int.tryParse(m.group(1) ?? '0') ?? 0;
+    final h = int.tryParse(m.group(2) ?? '0') ?? 0;
+    final mins = int.tryParse(m.group(3) ?? '0') ?? 0;
+    final s = int.tryParse(m.group(4) ?? '0') ?? 0;
+    final totalH = d * 24 + h;
+    if (totalH > 0) {
+      return '$totalH:${mins.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
     }
     return '$mins:${s.toString().padLeft(2, '0')}';
   }
@@ -1934,6 +2224,42 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     return rawId;
   }
 
+  String? _extractJsonArrayAfterKey(String source, String key) {
+    final keyIdx = source.indexOf(key);
+    if (keyIdx < 0) return null;
+    var start = source.indexOf('[', keyIdx + key.length);
+    if (start < 0) return null;
+    var depth = 0;
+    var inString = false;
+    var escaped = false;
+    for (var i = start; i < source.length; i++) {
+      final ch = source.codeUnitAt(i);
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch == 92 /* \ */ && inString) {
+        escaped = true;
+        continue;
+      }
+      if (ch == 34 /* " */) {
+        inString = !inString;
+        continue;
+      }
+      if (!inString) {
+        if (ch == 91 /* [ */) {
+          depth++;
+        } else if (ch == 93 /* ] */) {
+          depth--;
+          if (depth == 0) {
+            return source.substring(start, i + 1);
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   String _decodeHtmlEntities(String input) {
     var text = input
         .replaceAll('&amp;', '&')
@@ -2008,7 +2334,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
 
     onProgress(45);
 
-    // 2. Fallback: ekstrak captionTracks dari halaman watch YouTube
+    // 2. Fallback: ekstrak captionTracks dari halaman watch YouTube (balanced bracket scan)
     if (tracks.isEmpty) {
       final watchRes = await http
           .get(
@@ -2020,10 +2346,15 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           )
           .timeout(const Duration(seconds: 12));
       if (watchRes.statusCode == 200) {
-        final m = RegExp(r'"captionTracks":(\[.*?\])').firstMatch(watchRes.body);
-        if (m != null) {
-          final parsed = jsonDecode(m.group(1)!);
-          if (parsed is List) tracks = parsed;
+        final rawArray = _extractJsonArrayAfterKey(
+          watchRes.body,
+          '"captionTracks":',
+        );
+        if (rawArray != null) {
+          try {
+            final parsed = jsonDecode(rawArray);
+            if (parsed is List) tracks = parsed;
+          } catch (_) {}
         }
       }
     }
@@ -2217,6 +2548,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           var errorMsg = '';
           var pasteInlineError = '';
           var cancelled = false;
+          var pasteBusy = false;
           Timer? smoothTimer;
 
           void closeDialog() {
@@ -2253,39 +2585,48 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               }
 
               Future<void> applyPastedTranscript(String rawText) async {
-                final cleaned = rawText.replaceAll('\r\n', '\n').trim();
-                if (cleaned.isEmpty) {
+                if (pasteBusy) return;
+                pasteBusy = true;
+                try {
+                  final cleaned = rawText.replaceAll('\r\n', '\n').trim();
+                  if (cleaned.isEmpty) {
+                    if (!ctx.mounted) return;
+                    setDialogState(() {
+                      pasteInlineError =
+                          'Clipboard masih kosong. Klik "Salin" di TubeTranscript dulu atau tempel manual di kolom bawah.';
+                    });
+                    return;
+                  }
+                  final isJustUrl = RegExp(r'^https?://\S+$').hasMatch(cleaned);
+                  if (isJustUrl) {
+                    if (!ctx.mounted) return;
+                    setDialogState(() {
+                      pasteInlineError =
+                          'Teks yang tersalin masih berupa link URL, bukan isi transkrip.';
+                    });
+                    return;
+                  }
+                  if (rawId.isNotEmpty) {
+                    _transcriptCache[rawId] = cleaned;
+                  }
+                  final combined = await _buildTranscriptWithPrompt(
+                    selectedAsset,
+                    cleaned,
+                  );
+                  if (cancelled || !ctx.mounted) return;
                   setDialogState(() {
-                    pasteInlineError =
-                        'Clipboard masih kosong. Klik "Salin" di TubeTranscript dulu atau tempel manual di kolom bawah.';
+                    progress = 100;
+                    compiledResult = combined;
+                    pasteInlineError = '';
+                    step = 'ready';
                   });
-                  return;
+                } finally {
+                  pasteBusy = false;
                 }
-                final isJustUrl = RegExp(r'^https?://\S+$').hasMatch(cleaned);
-                if (isJustUrl) {
-                  setDialogState(() {
-                    pasteInlineError =
-                        'Teks yang tersalin masih berupa link URL, bukan isi transkrip.';
-                  });
-                  return;
-                }
-                if (rawId.isNotEmpty) {
-                  _transcriptCache[rawId] = cleaned;
-                }
-                final combined = await _buildTranscriptWithPrompt(
-                  selectedAsset,
-                  cleaned,
-                );
-                if (cancelled || !ctx.mounted) return;
-                setDialogState(() {
-                  progress = 100;
-                  compiledResult = combined;
-                  pasteInlineError = '';
-                  step = 'ready';
-                });
               }
 
               Future<void> handlePasteButton() async {
+                if (pasteBusy) return;
                 final manualText = pasteController.text.trim();
                 if (manualText.isNotEmpty) {
                   await applyPastedTranscript(manualText);
@@ -2309,6 +2650,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                 String label,
                 String assetPath,
               ) async {
+                if (step != 'select') return;
                 if (_useTubeTranscript) {
                   await openTubeTranscriptForPrompt(label, assetPath);
                   return;
@@ -2383,7 +2725,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                 ),
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 460),
-                  child: Padding(
+                  child: SingleChildScrollView(
                     padding: const EdgeInsets.fromLTRB(16, 12, 12, 18),
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
@@ -2847,22 +3189,28 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                               ),
                             ),
                             onPressed: () async {
+                              var copiedOk = false;
                               try {
                                 await Clipboard.setData(
                                   ClipboardData(text: compiledResult),
                                 );
+                                copiedOk = true;
                               } catch (_) {}
                               if (mounted) {
                                 ScaffoldMessenger.of(context).showSnackBar(
                                   SnackBar(
-                                    backgroundColor: const Color(0xFF1B5E20),
+                                    backgroundColor: copiedOk
+                                        ? const Color(0xFF1B5E20)
+                                        : Colors.orangeAccent,
                                     content: Text(
-                                      '✅ Transkrip + Prompt $selectedLabel berhasil di-copy ke Clipboard!',
+                                      copiedOk
+                                          ? '✅ Transkrip + Prompt $selectedLabel berhasil di-copy ke Clipboard!'
+                                          : '⚠️ Gagal menyalin ke Clipboard. Coba ulangi atau izinkan clipboard browser.',
                                     ),
                                   ),
                                 );
                               }
-                              if (ctx.mounted) {
+                              if (ctx.mounted && copiedOk) {
                                 setDialogState(() {
                                   step = 'select';
                                   progress = 1;
@@ -2959,6 +3307,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       if (selectedChannelId == channelId) {
         selectedChannelId = '';
       }
+      currentPage = 1;
     });
 
     if (isStandaloneMode || _isHpDevice) {
@@ -3500,68 +3849,74 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
 
   Future<void> _importSyncJson() async {
     final ctrl = TextEditingController();
-    await showDialog(
-      context: context,
-      builder: (ctx) {
-        return AlertDialog(
-          backgroundColor: const Color(0xFF1E1E1E),
-          title: const Text(
-            'Import Paket Data Sync',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text(
-                'Tempelkan isi JSON data sync dari perangkat lain:',
-                style: TextStyle(fontSize: 12, color: Colors.white70),
+    try {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) {
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1E1E1E),
+            title: const Text(
+              'Import Paket Data Sync',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'Tempelkan isi JSON data sync dari perangkat lain:',
+                    style: TextStyle(fontSize: 12, color: Colors.white70),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: ctrl,
+                    maxLines: 6,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontFamily: 'monospace',
+                      color: Colors.white,
+                    ),
+                    decoration: const InputDecoration(
+                      hintText:
+                          '{"device": "...", "videos": [...], "channels": [...]}',
+                      hintStyle: TextStyle(color: Colors.white24, fontSize: 11),
+                      filled: true,
+                      fillColor: Color(0xFF282828),
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ],
               ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: ctrl,
-                maxLines: 6,
-                style: const TextStyle(
-                  fontSize: 12,
-                  fontFamily: 'monospace',
-                  color: Colors.white,
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text(
+                  'Batal',
+                  style: TextStyle(color: Colors.white54),
                 ),
-                decoration: const InputDecoration(
-                  hintText:
-                      '{"device": "...", "videos": [...], "channels": [...]}',
-                  hintStyle: TextStyle(color: Colors.white24, fontSize: 11),
-                  filled: true,
-                  fillColor: Color(0xFF282828),
-                  border: OutlineInputBorder(),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFFFF0033),
+                  foregroundColor: Colors.white,
                 ),
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  _applySyncDataString(ctrl.text);
+                },
+                child: const Text('Terapkan Sync'),
               ),
             ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text(
-                'Batal',
-                style: TextStyle(color: Colors.white54),
-              ),
-            ),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFFFF0033),
-                foregroundColor: Colors.white,
-              ),
-              onPressed: () {
-                Navigator.pop(ctx);
-                _applySyncDataString(ctrl.text);
-              },
-              child: const Text('Terapkan Sync'),
-            ),
-          ],
-        );
-      },
-    );
+          );
+        },
+      );
+    } finally {
+      ctrl.dispose();
+    }
   }
 
-  void _applySyncDataString(String rawJson) {
+  Future<void> _applySyncDataString(String rawJson) async {
     try {
       final data = jsonDecode(rawJson.trim());
       final remoteVids = (data['videos'] as List?) ?? [];
@@ -3573,6 +3928,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         for (final c in remoteChs) (c['channel_id'] ?? '').toString(): c,
       };
 
+      final localChIds = <String>{
+        for (final c in _localChannels) (c['channel_id'] ?? '').toString(),
+      };
+
+      if (!mounted) return;
       setState(() {
         for (final v in _localVideos) {
           final vid = (v['video_id'] ?? '').toString();
@@ -3614,11 +3974,25 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             if (rc['region'] != null) c['region'] = rc['region'];
           }
         }
+        for (final entry in remoteChMap.entries) {
+          final cid = entry.key;
+          if (cid.isNotEmpty && !localChIds.contains(cid) && entry.value is Map) {
+            final rc = Map<String, dynamic>.from(entry.value as Map);
+            _localChannels.add(rc);
+          }
+        }
         _sortChannelsByWatchedDesc(_localChannels);
         _sortChannelsByWatchedDesc(channels);
       });
 
-      _applyLocalFilterAndPagination();
+      await _saveStandaloneData();
+      if (!mounted) return;
+      if (isStandaloneMode) {
+        _applyLocalFilterAndPagination();
+      } else {
+        await _fetchVideos(silent: true);
+      }
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: const Color(0xFF1B5E20),
@@ -3628,6 +4002,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         ),
       );
     } catch (e) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: Colors.redAccent,
@@ -3663,425 +4038,512 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     );
   }
 
-  void _showAddChannelModal() {
+  Future<void> _showAddChannelModal() async {
     final handleCtrl = TextEditingController();
     final csvCtrl = TextEditingController();
     bool busy = false;
     String? modalError;
 
-    showDialog(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setModalState) => AlertDialog(
-          backgroundColor: const Color(0xFF212121),
-          title: const Text('Tambah Channel Follower / Import Excel CSV'),
-          content: SizedBox(
-            width: 520,
-            child: SingleChildScrollView(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Text(
-                    '1. Tambah 1 Channel (@handle, Link Channel, atau ID UC...):',
-                    style: TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: handleCtrl,
-                          decoration: const InputDecoration(
-                            hintText: 'Contoh: @FerryIrwandi atau @RadityaDika',
-                            filled: true,
-                            fillColor: Color(0xFF121212),
-                            border: OutlineInputBorder(),
-                            isDense: true,
+    try {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setModalState) => AlertDialog(
+            backgroundColor: const Color(0xFF212121),
+            title: const Text('Tambah Channel Follower / Import Excel CSV'),
+            content: SizedBox(
+              width: 520,
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      '1. Tambah 1 Channel (@handle, Link Channel, atau ID UC...):',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: handleCtrl,
+                            decoration: const InputDecoration(
+                              hintText: 'Contoh: @FerryIrwandi atau @RadityaDika',
+                              filled: true,
+                              fillColor: Color(0xFF121212),
+                              border: OutlineInputBorder(),
+                              isDense: true,
+                            ),
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFFFF0033),
-                          foregroundColor: Colors.white,
-                        ),
-                        onPressed: busy
-                            ? null
-                            : () async {
-                                setModalState(() {
-                                  busy = true;
-                                  modalError = null;
-                                });
-                                try {
-                                  if (isStandaloneMode) {
-                                    await _standaloneAddAndSyncChannel(
-                                      handleCtrl.text,
-                                    );
-                                    if (ctx.mounted) Navigator.pop(ctx);
-                                    _applyLocalFilterAndPagination();
-                                  } else {
-                                    final res = await http.post(
-                                      Uri.parse('$baseUrl/api/channels'),
-                                      headers: {
-                                        'Content-Type': 'application/json',
-                                      },
-                                      body: jsonEncode({
-                                        'identifier': handleCtrl.text,
-                                      }),
-                                    );
-                                    if (res.statusCode == 200) {
+                        const SizedBox(width: 8),
+                        ElevatedButton(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFFFF0033),
+                            foregroundColor: Colors.white,
+                          ),
+                          onPressed: busy
+                              ? null
+                              : () async {
+                                  setModalState(() {
+                                    busy = true;
+                                    modalError = null;
+                                  });
+                                  try {
+                                    if (isStandaloneMode) {
+                                      await _standaloneAddAndSyncChannel(
+                                        handleCtrl.text,
+                                      );
                                       if (ctx.mounted) Navigator.pop(ctx);
-                                      _refreshAll();
+                                      if (mounted) {
+                                        _applyLocalFilterAndPagination();
+                                      }
                                     } else {
-                                      final err = jsonDecode(res.body);
+                                      final res = await http
+                                          .post(
+                                            Uri.parse('$baseUrl/api/channels'),
+                                            headers: {
+                                              'Content-Type':
+                                                  'application/json',
+                                            },
+                                            body: jsonEncode({
+                                              'identifier': handleCtrl.text,
+                                            }),
+                                          )
+                                          .timeout(const Duration(seconds: 25));
+                                      if (res.statusCode == 200) {
+                                        if (ctx.mounted) Navigator.pop(ctx);
+                                        if (mounted) _refreshAll();
+                                      } else {
+                                        String detail = 'Gagal menambah channel';
+                                        try {
+                                          final err = jsonDecode(res.body);
+                                          detail =
+                                              (err['detail'] ?? detail)
+                                                  .toString();
+                                        } catch (_) {}
+                                        if (ctx.mounted) {
+                                          setModalState(() {
+                                            modalError = detail;
+                                            busy = false;
+                                          });
+                                        }
+                                      }
+                                    }
+                                  } catch (e) {
+                                    if (ctx.mounted) {
                                       setModalState(() {
-                                        modalError =
-                                            err['detail'] ??
-                                            'Gagal menambah channel';
+                                        modalError = e.toString().replaceAll(
+                                          'Exception: ',
+                                          '',
+                                        );
                                         busy = false;
                                       });
                                     }
                                   }
-                                } catch (e) {
-                                  setModalState(() {
-                                    modalError = e.toString().replaceAll(
-                                      'Exception: ',
-                                      '',
-                                    );
-                                    busy = false;
-                                  });
-                                }
-                              },
-                        child: const Text('Tambah'),
+                                },
+                          child: const Text('Tambah'),
+                        ),
+                      ],
+                    ),
+                    const Divider(height: 28),
+                    const Text(
+                      '2. Atau Paste Banyak Channel dari Excel / CSV (1 baris per channel):',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 6),
+                    const Text(
+                      'Bisa paste daftar @handle atau isi file subscriptions.csv dari YouTube:',
+                      style: TextStyle(fontSize: 12, color: Colors.white70),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: csvCtrl,
+                      maxLines: 5,
+                      decoration: const InputDecoration(
+                        hintText:
+                            '@FajrulFx\n@FerryIrwandi\n@RadityaDika\natau UCxxxx,https://...,Nama Channel',
+                        filled: true,
+                        fillColor: Color(0xFF121212),
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    if (modalError != null) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        modalError!,
+                        style: const TextStyle(color: Colors.redAccent),
                       ),
                     ],
-                  ),
-                  const Divider(height: 28),
-                  const Text(
-                    '2. Atau Paste Banyak Channel dari Excel / CSV (1 baris per channel):',
-                    style: TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 6),
-                  const Text(
-                    'Bisa paste daftar @handle atau isi file subscriptions.csv dari YouTube:',
-                    style: TextStyle(fontSize: 12, color: Colors.white70),
-                  ),
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: csvCtrl,
-                    maxLines: 5,
-                    decoration: const InputDecoration(
-                      hintText:
-                          '@FajrulFx\n@FerryIrwandi\n@RadityaDika\natau UCxxxx,https://...,Nama Channel',
-                      filled: true,
-                      fillColor: Color(0xFF121212),
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  if (modalError != null) ...[
-                    const SizedBox(height: 12),
-                    Text(
-                      modalError!,
-                      style: const TextStyle(color: Colors.redAccent),
-                    ),
                   ],
-                ],
+                ),
               ),
             ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Tutup'),
-            ),
-            ElevatedButton.icon(
-              icon: const Icon(Icons.upload_file, size: 18),
-              label: const Text('Import Daftar CSV'),
-              onPressed: busy
-                  ? null
-                  : () async {
-                      setModalState(() {
-                        busy = true;
-                        modalError = null;
-                      });
-                      if (isStandaloneMode) {
-                        for (final line in csvCtrl.text.split('\n')) {
-                          final trimmed = line.trim();
-                          if (trimmed.isEmpty) continue;
-                          final cols = trimmed.split(',');
-                          if (cols[0].startsWith('UC') && cols.length >= 3) {
-                            final cid = cols[0].trim();
-                            final title = cols[2].trim();
-                            _localChannels.removeWhere(
-                              (c) => c['channel_id'] == cid,
-                            );
-                            _localChannels.add({
-                              'channel_id': cid,
-                              'title': title,
-                              'handle': '',
-                              'thumbnail_url': '',
-                              'uploads_playlist_id': 'UU${cid.substring(2)}',
-                              'source': 'csv',
-                              'video_count': 0,
-                            });
-                          } else if (localApiKey.isNotEmpty) {
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Tutup'),
+              ),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.upload_file, size: 18),
+                label: const Text('Import Daftar CSV'),
+                onPressed: busy
+                    ? null
+                    : () async {
+                        setModalState(() {
+                          busy = true;
+                          modalError = null;
+                        });
+                        try {
+                          if (isStandaloneMode) {
+                            for (final line in csvCtrl.text.split('\n')) {
+                              final trimmed = line.trim();
+                              if (trimmed.isEmpty) continue;
+                              final cols = trimmed.split(',');
+                              final first = cols[0].trim();
+                              if (first.isEmpty) continue;
+                              if (first.startsWith('UC') && cols.length >= 2) {
+                                final cid = first;
+                                final col1 = cols[1].trim();
+                                final col2 =
+                                    cols.length >= 3 ? cols[2].trim() : '';
+                                final title = col1.startsWith('http')
+                                    ? (col2.isNotEmpty ? col2 : cid)
+                                    : (col1.isNotEmpty ? col1 : (col2.isNotEmpty ? col2 : cid));
+                                _localUnsubscribedIds.remove(cid);
+                                _localChannels.removeWhere(
+                                  (c) => c['channel_id'] == cid,
+                                );
+                                _localChannels.add({
+                                  'channel_id': cid,
+                                  'title': title,
+                                  'handle': col2.startsWith('@') ? col2 : '',
+                                  'thumbnail_url': '',
+                                  'uploads_playlist_id': 'UU${cid.substring(2)}',
+                                  'source': 'csv',
+                                  'video_count': 0,
+                                  'status': 'subscribed',
+                                });
+                              } else if (localApiKey.isNotEmpty) {
+                                try {
+                                  await _standaloneAddAndSyncChannel(first);
+                                } catch (_) {}
+                              }
+                            }
+                            await _saveStandaloneData();
+                            if (ctx.mounted) Navigator.pop(ctx);
+                            if (mounted) _applyLocalFilterAndPagination();
+                            return;
+                          }
+                          final res = await http
+                              .post(
+                                Uri.parse('$baseUrl/api/channels/import-csv'),
+                                headers: {'Content-Type': 'application/json'},
+                                body: jsonEncode({'csv_text': csvCtrl.text}),
+                              )
+                              .timeout(const Duration(seconds: 30));
+                          if (res.statusCode == 200) {
+                            if (ctx.mounted) Navigator.pop(ctx);
+                            if (mounted) _refreshAll();
+                          } else {
+                            String detail = 'Gagal import CSV';
                             try {
-                              await _standaloneAddAndSyncChannel(cols[0]);
+                              final err = jsonDecode(res.body);
+                              detail = (err['detail'] ?? detail).toString();
                             } catch (_) {}
+                            if (ctx.mounted) {
+                              setModalState(() {
+                                modalError = detail;
+                                busy = false;
+                              });
+                            }
+                          }
+                        } catch (e) {
+                          if (ctx.mounted) {
+                            setModalState(() {
+                              modalError = e.toString().replaceAll(
+                                'Exception: ',
+                                '',
+                              );
+                              busy = false;
+                            });
                           }
                         }
-                        if (ctx.mounted) Navigator.pop(ctx);
-                        _applyLocalFilterAndPagination();
-                        return;
-                      }
-                      final res = await http.post(
-                        Uri.parse('$baseUrl/api/channels/import-csv'),
-                        headers: {'Content-Type': 'application/json'},
-                        body: jsonEncode({'csv_text': csvCtrl.text}),
-                      );
-                      if (res.statusCode == 200) {
-                        if (ctx.mounted) Navigator.pop(ctx);
-                        _refreshAll();
-                      } else {
-                        final err = jsonDecode(res.body);
-                        setModalState(() {
-                          modalError = err['detail'] ?? 'Gagal import CSV';
-                          busy = false;
-                        });
-                      }
-                    },
-            ),
-          ],
+                      },
+              ),
+            ],
+          ),
         ),
-      ),
-    );
+      );
+    } finally {
+      handleCtrl.dispose();
+      csvCtrl.dispose();
+    }
   }
 
-  void _showApiSettingsModal() {
+  Future<void> _showApiSettingsModal() async {
     final apiKeyCtrl = TextEditingController(text: localApiKey);
     final oauthCtrl = TextEditingController(text: localOauthToken);
     final serverCtrl = TextEditingController(text: baseUrl);
     bool syncing = false;
     String? statusMsg;
 
-    showDialog(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setModalState) => AlertDialog(
-          backgroundColor: const Color(0xFF212121),
-          title: const Text(
-            'Pengaturan API YouTube (Gratis) & Mode Mandiri HP',
-          ),
-          content: SizedBox(
-            width: 540,
-            child: SingleChildScrollView(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: isStandaloneMode
-                          ? const Color(0xFF1B3B2B)
-                          : const Color(0xFF1A2B3C),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          isStandaloneMode
-                              ? Icons.phone_android
-                              : Icons.computer,
-                          color: Colors.greenAccent,
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Text(
+    try {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setModalState) => AlertDialog(
+            backgroundColor: const Color(0xFF212121),
+            title: const Text(
+              'Pengaturan API YouTube (Gratis) & Mode Mandiri HP',
+            ),
+            content: SizedBox(
+              width: 540,
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: isStandaloneMode
+                            ? const Color(0xFF1B3B2B)
+                            : const Color(0xFF1A2B3C),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
                             isStandaloneMode
-                                ? 'Mode Mandiri Aktif: Aplikasi jalan sendiri langsung di HP/Perangkat tanpa butuh Backend Python!'
-                                : 'Mode Terhubung Backend Python ($baseUrl)',
-                            style: const TextStyle(
-                              fontSize: 12.5,
-                              fontWeight: FontWeight.w600,
+                                ? Icons.phone_android
+                                : Icons.computer,
+                            color: Colors.greenAccent,
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              isStandaloneMode
+                                  ? 'Mode Mandiri Aktif: Aplikasi jalan sendiri langsung di HP/Perangkat tanpa butuh Backend Python!'
+                                  : 'Mode Terhubung Backend Python ($baseUrl)',
+                              style: const TextStyle(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                              ),
                             ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 12),
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF181818),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.white24),
-                    ),
-                    child: const Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '💡 Cara Dapat YouTube API Key Gratis (1 Menit, Rp 0):',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            color: Colors.amberAccent,
-                          ),
-                        ),
-                        SizedBox(height: 4),
-                        Text(
-                          '1. Buka console.cloud.google.com -> Buat Project baru.\n'
-                          '2. Buka menu "APIs & Services" -> "Library" -> Cari "YouTube Data API v3" -> Klik Enable.\n'
-                          '3. Buka "Credentials" -> "Create Credentials" -> Pilih "API Key" -> Copy & Paste di bawah.',
-                          style: TextStyle(fontSize: 12, color: Colors.white70),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  Text(
-                    'YouTube API Key ${hasApiKey ? "(Sudah Terpasang)" : "(Belum Diisi)"}:',
-                    style: const TextStyle(fontWeight: FontWeight.w600),
-                  ),
-                  const SizedBox(height: 6),
-                  TextField(
-                    controller: apiKeyCtrl,
-                    decoration: const InputDecoration(
-                      hintText: 'AIzaSy...',
-                      filled: true,
-                      fillColor: Color(0xFF121212),
-                      border: OutlineInputBorder(),
-                      isDense: true,
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  const Text(
-                    'OAuth 2.0 Access Token (Opsional):',
-                    style: TextStyle(fontWeight: FontWeight.w600),
-                  ),
-                  const SizedBox(height: 6),
-                  TextField(
-                    controller: oauthCtrl,
-                    decoration: const InputDecoration(
-                      hintText: 'ya29.a0...',
-                      filled: true,
-                      fillColor: Color(0xFF121212),
-                      border: OutlineInputBorder(),
-                      isDense: true,
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  const Text(
-                    'Alamat Server Python (Opsional - kosongkan jika jalan mandiri di HP):',
-                    style: TextStyle(fontWeight: FontWeight.w600),
-                  ),
-                  const SizedBox(height: 6),
-                  TextField(
-                    controller: serverCtrl,
-                    decoration: const InputDecoration(
-                      hintText: 'http://127.0.0.1:8000',
-                      filled: true,
-                      fillColor: Color(0xFF121212),
-                      border: OutlineInputBorder(),
-                      isDense: true,
-                    ),
-                  ),
-                  if (statusMsg != null) ...[
                     const SizedBox(height: 12),
-                    Text(
-                      statusMsg!,
-                      style: const TextStyle(color: Colors.greenAccent),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF181818),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.white24),
+                      ),
+                      child: const Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '💡 Cara Dapat YouTube API Key Gratis (1 Menit, Rp 0):',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: Colors.amberAccent,
+                            ),
+                          ),
+                          SizedBox(height: 4),
+                          Text(
+                            '1. Buka console.cloud.google.com -> Buat Project baru.\n'
+                            '2. Buka menu "APIs & Services" -> "Library" -> Cari "YouTube Data API v3" -> Klik Enable.\n'
+                            '3. Buka "Credentials" -> "Create Credentials" -> Pilih "API Key" -> Copy & Paste di bawah.',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.white70,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
+                    const SizedBox(height: 14),
+                    Text(
+                      'YouTube API Key ${hasApiKey ? "(Sudah Terpasang)" : "(Belum Diisi)"}:',
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: apiKeyCtrl,
+                      decoration: const InputDecoration(
+                        hintText: 'AIzaSy...',
+                        filled: true,
+                        fillColor: Color(0xFF121212),
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    const Text(
+                      'OAuth 2.0 Access Token (Opsional):',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: oauthCtrl,
+                      decoration: const InputDecoration(
+                        hintText: 'ya29.a0...',
+                        filled: true,
+                        fillColor: Color(0xFF121212),
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    const Text(
+                      'Alamat Server Python (Opsional - kosongkan jika jalan mandiri di HP):',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: serverCtrl,
+                      decoration: const InputDecoration(
+                        hintText: 'http://127.0.0.1:8000',
+                        filled: true,
+                        fillColor: Color(0xFF121212),
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                    ),
+                    if (statusMsg != null) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        statusMsg!,
+                        style: const TextStyle(color: Colors.greenAccent),
+                      ),
+                    ],
                   ],
-                ],
+                ),
               ),
             ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () async {
-                if (isStandaloneMode) {
-                  _localChannels.removeWhere((c) => c['source'] == 'demo');
-                  _localVideos.removeWhere((v) => v['is_demo'] == 1);
+            actions: [
+              TextButton(
+                onPressed: () async {
+                  if (isStandaloneMode || baseUrl.trim().isEmpty) {
+                    _localChannels.removeWhere((c) => c['source'] == 'demo');
+                    _localVideos.removeWhere((v) => v['is_demo'] == 1);
+                    await _saveStandaloneData();
+                    if (ctx.mounted) Navigator.pop(ctx);
+                    if (mounted) _applyLocalFilterAndPagination();
+                    return;
+                  }
+                  try {
+                    await http
+                        .delete(Uri.parse('$baseUrl/api/demo'))
+                        .timeout(const Duration(seconds: 10));
+                  } catch (_) {}
                   if (ctx.mounted) Navigator.pop(ctx);
-                  _applyLocalFilterAndPagination();
-                  return;
-                }
-                await http.delete(Uri.parse('$baseUrl/api/demo'));
-                if (ctx.mounted) Navigator.pop(ctx);
-                _refreshAll();
-              },
-              child: const Text(
-                'Hapus Data Demo',
-                style: TextStyle(color: Colors.orangeAccent),
+                  if (mounted) _refreshAll();
+                },
+                child: const Text(
+                  'Hapus Data Demo',
+                  style: TextStyle(color: Colors.orangeAccent),
+                ),
               ),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Tutup'),
-            ),
-            ElevatedButton(
-              onPressed: syncing
-                  ? null
-                  : () async {
-                      setState(() {
-                        localApiKey = apiKeyCtrl.text.trim();
-                        localOauthToken = oauthCtrl.text.trim();
-                        hasApiKey = localApiKey.isNotEmpty;
-                        baseUrl = serverCtrl.text.trim();
-                      });
-                      setModalState(() {
-                        syncing = true;
-                        statusMsg = 'Menyimpan & menyinkronkan video...';
-                      });
-                      if (!isStandaloneMode) {
-                        try {
-                          if (localApiKey.isNotEmpty ||
-                              localOauthToken.isNotEmpty) {
-                            await http.post(
-                              Uri.parse('$baseUrl/api/settings'),
-                              headers: {'Content-Type': 'application/json'},
-                              body: jsonEncode({
-                                'api_key': localApiKey,
-                                'oauth_token': localOauthToken,
-                              }),
-                            );
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Tutup'),
+              ),
+              ElevatedButton(
+                onPressed: syncing
+                    ? null
+                    : () async {
+                        final nextKey = apiKeyCtrl.text.trim();
+                        final nextOauth = oauthCtrl.text.trim();
+                        final nextServer = serverCtrl.text.trim();
+                        if (!mounted) return;
+                        setState(() {
+                          localApiKey = nextKey;
+                          localOauthToken = nextOauth;
+                          hasApiKey = localApiKey.isNotEmpty;
+                          apiKeyPreview = localApiKey.length > 8
+                              ? '${localApiKey.substring(0, 6)}...${localApiKey.substring(localApiKey.length - 4)}'
+                              : (localApiKey.isNotEmpty ? 'Terpasang' : '');
+                          if (nextServer.isEmpty) {
+                            baseUrl = '';
+                            isStandaloneMode = true;
+                          } else {
+                            baseUrl = nextServer;
                           }
-                          await http.post(
-                            Uri.parse('$baseUrl/api/sync'),
-                            headers: {'Content-Type': 'application/json'},
-                            body: jsonEncode({
-                              'import_mode': localOauthToken.isNotEmpty
-                                  ? 'subscriptions'
-                                  : 'none',
-                              'years_back': 4,
-                            }),
-                          );
-                          setState(() {
-                            refreshingYouTube = true;
-                            refreshProgress = 2;
-                            refreshReadyGreen = false;
+                        });
+                        if (ctx.mounted) {
+                          setModalState(() {
+                            syncing = true;
+                            statusMsg = 'Menyimpan & menyinkronkan video...';
                           });
-                          _startRefreshPolling();
-                        } catch (_) {}
-                      }
-                      if (ctx.mounted) Navigator.pop(ctx);
-                      _refreshAll();
-                    },
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFFFF0033),
-                foregroundColor: Colors.white,
+                        }
+                        await _saveStandaloneData();
+                        if (!isStandaloneMode && baseUrl.isNotEmpty) {
+                          try {
+                            if (localApiKey.isNotEmpty ||
+                                localOauthToken.isNotEmpty) {
+                              await http
+                                  .post(
+                                    Uri.parse('$baseUrl/api/settings'),
+                                    headers: {
+                                      'Content-Type': 'application/json',
+                                    },
+                                    body: jsonEncode({
+                                      'api_key': localApiKey,
+                                      'oauth_token': localOauthToken,
+                                    }),
+                                  )
+                                  .timeout(const Duration(seconds: 10));
+                            }
+                            await http
+                                .post(
+                                  Uri.parse('$baseUrl/api/sync'),
+                                  headers: {
+                                    'Content-Type': 'application/json',
+                                  },
+                                  body: jsonEncode({
+                                    'import_mode': localOauthToken.isNotEmpty
+                                        ? 'subscriptions'
+                                        : 'none',
+                                    'years_back': 4,
+                                  }),
+                                )
+                                .timeout(const Duration(seconds: 15));
+                            if (mounted) {
+                              setState(() {
+                                refreshingYouTube = true;
+                                refreshProgress = 2;
+                                refreshReadyGreen = false;
+                              });
+                              _startRefreshPolling();
+                            }
+                          } catch (_) {}
+                        }
+                        if (ctx.mounted) Navigator.pop(ctx);
+                        if (mounted) _refreshAll();
+                      },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFFFF0033),
+                  foregroundColor: Colors.white,
+                ),
+                child: Text(
+                  syncing ? 'Menyinkronkan...' : 'Simpan & Sync Sekarang',
+                ),
               ),
-              child: Text(
-                syncing ? 'Menyinkronkan...' : 'Simpan & Sync Sekarang',
-              ),
-            ),
-          ],
+            ],
+          ),
         ),
-      ),
-    );
+      );
+    } finally {
+      apiKeyCtrl.dispose();
+      oauthCtrl.dispose();
+      serverCtrl.dispose();
+    }
   }
 
   void _cycleSidebarMode() {
@@ -4997,6 +5459,46 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     );
   }
 
+  Future<void> _pickCustomDate({VoidCallback? onApplied}) async {
+    final res = await showDialog<(DateTime, DateTime?)>(
+      context: context,
+      builder: (_) =>
+          _CustomCalendarDialog(isRange: false, initialDate: customDate),
+    );
+    if (res == null || !mounted) return;
+    _yearInputCtrl.clear();
+    setState(() {
+      customDate = res.$1;
+      period = 'custom_date';
+      currentPage = 1;
+    });
+    onApplied?.call();
+    await _saveUiPreferences();
+    await _fetchVideos();
+  }
+
+  Future<void> _pickCustomDateRange({VoidCallback? onApplied}) async {
+    final res = await showDialog<(DateTime, DateTime?)>(
+      context: context,
+      builder: (_) => _CustomCalendarDialog(
+        isRange: true,
+        initialRangeStart: customRangeStart,
+        initialRangeEnd: customRangeEnd,
+      ),
+    );
+    if (res == null || res.$2 == null || !mounted) return;
+    _yearInputCtrl.clear();
+    setState(() {
+      customRangeStart = res.$1;
+      customRangeEnd = res.$2;
+      period = 'custom_range';
+      currentPage = 1;
+    });
+    onApplied?.call();
+    await _saveUiPreferences();
+    await _fetchVideos();
+  }
+
   void _showMobileFilterBottomSheet() {
     showModalBottomSheet(
       context: context,
@@ -5006,18 +5508,21 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (ctx) {
+        var pendingOverlap = false;
         return StatefulBuilder(
           builder: (ctx, setModalState) {
             final periods = [
-              ('all', 'Semua Waktu'),
-              ('week', 'Minggu Ini'),
-              ('month', 'Bulan Ini'),
-              ('year', 'Tahun Ini'),
+              ('all', 'All Time'),
+              ('today', 'Today'),
+              ('week', 'This Week'),
+              ('month', 'This Month'),
+              ('year', 'This Year'),
             ];
             final sorts = [
               ('views', '🔥 View Terbanyak'),
               ('likes', '👍 Like Terbanyak'),
-              ('time', '🕒 Waktu Upload'),
+              ('time', '🕒 Terbaru ke Terlama'),
+              ('oldest', '⏳ Terlama ke Terbaru'),
             ];
 
             Widget regionChoice(String value, String label) {
@@ -5169,31 +5674,102 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                     Wrap(
                       spacing: 8,
                       runSpacing: 8,
-                      children: periods.map((p) {
-                        final active = period == p.$1;
-                        return ChoiceChip(
-                          label: Text(p.$2),
-                          selected: active,
+                      children: [
+                        ...periods.map((p) {
+                          final active = period == p.$1;
+                          return ChoiceChip(
+                            label: Text(p.$2),
+                            selected: active,
+                            selectedColor: Colors.white,
+                            backgroundColor: const Color(0xFF2C2C2C),
+                            labelStyle: TextStyle(
+                              color: active ? Colors.black : Colors.white,
+                              fontWeight: active
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                              fontSize: 12.5,
+                            ),
+                            onSelected: (_) {
+                              _yearInputCtrl.clear();
+                              setState(() {
+                                period = p.$1;
+                                currentPage = 1;
+                              });
+                              setModalState(() {});
+                              _saveUiPreferences();
+                              _fetchVideos();
+                            },
+                          );
+                        }),
+                        ChoiceChip(
+                          avatar: Icon(
+                            Icons.event,
+                            size: 15,
+                            color: period == 'custom_date'
+                                ? Colors.black
+                                : Colors.greenAccent,
+                          ),
+                          label: Text(
+                            period == 'custom_date' && customDate != null
+                                ? 'Custom Date (≤ ${_formatDateId(customDate!)})'
+                                : 'Custom Date',
+                          ),
+                          selected: period == 'custom_date',
                           selectedColor: Colors.white,
                           backgroundColor: const Color(0xFF2C2C2C),
                           labelStyle: TextStyle(
-                            color: active ? Colors.black : Colors.white,
-                            fontWeight: active
+                            color: period == 'custom_date'
+                                ? Colors.black
+                                : Colors.white,
+                            fontWeight: period == 'custom_date'
                                 ? FontWeight.bold
                                 : FontWeight.normal,
                             fontSize: 12.5,
                           ),
                           onSelected: (_) {
-                            _yearInputCtrl.clear();
-                            setState(() {
-                              period = p.$1;
-                              currentPage = 1;
-                            });
-                            setModalState(() {});
-                            _fetchVideos();
+                            _pickCustomDate(
+                              onApplied: () {
+                                if (ctx.mounted) setModalState(() {});
+                              },
+                            );
                           },
-                        );
-                      }).toList(),
+                        ),
+                        ChoiceChip(
+                          avatar: Icon(
+                            Icons.date_range,
+                            size: 15,
+                            color: period == 'custom_range'
+                                ? Colors.black
+                                : Colors.lightBlueAccent,
+                          ),
+                          label: Text(
+                            period == 'custom_range' &&
+                                    customRangeStart != null &&
+                                    customRangeEnd != null
+                                ? 'Custom Date Range (${_formatDateId(customRangeStart!)} – ${_formatDateId(customRangeEnd!)})'
+                                : 'Custom Date Range',
+                          ),
+                          selected: period == 'custom_range',
+                          selectedColor: Colors.white,
+                          backgroundColor: const Color(0xFF2C2C2C),
+                          labelStyle: TextStyle(
+                            color: period == 'custom_range'
+                                ? Colors.black
+                                : Colors.white,
+                            fontWeight: period == 'custom_range'
+                                ? FontWeight.bold
+                                : FontWeight.normal,
+                            fontSize: 12.5,
+                          ),
+                          onSelected: (_) {
+                            _pickCustomDateRange(
+                              onApplied: () {
+                                if (ctx.mounted) setModalState(() {});
+                              },
+                            );
+                          },
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 14),
                     const Text(
@@ -5266,8 +5842,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                                   .toDouble();
 
                           void finishDurationDrag() {
+                            pendingOverlap = false;
                             if (_activeDurationThumb == null) return;
-                            _activeDurationThumb = null;
+                            setModalState(() => _activeDurationThumb = null);
                             setState(() => currentPage = 1);
                             _saveUiPreferences();
                             _fetchVideos();
@@ -5276,6 +5853,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                           return GestureDetector(
                             behavior: HitTestBehavior.opaque,
                             onHorizontalDragStart: (details) {
+                              pendingOverlap = false;
                               final x = details.localPosition.dx;
                               final startX =
                                   trackInset +
@@ -5292,12 +5870,21 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
 
                               if (startDistance <= thumbHitRadius ||
                                   endDistance <= thumbHitRadius) {
-                                setModalState(
-                                  () => _activeDurationThumb =
-                                      startDistance <= endDistance
-                                      ? Thumb.start
-                                      : Thumb.end,
-                                );
+                                if ((durationRange.start - durationRange.end)
+                                        .abs() <
+                                    0.01) {
+                                  pendingOverlap = true;
+                                  setModalState(
+                                    () => _activeDurationThumb = Thumb.end,
+                                  );
+                                } else {
+                                  setModalState(
+                                    () => _activeDurationThumb =
+                                        startDistance <= endDistance
+                                        ? Thumb.start
+                                        : Thumb.end,
+                                  );
+                                }
                               } else {
                                 setModalState(
                                   () => _activeDurationThumb = null,
@@ -5305,10 +5892,19 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                               }
                             },
                             onHorizontalDragUpdate: (details) {
-                              final deltaMinutes =
-                                  (details.primaryDelta ?? 0) /
-                                  trackWidth *
-                                  120;
+                              final rawDelta = details.primaryDelta ?? 0;
+                              if (pendingOverlap && rawDelta != 0) {
+                                pendingOverlap = false;
+                                final picked = rawDelta > 0
+                                    ? Thumb.end
+                                    : Thumb.start;
+                                if (_activeDurationThumb != picked) {
+                                  setModalState(
+                                    () => _activeDurationThumb = picked,
+                                  );
+                                }
+                              }
+                              final deltaMinutes = rawDelta / trackWidth * 120;
                               final thumb = _activeDurationThumb;
                               if (thumb == Thumb.start) {
                                 final start =
@@ -5471,10 +6067,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
 
   Widget _buildFilterAndSortHeader(bool isMobile) {
     final periods = [
-      ('all', 'Semua Waktu'),
-      ('week', 'Minggu Ini'),
-      ('month', 'Bulan Ini'),
-      ('year', 'Tahun Ini'),
+      ('all', 'All Time'),
+      ('today', 'Today'),
+      ('week', 'This Week'),
+      ('month', 'This Month'),
+      ('year', 'This Year'),
     ];
     final isCustomYear =
         period.endsWith('y') &&
@@ -5483,18 +6080,15 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final sorts = [
       ('views', '🔥 View Terbanyak'),
       ('likes', '👍 Like Terbanyak'),
-      ('time', '🕒 Waktu Upload'),
+      ('time', '🕒 Terbaru ke Terlama'),
+      ('oldest', '⏳ Terlama ke Terbaru'),
     ];
 
     if (filterMinimized) {
       final sortLabel = sorts
-          .firstWhere((s) => s.$1 == sortBy, orElse: () => sorts.last)
+          .firstWhere((s) => s.$1 == sortBy, orElse: () => sorts[2])
           .$2;
-      final periodLabel = isCustomYear
-          ? '${period.substring(0, period.length - 1)} Tahun Lalu'
-          : periods
-                .firstWhere((p) => p.$1 == period, orElse: () => periods.first)
-                .$2;
+      final periodLabel = _periodDisplayLabel();
       final regionLabel = selectedRegion == 'Nasional'
           ? '🇮🇩 Nasional'
           : (selectedRegion == 'Internasional'
@@ -5691,10 +6285,59 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               period = p.$1;
               currentPage = 1;
             });
+            _saveUiPreferences();
             _fetchVideos();
           },
         );
       }),
+      ChoiceChip(
+        avatar: Icon(
+          Icons.event,
+          size: 16,
+          color: period == 'custom_date' ? Colors.black : Colors.greenAccent,
+        ),
+        label: Text(
+          period == 'custom_date' && customDate != null
+              ? 'Custom Date (≤ ${_formatDateId(customDate!)})'
+              : 'Custom Date',
+        ),
+        selected: period == 'custom_date',
+        selectedColor: Colors.white,
+        backgroundColor: const Color(0xFF272727),
+        labelStyle: TextStyle(
+          color: period == 'custom_date' ? Colors.black : Colors.white,
+          fontWeight:
+              period == 'custom_date' ? FontWeight.bold : FontWeight.normal,
+          fontSize: 13,
+        ),
+        onSelected: (_) => _pickCustomDate(),
+      ),
+      ChoiceChip(
+        avatar: Icon(
+          Icons.date_range,
+          size: 16,
+          color: period == 'custom_range'
+              ? Colors.black
+              : Colors.lightBlueAccent,
+        ),
+        label: Text(
+          period == 'custom_range' &&
+                  customRangeStart != null &&
+                  customRangeEnd != null
+              ? 'Custom Date Range (${_formatDateId(customRangeStart!)} – ${_formatDateId(customRangeEnd!)})'
+              : 'Custom Date Range',
+        ),
+        selected: period == 'custom_range',
+        selectedColor: Colors.white,
+        backgroundColor: const Color(0xFF272727),
+        labelStyle: TextStyle(
+          color: period == 'custom_range' ? Colors.black : Colors.white,
+          fontWeight:
+              period == 'custom_range' ? FontWeight.bold : FontWeight.normal,
+          fontSize: 13,
+        ),
+        onSelected: (_) => _pickCustomDateRange(),
+      ),
       // Input Angka Tahun Lalu (misal ketik 3 = 3 Tahun Lalu)
       Container(
         height: 36,
@@ -6076,8 +6719,8 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final channelTitle = (v['channel_title'] ?? '').toString();
     final thumbUrl = (v['thumbnail_url'] ?? '').toString();
     final channelThumb = (v['channel_thumbnail'] ?? '').toString();
-    final views = (v['view_count'] ?? 0) as int;
-    final likes = (v['like_count'] ?? 0) as int;
+    final views = int.tryParse((v['view_count'] ?? 0).toString()) ?? 0;
+    final likes = int.tryParse((v['like_count'] ?? 0).toString()) ?? 0;
     final publishedAt = (v['published_at'] ?? '').toString();
     final duration = (v['duration'] ?? '').toString();
     final vHp = int.tryParse((v['views_hp'] ?? 0).toString()) ?? 0;
@@ -6546,6 +7189,634 @@ class _HoldToUnsubscribeMenuItemState
           ),
         ),
       ),
+    );
+  }
+}
+
+class _CustomCalendarDialog extends StatefulWidget {
+  final bool isRange;
+  final DateTime? initialDate;
+  final DateTime? initialRangeStart;
+  final DateTime? initialRangeEnd;
+
+  const _CustomCalendarDialog({
+    required this.isRange,
+    this.initialDate,
+    this.initialRangeStart,
+    this.initialRangeEnd,
+  });
+
+  @override
+  State<_CustomCalendarDialog> createState() => _CustomCalendarDialogState();
+}
+
+class _CustomCalendarDialogState extends State<_CustomCalendarDialog> {
+  static const int _minYear = 1995;
+  static const List<String> _monthsFull = [
+    'Januari',
+    'Februari',
+    'Maret',
+    'April',
+    'Mei',
+    'Juni',
+    'Juli',
+    'Agustus',
+    'September',
+    'Oktober',
+    'November',
+    'Desember',
+  ];
+  static const List<String> _monthsShort = [
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'Mei',
+    'Jun',
+    'Jul',
+    'Agu',
+    'Sep',
+    'Okt',
+    'Nov',
+    'Des',
+  ];
+  static const List<String> _dayHeaders = [
+    'Min',
+    'Sen',
+    'Sel',
+    'Rab',
+    'Kam',
+    'Jum',
+    'Sab',
+  ];
+
+  late DateTime _today;
+  late int _viewYear;
+  late int _viewMonth;
+  DateTime? _singleDate;
+  DateTime? _rangeStart;
+  DateTime? _rangeEnd;
+  bool _editingEndDate = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final now = DateTime.now();
+    _today = DateTime(now.year, now.month, now.day);
+    if (widget.isRange) {
+      _rangeStart = _clampToToday(widget.initialRangeStart);
+      _rangeEnd = _clampToToday(widget.initialRangeEnd);
+      if (_rangeStart != null &&
+          _rangeEnd != null &&
+          _rangeStart!.isAfter(_rangeEnd!)) {
+        final tmp = _rangeStart;
+        _rangeStart = _rangeEnd;
+        _rangeEnd = tmp;
+      }
+      _editingEndDate = _rangeStart != null && _rangeEnd == null;
+      final anchor = _rangeEnd ?? _rangeStart ?? _today;
+      _viewYear = anchor.year.clamp(_minYear, _today.year);
+      _viewMonth = anchor.month;
+    } else {
+      _singleDate = _clampToToday(widget.initialDate) ?? _today;
+      _viewYear = _singleDate!.year.clamp(_minYear, _today.year);
+      _viewMonth = _singleDate!.month;
+    }
+    if (_viewYear == _today.year && _viewMonth > _today.month) {
+      _viewMonth = _today.month;
+    }
+  }
+
+  DateTime? _clampToToday(DateTime? d) {
+    if (d == null) return null;
+    final clean = DateTime(d.year, d.month, d.day);
+    return clean.isAfter(_today) ? _today : clean;
+  }
+
+  bool _sameDay(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+
+  String _fmtId(DateTime? d) {
+    if (d == null) return 'Belum dipilih';
+    final dd = d.day.toString().padLeft(2, '0');
+    return '$dd ${_monthsShort[d.month - 1]} ${d.year}';
+  }
+
+  bool get _canGoPrevMonth =>
+      !(_viewYear <= _minYear && _viewMonth <= 1);
+
+  bool get _canGoNextMonth =>
+      !(_viewYear > _today.year ||
+          (_viewYear == _today.year && _viewMonth >= _today.month));
+
+  void _changeMonth(int delta) {
+    var m = _viewMonth + delta;
+    var y = _viewYear;
+    if (m < 1) {
+      m = 12;
+      y -= 1;
+    } else if (m > 12) {
+      m = 1;
+      y += 1;
+    }
+    if (y < _minYear ||
+        y > _today.year ||
+        (y == _today.year && m > _today.month)) {
+      return;
+    }
+    setState(() {
+      _viewYear = y;
+      _viewMonth = m;
+    });
+  }
+
+  void _focusRangeEndpoint(bool isEnd) {
+    setState(() {
+      _editingEndDate = isEnd;
+      final target = isEnd ? _rangeEnd : _rangeStart;
+      if (target != null) {
+        _viewYear = target.year.clamp(_minYear, _today.year);
+        _viewMonth = target.month;
+        if (_viewYear == _today.year && _viewMonth > _today.month) {
+          _viewMonth = _today.month;
+        }
+      }
+    });
+  }
+
+  Widget _buildRangeSelectorBox({
+    required Key boxKey,
+    required String title,
+    required DateTime? date,
+    required bool isActive,
+    required Color accentColor,
+    required VoidCallback onTap,
+  }) {
+    return Expanded(
+      child: InkWell(
+        key: boxKey,
+        borderRadius: BorderRadius.circular(8),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(
+            color: isActive
+                ? accentColor.withValues(alpha: 0.14)
+                : const Color(0xFF282828),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: isActive
+                  ? accentColor
+                  : (date != null
+                        ? const Color(0xFF5A5A5A)
+                        : const Color(0xFF3E3E3E)),
+              width: isActive ? 1.8 : 1.0,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      title,
+                      style: TextStyle(
+                        fontSize: 10.5,
+                        fontWeight:
+                            isActive ? FontWeight.bold : FontWeight.normal,
+                        color: isActive ? accentColor : Colors.white54,
+                      ),
+                    ),
+                  ),
+                  if (isActive)
+                    Icon(Icons.edit, size: 12, color: accentColor),
+                ],
+              ),
+              const SizedBox(height: 2),
+              Text(
+                _fmtId(date),
+                style: const TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _onTapDay(DateTime cellDate) {
+    if (cellDate.isAfter(_today)) return;
+    setState(() {
+      if (!widget.isRange) {
+        _singleDate = cellDate;
+      } else if (!_editingEndDate) {
+        _rangeStart = cellDate;
+        if (_rangeEnd == null) {
+          _editingEndDate = true;
+        } else if (_rangeStart!.isAfter(_rangeEnd!)) {
+          final tmp = _rangeStart;
+          _rangeStart = _rangeEnd;
+          _rangeEnd = tmp;
+        }
+      } else {
+        _rangeEnd = cellDate;
+        if (_rangeStart == null) {
+          _editingEndDate = false;
+        } else if (_rangeEnd!.isBefore(_rangeStart!)) {
+          final tmp = _rangeStart;
+          _rangeStart = _rangeEnd;
+          _rangeEnd = tmp;
+        }
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final firstOfMonth = DateTime(_viewYear, _viewMonth, 1);
+    final leadingBlanks = firstOfMonth.weekday % 7; // Sunday = 0 .. Saturday = 6
+    final daysInMonth = DateUtils.getDaysInMonth(_viewYear, _viewMonth);
+    final totalCells = leadingBlanks + daysInMonth;
+    final rowCount = ((totalCells + 6) ~/ 7);
+    final maxMonthForYear = _viewYear == _today.year ? _today.month : 12;
+    final canApply = widget.isRange
+        ? (_rangeStart != null && _rangeEnd != null)
+        : (_singleDate != null);
+
+    return AlertDialog(
+      backgroundColor: const Color(0xFF1F1F1F),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      titlePadding: const EdgeInsets.fromLTRB(18, 16, 18, 8),
+      contentPadding: const EdgeInsets.fromLTRB(18, 4, 18, 8),
+      title: Row(
+        children: [
+          Icon(
+            widget.isRange ? Icons.date_range : Icons.event,
+            color: widget.isRange ? Colors.lightBlueAccent : Colors.greenAccent,
+            size: 20,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              widget.isRange ? 'Custom Date Range' : 'Custom Date',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 16.5,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+          if (widget.isRange && (_rangeStart != null || _rangeEnd != null))
+            TextButton(
+              onPressed: () => setState(() {
+                _rangeStart = null;
+                _rangeEnd = null;
+                _editingEndDate = false;
+              }),
+              child: const Text(
+                'Reset',
+                style: TextStyle(fontSize: 12, color: Colors.amberAccent),
+              ),
+            ),
+        ],
+      ),
+      content: SizedBox(
+        width: 340,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                widget.isRange
+                    ? 'Ketuk kotak Start Date atau End Date kapan saja untuk memilih atau merevisi tanggal.'
+                    : 'Pilih satu tanggal sebagai batas akhir upload video (≤ tanggal dipilih).',
+                style: const TextStyle(fontSize: 12, color: Colors.white60),
+              ),
+              const SizedBox(height: 10),
+              if (widget.isRange)
+                Row(
+                  children: [
+                    _buildRangeSelectorBox(
+                      boxKey: const Key('range_start_selector'),
+                      title: 'Start Date',
+                      date: _rangeStart,
+                      isActive: !_editingEndDate,
+                      accentColor: Colors.amberAccent,
+                      onTap: () => _focusRangeEndpoint(false),
+                    ),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 6),
+                      child: Icon(
+                        Icons.arrow_forward,
+                        size: 16,
+                        color: Colors.white54,
+                      ),
+                    ),
+                    _buildRangeSelectorBox(
+                      boxKey: const Key('range_end_selector'),
+                      title: 'End Date',
+                      date: _rangeEnd,
+                      isActive: _editingEndDate,
+                      accentColor: Colors.lightBlueAccent,
+                      onTap: () => _focusRangeEndpoint(true),
+                    ),
+                  ],
+                )
+              else
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF282828),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.white38),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Batas Waktu Dipilih:',
+                          style: TextStyle(fontSize: 12, color: Colors.white70),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        _fmtId(_singleDate),
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              const SizedBox(height: 10),
+              // Month & Year navigation bar (supports fast cross-month & cross-year jumps)
+              Row(
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.chevron_left, color: Colors.white),
+                    tooltip: 'Bulan Sebelumnya',
+                    onPressed: _canGoPrevMonth ? () => _changeMonth(-1) : null,
+                  ),
+                  Expanded(
+                    flex: 3,
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<int>(
+                        key: const Key('calendar_month_dropdown'),
+                        value: _viewMonth,
+                        isExpanded: true,
+                        menuMaxHeight: 280,
+                        dropdownColor: const Color(0xFF282828),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        items: [
+                          for (int m = 1; m <= maxMonthForYear; m++)
+                            DropdownMenuItem(
+                              value: m,
+                              child: Text(_monthsFull[m - 1]),
+                            ),
+                        ],
+                        onChanged: (val) {
+                          if (val == null) return;
+                          setState(() => _viewMonth = val);
+                        },
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    flex: 2,
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<int>(
+                        key: const Key('calendar_year_dropdown'),
+                        value: _viewYear,
+                        isExpanded: true,
+                        menuMaxHeight: 280,
+                        dropdownColor: const Color(0xFF282828),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        items: [
+                          for (int y = _today.year; y >= _minYear; y--)
+                            DropdownMenuItem(value: y, child: Text('$y')),
+                        ],
+                        onChanged: (val) {
+                          if (val == null) return;
+                          setState(() {
+                            _viewYear = val;
+                            if (_viewYear == _today.year &&
+                                _viewMonth > _today.month) {
+                              _viewMonth = _today.month;
+                            }
+                          });
+                        },
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: Icon(
+                      Icons.chevron_right,
+                      color: _canGoNextMonth ? Colors.white : Colors.white24,
+                    ),
+                    tooltip: 'Bulan Berikutnya',
+                    onPressed: _canGoNextMonth ? () => _changeMonth(1) : null,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              // Day-of-week header
+              Row(
+                children: _dayHeaders
+                    .map(
+                      (h) => Expanded(
+                        child: Center(
+                          child: Text(
+                            h,
+                            style: const TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: Colors.white54,
+                            ),
+                          ),
+                        ),
+                      ),
+                    )
+                    .toList(),
+              ),
+              const SizedBox(height: 4),
+              // Day cells
+              Column(
+                children: List.generate(rowCount, (row) {
+                  return Row(
+                    children: List.generate(7, (col) {
+                      final idx = row * 7 + col;
+                      final dayNum = idx - leadingBlanks + 1;
+                      if (dayNum < 1 || dayNum > daysInMonth) {
+                        return const Expanded(child: SizedBox(height: 36));
+                      }
+                      final cellDate = DateTime(_viewYear, _viewMonth, dayNum);
+                      final isToday = _sameDay(cellDate, _today);
+                      final isFuture = cellDate.isAfter(_today);
+                      final isSelectedSingle =
+                          !widget.isRange &&
+                          _singleDate != null &&
+                          _sameDay(cellDate, _singleDate!);
+                      final isStart =
+                          widget.isRange &&
+                          _rangeStart != null &&
+                          _sameDay(cellDate, _rangeStart!);
+                      final isEnd =
+                          widget.isRange &&
+                          _rangeEnd != null &&
+                          _sameDay(cellDate, _rangeEnd!);
+                      final isInRange =
+                          widget.isRange &&
+                          _rangeStart != null &&
+                          _rangeEnd != null &&
+                          cellDate.isAfter(_rangeStart!) &&
+                          cellDate.isBefore(_rangeEnd!);
+                      final isEndpoint = isSelectedSingle || isStart || isEnd;
+
+                      Color bgColor = Colors.transparent;
+                      BoxBorder? border;
+                      Color textColor = Colors.white;
+                      if (isFuture) {
+                        textColor = Colors.white24;
+                      } else if (isToday && !isEndpoint) {
+                        bgColor = Colors.green;
+                        border = Border.all(
+                          color: Colors.greenAccent,
+                          width: 1.5,
+                        );
+                        textColor = Colors.white;
+                      } else if (isEndpoint) {
+                        bgColor = widget.isRange
+                            ? (isStart && !isEnd
+                                  ? const Color(0xFFEF6C00)
+                                  : const Color(0xFF1976D2))
+                            : const Color(0xFFFF0033);
+                        border = isToday
+                            ? Border.all(color: Colors.green, width: 2.5)
+                            : null;
+                        textColor = Colors.white;
+                      } else if (isInRange) {
+                        bgColor = const Color(
+                          0xFF1976D2,
+                        ).withValues(alpha: 0.28);
+                        textColor = Colors.white;
+                      }
+
+                      return Expanded(
+                        child: Padding(
+                          padding: const EdgeInsets.all(2),
+                          child: InkWell(
+                            key: Key(
+                              'cal_day_${cellDate.year}_${cellDate.month}_${cellDate.day}',
+                            ),
+                            borderRadius: BorderRadius.circular(8),
+                            onTap: isFuture ? null : () => _onTapDay(cellDate),
+                            child: Container(
+                              height: 34,
+                              decoration: BoxDecoration(
+                                color: bgColor,
+                                borderRadius: BorderRadius.circular(8),
+                                border: border,
+                              ),
+                              alignment: Alignment.center,
+                              child: Text(
+                                '$dayNum',
+                                style: TextStyle(
+                                  fontSize: 12.5,
+                                  fontWeight: (isToday || isEndpoint)
+                                      ? FontWeight.bold
+                                      : FontWeight.normal,
+                                  color: textColor,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    }),
+                  );
+                }),
+              ),
+              const SizedBox(height: 10),
+              // Legend
+              Wrap(
+                spacing: 10,
+                runSpacing: 4,
+                alignment: WrapAlignment.spaceBetween,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 12,
+                        height: 12,
+                        decoration: BoxDecoration(
+                          color: Colors.green,
+                          borderRadius: BorderRadius.circular(3),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      const Text(
+                        'Hari Ini',
+                        style: TextStyle(fontSize: 11.5, color: Colors.greenAccent),
+                      ),
+                    ],
+                  ),
+                  const Text(
+                    'Tanggal masa depan nonaktif',
+                    style: TextStyle(fontSize: 11, color: Colors.white38),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Batal', style: TextStyle(color: Colors.white60)),
+        ),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: widget.isRange
+                ? const Color(0xFF1976D2)
+                : const Color(0xFFFF0033),
+            foregroundColor: Colors.white,
+          ),
+          onPressed: canApply
+              ? () {
+                  if (widget.isRange) {
+                    Navigator.pop(context, (_rangeStart!, _rangeEnd));
+                  } else {
+                    Navigator.pop(context, (_singleDate!, null));
+                  }
+                }
+              : null,
+          child: const Text('Terapkan'),
+        ),
+      ],
     );
   }
 }

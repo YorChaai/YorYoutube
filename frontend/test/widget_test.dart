@@ -30,10 +30,11 @@ void main() {
     // 2. Cek Tombol Refresh YouTube tersedia di header
     expect(find.text('Refresh YouTube'), findsOneWidget);
 
-    // 3. Cek 3 Tombol Sortir & Pilihan Permanen 25/50/100 Video
+    // 3. Cek Tombol Sortir & Pilihan Permanen 25/50/100 Video
     expect(find.text('🔥 View Terbanyak'), findsOneWidget);
     expect(find.text('👍 Like Terbanyak'), findsOneWidget);
-    expect(find.text('🕒 Waktu Upload'), findsOneWidget);
+    expect(find.text('🕒 Terbaru ke Terlama'), findsOneWidget);
+    expect(find.text('⏳ Terlama ke Terbaru'), findsOneWidget);
     expect(find.text('25 Video'), findsOneWidget);
     expect(find.text('50 Video'), findsOneWidget);
     expect(find.text('100 Video'), findsOneWidget);
@@ -64,8 +65,14 @@ void main() {
     expect(find.text('🔕 Unsubscribe'), findsNothing);
     expect(find.byIcon(Icons.more_vert), findsWidgets);
 
-    // 7. Pastikan filter waktu sampai Tahun Ini + Input Tahun Lalu tersedia
-    expect(find.text('Tahun Ini'), findsOneWidget);
+    // 7. Pastikan filter waktu All Time, Today, This Week, This Month, This Year, Custom Date, Custom Date Range + Tahun Lalu tersedia
+    expect(find.text('All Time'), findsOneWidget);
+    expect(find.text('Today'), findsOneWidget);
+    expect(find.text('This Week'), findsOneWidget);
+    expect(find.text('This Month'), findsOneWidget);
+    expect(find.text('This Year'), findsOneWidget);
+    expect(find.text('Custom Date'), findsOneWidget);
+    expect(find.text('Custom Date Range'), findsOneWidget);
     expect(find.text('Tahun Lalu'), findsOneWidget);
 
     // 8. Buka menu titik 3 kartu video -> cek opsi Transkrip & popup 3 prompt sejajar + TubeTranscript
@@ -127,5 +134,135 @@ void main() {
     await tester.tap(find.byIcon(Icons.close));
     await tester.pumpAndSettle();
     expect(find.text('Transkrip + Prompt'), findsNothing);
+  });
+
+  testWidgets('Period Filters, Sorting (Newest/Oldest), Custom Date & Custom Date Range Calendar', (WidgetTester tester) async {
+    await tester.binding.setSurfaceSize(const Size(1280, 900));
+    await tester.pumpWidget(const PersonalYouTubeApp());
+    await tester.pumpAndSettle();
+
+    // Uji pengurutan Terbaru <-> Terlama bersamaan dengan filter periode
+    await tester.tap(find.text('⏳ Terlama ke Terbaru'));
+    await tester.pumpAndSettle();
+    expect(find.text('Total: 36 video'), findsOneWidget);
+
+    await tester.tap(find.text('This Year'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('All Time'));
+    await tester.pumpAndSettle();
+    expect(find.text('Total: 36 video'), findsOneWidget);
+
+    // Uji Custom Date Calendar: penanda hijau pada hari ini, tanggal masa depan nonaktif
+    await tester.tap(find.text('Custom Date'));
+    await tester.pumpAndSettle();
+    expect(find.text('Hari Ini'), findsOneWidget);
+    expect(find.text('Tanggal masa depan nonaktif'), findsOneWidget);
+
+    final now = DateTime.now();
+    final todayKey = Key('cal_day_${now.year}_${now.month}_${now.day}');
+    final todayFinder = find.byKey(todayKey);
+    expect(todayFinder, findsOneWidget);
+    final todayBox = tester.widget<Container>(
+      find.descendant(of: todayFinder, matching: find.byType(Container)),
+    );
+    final todayDeco = todayBox.decoration as BoxDecoration?;
+    expect(todayDeco?.border?.top.color, Colors.green);
+
+    final daysInMonth = DateUtils.getDaysInMonth(now.year, now.month);
+    if (now.day < daysInMonth) {
+      final futureKey = Key('cal_day_${now.year}_${now.month}_${now.day + 1}');
+      final futureInk = tester.widget<InkWell>(find.byKey(futureKey));
+      expect(futureInk.onTap, isNull);
+    }
+
+    // Pilih tanggal 1 bulan ini -> Terapkan
+    final day1Key = Key('cal_day_${now.year}_${now.month}_1');
+    await tester.tap(find.byKey(day1Key));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Terapkan'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Custom Date (≤ 01 '), findsOneWidget);
+
+    // Uji Custom Date Range lintas tahun: 1 Desember 2004 -> 17 Maret 2006
+    await tester.tap(find.text('Custom Date Range'));
+    await tester.pumpAndSettle();
+
+    // Pilih tahun 2004 dan bulan Desember -> klik tgl 1
+    await tester.tap(find.byKey(const Key('calendar_year_dropdown')));
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.text('2004'),
+      150,
+      scrollable: find.byType(Scrollable).last,
+    );
+    await tester.ensureVisible(find.text('2004').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('2004').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('calendar_month_dropdown')));
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.text('Desember'),
+      150,
+      scrollable: find.byType(Scrollable).last,
+    );
+    await tester.ensureVisible(find.text('Desember').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Desember').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('cal_day_2004_12_1')));
+    await tester.pumpAndSettle();
+
+    // Pilih tahun 2006 dan bulan Maret -> klik tgl 17
+    await tester.tap(find.byKey(const Key('calendar_year_dropdown')));
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.text('2006'),
+      -150,
+      scrollable: find.byType(Scrollable).last,
+    );
+    await tester.ensureVisible(find.text('2006').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('2006').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('calendar_month_dropdown')));
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.text('Maret'),
+      -150,
+      scrollable: find.byType(Scrollable).last,
+    );
+    await tester.ensureVisible(find.text('Maret').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Maret').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('cal_day_2006_3_17')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('01 Des 2004'), findsOneWidget);
+    expect(find.text('17 Mar 2006'), findsOneWidget);
+
+    // Uji revisi interaktif: klik kotak Start Date -> otomatis lompat ke Des 2004 dan ubah ke 05 Des 2004 tanpa mereset End Date
+    await tester.tap(find.byKey(const Key('range_start_selector')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('cal_day_2004_12_5')));
+    await tester.pumpAndSettle();
+    expect(find.text('05 Des 2004'), findsOneWidget);
+    expect(find.text('17 Mar 2006'), findsOneWidget);
+
+    // Klik kotak End Date -> otomatis lompat kembali ke Mar 2006 dan ubah ke 20 Mar 2006
+    await tester.tap(find.byKey(const Key('range_end_selector')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('cal_day_2006_3_20')));
+    await tester.pumpAndSettle();
+    expect(find.text('05 Des 2004'), findsOneWidget);
+    expect(find.text('20 Mar 2006'), findsOneWidget);
+
+    await tester.tap(find.text('Terapkan'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Custom Date Range (05 Des 2004 – 20 Mar 2006)'),
+      findsOneWidget,
+    );
   });
 }
