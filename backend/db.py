@@ -322,7 +322,7 @@ def upsert_videos(videos: list[dict]) -> int:
                 duration_seconds=excluded.duration_seconds,
                 channel_title=excluded.channel_title,
                 channel_thumbnail=excluded.channel_thumbnail,
-                region=excluded.region
+                region=CASE WHEN excluded.region != 'Belum diketahui' THEN excluded.region ELSE videos.region END
             """,
             filtered_videos,
         )
@@ -564,6 +564,29 @@ def query_videos(
     }
 
 
+def _parse_iso_utc(ts: str) -> datetime | None:
+    raw = (ts or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _is_newer_or_equal_ts(incoming_ts: str, existing_ts: str) -> bool:
+    if not incoming_ts:
+        return False
+    if not existing_ts:
+        return True
+    dt_in = _parse_iso_utc(incoming_ts)
+    dt_ex = _parse_iso_utc(existing_ts)
+    if dt_in is not None and dt_ex is not None:
+        return dt_in >= dt_ex
+    return incoming_ts >= existing_ts
+
+
 def sync_device_data(payload: dict) -> dict:
     """
     Sinkronisasi 2 arah antara HP dan Laptop (via Kabel USB / JSON Bundle):
@@ -637,7 +660,7 @@ def sync_device_data(payload: dict) -> dict:
                 new_region = existing["region"] or "Nasional"
 
                 # Gunakan timestamp updated_at terbaru untuk rekonsiliasi status unfollowed vs subscribed
-                if c_upd and (not new_upd or c_upd >= new_upd):
+                if _is_newer_or_equal_ts(c_upd, new_upd):
                     if c_status in ("subscribed", "unfollowed"):
                         new_status = c_status
                     new_upd = c_upd

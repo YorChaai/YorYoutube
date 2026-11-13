@@ -611,13 +611,27 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               ),
             );
         }
+        final savedSettings = await db.query('settings');
+        for (final row in savedSettings) {
+          final k = (row['key'] ?? '').toString();
+          final v = (row['value'] ?? '').toString();
+          if (k == 'api_key' && v.isNotEmpty) {
+            localApiKey = v;
+            hasApiKey = true;
+            apiKeyPreview = v.length > 8
+                ? '${v.substring(0, 6)}...${v.substring(v.length - 4)}'
+                : 'Terpasang';
+          } else if (k == 'my_channel_id' && v.isNotEmpty) {
+            localMyChannelId = v;
+          }
+        }
       }
     } catch (_) {}
   }
 
   Future<Database> _openStandaloneDatabase() => openDatabase(
     'standalone_cache.db',
-    version: 1,
+    version: 2,
     onCreate: (db, version) async {
       await db.execute(
         'CREATE TABLE channels (id TEXT PRIMARY KEY, data TEXT NOT NULL)',
@@ -625,6 +639,16 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       await db.execute(
         'CREATE TABLE videos (id TEXT PRIMARY KEY, data TEXT NOT NULL)',
       );
+      await db.execute(
+        'CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+      );
+    },
+    onUpgrade: (db, oldVersion, newVersion) async {
+      if (oldVersion < 2) {
+        await db.execute(
+          'CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+        );
+      }
     },
   );
 
@@ -651,6 +675,20 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           });
         }
         await videoBatch.commit(noResult: true);
+        if (localApiKey.isNotEmpty) {
+          await txn.insert(
+            'settings',
+            {'key': 'api_key', 'value': localApiKey},
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
+        }
+        if (localMyChannelId.isNotEmpty) {
+          await txn.insert(
+            'settings',
+            {'key': 'my_channel_id', 'value': localMyChannelId},
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
+        }
       });
     } catch (_) {
       // Keep the current session usable if device storage is temporarily unavailable.
@@ -1133,7 +1171,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           .map((c) => (c['channel_id'] ?? '').toString())
           .toSet();
       String? pageToken;
-      for (var page = 0; page < 25; page++) {
+      for (var page = 0; page < 50; page++) {
         final params = <String, String>{
           'part': 'snippet',
           'channelId': localMyChannelId,
@@ -1150,16 +1188,22 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           params,
         );
         final res = await http.get(uri).timeout(const Duration(seconds: 8));
-        if (res.statusCode != 200) break;
         final data = jsonDecode(res.body);
+        if (res.statusCode != 200 || data['error'] != null) {
+          final msg = (data['error']?['message'] ??
+                  'Gagal mengambil daftar subscriptions (${res.statusCode})')
+              .toString();
+          throw Exception(msg);
+        }
         final items = (data['items'] as List?) ?? [];
         for (final item in items) {
           final snip = item['snippet'] ?? {};
           final cid = (snip['resourceId']?['channelId'] ?? '').toString();
           if (cid.isEmpty ||
               existingCids.contains(cid) ||
-              _localUnsubscribedIds.contains(cid))
+              _localUnsubscribedIds.contains(cid)) {
             continue;
+          }
           final title = (snip['title'] ?? cid).toString();
           final thumb = (snip['thumbnails']?['default']?['url'] ?? '')
               .toString();
@@ -1194,7 +1238,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final newVidMeta = <String, Map<String, String>>{};
     final vidRegex = RegExp(r'<yt:videoId>([^<]+)</yt:videoId>');
 
-    const batchSize = 35;
+    const batchSize = 15;
     for (var i = 0; i < targetChs.length; i += batchSize) {
       final chunk = targetChs.sublist(
         i,
@@ -1204,28 +1248,42 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         chunk.map((ch) async {
           final cid = (ch['channel_id'] ?? '').toString();
           if (!cid.startsWith('UC')) return;
-          try {
-            final feedUri = Uri.parse(
-              'https://www.youtube.com/feeds/videos.xml?channel_id=$cid',
-            );
-            final res = await http
-                .get(feedUri)
-                .timeout(const Duration(seconds: 5));
-            if (res.statusCode == 200) {
-              final matches = vidRegex.allMatches(res.body);
-              for (final m in matches) {
-                final vid = (m.group(1) ?? '').trim();
-                if (vid.isNotEmpty && !existingVidIds.contains(vid)) {
-                  newVidMeta[vid] = {
-                    'channel_id': cid,
-                    'channel_title': (ch['title'] ?? '').toString(),
-                    'channel_thumbnail': (ch['thumbnail_url'] ?? '').toString(),
-                    'region': (ch['region'] ?? 'Belum diketahui').toString(),
-                  };
+          final feedUri = Uri.parse(
+            'https://www.youtube.com/feeds/videos.xml?channel_id=$cid',
+          );
+          for (var attempt = 0; attempt < 2; attempt++) {
+            try {
+              final res = await http
+                  .get(feedUri)
+                  .timeout(const Duration(seconds: 8));
+              if (res.statusCode == 200) {
+                final matches = vidRegex.allMatches(res.body);
+                for (final m in matches) {
+                  final vid = (m.group(1) ?? '').trim();
+                  if (vid.isNotEmpty && !existingVidIds.contains(vid)) {
+                    newVidMeta[vid] = {
+                      'channel_id': cid,
+                      'channel_title': (ch['title'] ?? '').toString(),
+                      'channel_thumbnail':
+                          (ch['thumbnail_url'] ?? '').toString(),
+                      'region': (ch['region'] ?? 'Belum diketahui').toString(),
+                    };
+                  }
                 }
+                return;
+              }
+              if ((res.statusCode == 429 || res.statusCode >= 500) &&
+                  attempt == 0) {
+                await Future.delayed(const Duration(milliseconds: 400));
+                continue;
+              }
+              return;
+            } catch (_) {
+              if (attempt == 0) {
+                await Future.delayed(const Duration(milliseconds: 400));
               }
             }
-          } catch (_) {}
+          }
         }),
       );
       if (!mounted) return;
@@ -1243,56 +1301,57 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         i,
         (i + 50 > newIds.length) ? newIds.length : i + 50,
       );
-      try {
-        final vUri = Uri.https('www.googleapis.com', '/youtube/v3/videos', {
-          'part': 'snippet,statistics,contentDetails',
-          'id': slice.join(','),
-          'key': localApiKey,
+      final vUri = Uri.https('www.googleapis.com', '/youtube/v3/videos', {
+        'part': 'snippet,statistics,contentDetails',
+        'id': slice.join(','),
+        'key': localApiKey,
+      });
+      final vRes = await http.get(vUri).timeout(const Duration(seconds: 12));
+      final vData = jsonDecode(vRes.body);
+      if (vRes.statusCode != 200 || vData['error'] != null) {
+        final msg = (vData['error']?['message'] ??
+                'YouTube API error (${vRes.statusCode})')
+            .toString();
+        throw Exception(msg);
+      }
+      final vItems = (vData['items'] as List?) ?? [];
+      for (final v in vItems) {
+        final vid = (v['id'] ?? '').toString();
+        if (vid.isEmpty || existingVidIds.contains(vid)) continue;
+        existingVidIds.add(vid);
+        final vsnip = v['snippet'] ?? {};
+        final vstats = v['statistics'] ?? {};
+        final meta = newVidMeta[vid] ?? {};
+        final cid = (vsnip['channelId'] ?? meta['channel_id'] ?? '').toString();
+        final durStr = _parseIsoDuration(
+          (v['contentDetails']?['duration'] ?? '').toString(),
+        );
+        _localVideos.insert(0, {
+          'video_id': vid,
+          'channel_id': cid,
+          'channel_title':
+              (vsnip['channelTitle'] ?? meta['channel_title'] ?? '').toString(),
+          'channel_thumbnail': (meta['channel_thumbnail'] ?? '').toString(),
+          'title': (vsnip['title'] ?? 'Untitled').toString(),
+          'thumbnail_url':
+              (vsnip['thumbnails']?['high']?['url'] ??
+                      vsnip['thumbnails']?['medium']?['url'] ??
+                      'https://i.ytimg.com/vi/$vid/hqdefault.jpg')
+                  .toString(),
+          'published_at':
+              (vsnip['publishedAt'] ?? DateTime.now().toUtc().toIso8601String())
+                  .toString(),
+          'view_count':
+              int.tryParse((vstats['viewCount'] ?? '0').toString()) ?? 0,
+          'like_count':
+              int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0,
+          'duration': durStr,
+          'duration_seconds': _durationToSeconds(durStr),
+          'watched_count': _getCreatorWatchedCount(cid),
+          'region': (meta['region'] ?? 'Belum diketahui').toString(),
+          'is_demo': 0,
         });
-        final vRes = await http.get(vUri).timeout(const Duration(seconds: 10));
-        if (vRes.statusCode == 200) {
-          final vData = jsonDecode(vRes.body);
-          final vItems = (vData['items'] as List?) ?? [];
-          for (final v in vItems) {
-            final vid = (v['id'] ?? '').toString();
-            final vsnip = v['snippet'] ?? {};
-            final vstats = v['statistics'] ?? {};
-            final meta = newVidMeta[vid] ?? {};
-            final cid = (vsnip['channelId'] ?? meta['channel_id'] ?? '')
-                .toString();
-            final durStr = _parseIsoDuration(
-              (v['contentDetails']?['duration'] ?? '').toString(),
-            );
-            _localVideos.insert(0, {
-              'video_id': vid,
-              'channel_id': cid,
-              'channel_title':
-                  (vsnip['channelTitle'] ?? meta['channel_title'] ?? '')
-                      .toString(),
-              'channel_thumbnail': (meta['channel_thumbnail'] ?? '').toString(),
-              'title': (vsnip['title'] ?? 'Untitled').toString(),
-              'thumbnail_url':
-                  (vsnip['thumbnails']?['high']?['url'] ??
-                          vsnip['thumbnails']?['medium']?['url'] ??
-                          'https://i.ytimg.com/vi/$vid/hqdefault.jpg')
-                      .toString(),
-              'published_at':
-                  (vsnip['publishedAt'] ??
-                          DateTime.now().toUtc().toIso8601String())
-                      .toString(),
-              'view_count':
-                  int.tryParse((vstats['viewCount'] ?? '0').toString()) ?? 0,
-              'like_count':
-                  int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0,
-              'duration': durStr,
-              'duration_seconds': _durationToSeconds(durStr),
-              'watched_count': _getCreatorWatchedCount(cid),
-              'region': (meta['region'] ?? 'Belum diketahui').toString(),
-              'is_demo': 0,
-            });
-          }
-        }
-      } catch (_) {}
+      }
     }
   }
 
@@ -1370,11 +1429,23 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             (snippet['country'] ?? '').toString(),
             (snippet['defaultLanguage'] ?? '').toString(),
           );
-          for (final channel in _localChannels) {
-            if (channel['channel_id'] == channelId) channel['region'] = region;
-          }
-          for (final video in _localVideos) {
-            if (video['channel_id'] == channelId) video['region'] = region;
+          if (region != 'Belum diketahui') {
+            for (final channel in _localChannels) {
+              if (channel['channel_id'] == channelId) {
+                final curReg = (channel['region'] ?? 'Belum diketahui').toString();
+                if (curReg.isEmpty || curReg == 'Belum diketahui') {
+                  channel['region'] = region;
+                }
+              }
+            }
+            for (final video in _localVideos) {
+              if (video['channel_id'] == channelId) {
+                final curReg = (video['region'] ?? 'Belum diketahui').toString();
+                if (curReg.isEmpty || curReg == 'Belum diketahui') {
+                  video['region'] = region;
+                }
+              }
+            }
           }
         }
       } catch (_) {}
@@ -1483,8 +1554,14 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         final vid = v['id'].toString();
         final vsnip = v['snippet'] ?? {};
         final vstats = v['statistics'] ?? {};
-        _localVideos.removeWhere((old) => old['video_id'] == vid);
-        _localVideos.add({
+        final existingIdx = _localVideos.indexWhere(
+          (old) => old['video_id'] == vid,
+        );
+        final existing = existingIdx >= 0 ? _localVideos[existingIdx] : null;
+        final durStr = _parseIsoDuration(
+          (v['contentDetails']?['duration'] ?? '').toString(),
+        );
+        final nextVideo = <String, dynamic>{
           'video_id': vid,
           'channel_id': cid,
           'channel_title': title,
@@ -1502,12 +1579,20 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               int.tryParse((vstats['viewCount'] ?? '0').toString()) ?? 0,
           'like_count':
               int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0,
-          'duration': _parseIsoDuration(
-            (v['contentDetails']?['duration'] ?? '').toString(),
-          ),
-          'region': region,
+          'duration': durStr,
+          'duration_seconds': _durationToSeconds(durStr),
+          'region': (existing?['region'] ?? region).toString(),
+          'views_hp': existing?['views_hp'] ?? 0,
+          'views_laptop': existing?['views_laptop'] ?? 0,
+          'views_total': existing?['views_total'] ?? 0,
+          'watched_count': existing?['watched_count'] ?? _getCreatorWatchedCount(cid),
           'is_demo': 0,
-        });
+        };
+        if (existingIdx >= 0) {
+          _localVideos[existingIdx] = nextVideo;
+        } else {
+          _localVideos.add(nextVideo);
+        }
       }
     }
     await _saveStandaloneData();
@@ -1830,6 +1915,1026 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     await launchUrl(url, mode: LaunchMode.externalApplication);
   }
 
+  final Map<String, String> _transcriptCache = {};
+  bool _useTubeTranscript = false;
+
+  Uri _tubeTranscriptUri(String videoId) {
+    final rawId = _extractRawVideoId(videoId);
+    return Uri.parse('https://tubetranscript.com/id/watch?v=$rawId');
+  }
+
+  String _extractRawVideoId(String videoId) {
+    var rawId = videoId.trim();
+    if (rawId.startsWith('demo_') && rawId.length > 8) {
+      final parts = rawId.split('_');
+      if (parts.length >= 3) {
+        rawId = parts.sublist(2).join('_');
+      }
+    }
+    return rawId;
+  }
+
+  String _decodeHtmlEntities(String input) {
+    var text = input
+        .replaceAll('&amp;', '&')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&#39;', "'")
+        .replaceAll('&apos;', "'")
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&nbsp;', ' ');
+    text = text.replaceAllMapped(RegExp(r'&#(\d+);'), (m) {
+      final code = int.tryParse(m.group(1) ?? '');
+      return code != null ? String.fromCharCode(code) : m.group(0)!;
+    });
+    text = text.replaceAllMapped(RegExp(r'&#x([0-9a-fA-F]+);'), (m) {
+      final code = int.tryParse(m.group(1) ?? '', radix: 16);
+      return code != null ? String.fromCharCode(code) : m.group(0)!;
+    });
+    return text;
+  }
+
+  Map<String, dynamic>? _pickBestCaptionTrack(List<dynamic> tracks) {
+    if (tracks.isEmpty) return null;
+    for (final lang in ['id', 'en']) {
+      for (final t in tracks) {
+        if (t is Map) {
+          final code = (t['languageCode'] ?? '').toString().toLowerCase();
+          if (code == lang || code.startsWith('$lang-')) {
+            return Map<String, dynamic>.from(t);
+          }
+        }
+      }
+    }
+    final first = tracks.first;
+    return first is Map ? Map<String, dynamic>.from(first) : null;
+  }
+
+  Future<String> _fetchYouTubeTranscriptDirect(
+    String rawId,
+    void Function(int) onProgress,
+  ) async {
+    List<dynamic> tracks = [];
+    onProgress(20);
+
+    // 1. Coba YouTube Innertube Android API untuk mendapatkan captionTracks
+    try {
+      final playerRes = await http
+          .post(
+            Uri.parse('https://www.youtube.com/youtubei/v1/player'),
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent': 'com.google.android.youtube/20.10.38 (Linux; U; Android 14)',
+            },
+            body: jsonEncode({
+              'context': {
+                'client': {
+                  'clientName': 'ANDROID',
+                  'clientVersion': '20.10.38',
+                  'hl': 'id',
+                },
+              },
+              'videoId': rawId,
+            }),
+          )
+          .timeout(const Duration(seconds: 12));
+      if (playerRes.statusCode == 200) {
+        final data = jsonDecode(playerRes.body);
+        final list =
+            data['captions']?['playerCaptionsTracklistRenderer']?['captionTracks'];
+        if (list is List) tracks = list;
+      }
+    } catch (_) {}
+
+    onProgress(45);
+
+    // 2. Fallback: ekstrak captionTracks dari halaman watch YouTube
+    if (tracks.isEmpty) {
+      final watchRes = await http
+          .get(
+            Uri.parse('https://www.youtube.com/watch?v=$rawId&hl=id'),
+            headers: {
+              'User-Agent':
+                  'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/125.0 Mobile Safari/537.36',
+            },
+          )
+          .timeout(const Duration(seconds: 12));
+      if (watchRes.statusCode == 200) {
+        final m = RegExp(r'"captionTracks":(\[.*?\])').firstMatch(watchRes.body);
+        if (m != null) {
+          final parsed = jsonDecode(m.group(1)!);
+          if (parsed is List) tracks = parsed;
+        }
+      }
+    }
+
+    final track = _pickBestCaptionTrack(tracks);
+    final baseTrackUrl = (track?['baseUrl'] ?? '').toString();
+    if (baseTrackUrl.isEmpty) {
+      throw Exception('Video ini tidak menyediakan caption/transkrip.');
+    }
+
+    onProgress(70);
+
+    final segments = <String>[];
+    // 3. Ambil isi caption (ganti fmt=... ke json3 agar konsisten seperti youtube-transcript-api, lalu fallback XML srv1/srv3)
+    try {
+      final fmtPattern = RegExp(r'([?&])fmt=[^&]+');
+      final json3Url = fmtPattern.hasMatch(baseTrackUrl)
+          ? baseTrackUrl.replaceAllMapped(
+              fmtPattern,
+              (m) => '${m.group(1)}fmt=json3',
+            )
+          : '$baseTrackUrl&fmt=json3';
+      final capRes = await http
+          .get(Uri.parse(json3Url))
+          .timeout(const Duration(seconds: 12));
+      if (capRes.statusCode == 200 && capRes.body.trimLeft().startsWith('{')) {
+        final capJson = jsonDecode(capRes.body);
+        final events = (capJson['events'] as List?) ?? [];
+        for (final ev in events) {
+          if (ev is! Map) continue;
+          final segs = ev['segs'];
+          if (segs is! List) continue;
+          final line = segs
+              .map((s) => (s is Map ? (s['utf8'] ?? '') : '').toString())
+              .join()
+              .replaceAll(RegExp(r'\s+'), ' ')
+              .trim();
+          if (line.isNotEmpty) {
+            segments.add(_decodeHtmlEntities(line));
+          }
+        }
+      }
+    } catch (_) {}
+
+    if (segments.isEmpty) {
+      final xmlRes = await http
+          .get(Uri.parse(baseTrackUrl))
+          .timeout(const Duration(seconds: 12));
+      if (xmlRes.statusCode == 200) {
+        final tagRegex = RegExp(
+          r'<(?:text|p)\b[^>]*>(.*?)</(?:text|p)>',
+          dotAll: true,
+        );
+        for (final m in tagRegex.allMatches(xmlRes.body)) {
+          final rawText = (m.group(1) ?? '')
+              .replaceAll(RegExp(r'<[^>]+>'), '')
+              .replaceAll(RegExp(r'\s+'), ' ')
+              .trim();
+          final decoded = _decodeHtmlEntities(rawText).trim();
+          if (decoded.isNotEmpty) {
+            segments.add(decoded);
+          }
+        }
+      }
+    }
+
+    if (segments.isEmpty) {
+      throw Exception('Teks transkrip kosong atau tidak tersedia.');
+    }
+    onProgress(95);
+    return segments.join(' ; ');
+  }
+
+  Future<String> _fetchTranscriptText(
+    String videoId,
+    void Function(int) onProgress,
+  ) async {
+    final rawId = _extractRawVideoId(videoId);
+    if (rawId.isEmpty) {
+      throw Exception('Video ID tidak valid.');
+    }
+    final cached = _transcriptCache[rawId];
+    if (cached != null && cached.isNotEmpty) {
+      onProgress(40);
+      await Future.delayed(const Duration(milliseconds: 120));
+      onProgress(80);
+      await Future.delayed(const Duration(milliseconds: 120));
+      onProgress(100);
+      return cached;
+    }
+
+    onProgress(10);
+    String? backendError;
+    if (!isStandaloneMode) {
+      try {
+        final res = await http
+            .get(
+              Uri.parse(
+                '$baseUrl/api/videos/${Uri.encodeComponent(rawId)}/transcript',
+              ),
+            )
+            .timeout(const Duration(seconds: 15));
+        if (res.statusCode == 200) {
+          final data = jsonDecode(res.body);
+          final txt = (data['text'] ?? '').toString().trim();
+          if (txt.isNotEmpty) {
+            _transcriptCache[rawId] = txt;
+            onProgress(100);
+            return txt;
+          }
+        } else {
+          try {
+            final err = jsonDecode(res.body);
+            backendError = (err['detail'] ?? '').toString();
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
+
+    if (kIsWeb && backendError != null && backendError.isNotEmpty) {
+      throw Exception(backendError);
+    }
+
+    try {
+      final directText = await _fetchYouTubeTranscriptDirect(rawId, onProgress);
+      _transcriptCache[rawId] = directText;
+      onProgress(100);
+      return directText;
+    } catch (e) {
+      if (backendError != null && backendError.isNotEmpty) {
+        throw Exception(backendError);
+      }
+      rethrow;
+    }
+  }
+
+  Future<String> _buildTranscriptWithPrompt(
+    String assetPath,
+    String transcriptBody,
+  ) async {
+    var template = await rootBundle.loadString(assetPath);
+    if (template.startsWith('\uFEFF')) {
+      template = template.substring(1);
+    }
+    final placeholder = RegExp(r'Teks\s+disini', caseSensitive: false);
+    if (placeholder.hasMatch(template)) {
+      return template.replaceFirst(placeholder, transcriptBody);
+    }
+    return '${template.trimRight()}\n\nTeks:\n"""\n$transcriptBody\n"""\n';
+  }
+
+  Future<void> _showTranscriptPromptDialog(Map<String, dynamic> video) async {
+    final videoId = (video['video_id'] ?? '').toString();
+    final rawId = _extractRawVideoId(videoId);
+    final videoTitle = (video['title'] ?? 'Video YouTube').toString();
+    const promptOptions = [
+      (
+        label: 'Kutip',
+        subtitle: 'Bukti kutipan',
+        asset: 'assets/prompts/promt kutip.md',
+        icon: Icons.format_quote,
+        color: Color(0xFFEF5350),
+      ),
+      (
+        label: 'Formal',
+        subtitle: 'Tanpa kutipan',
+        asset: 'assets/prompts/promt formal.md',
+        icon: Icons.description_outlined,
+        color: Color(0xFF42A5F5),
+      ),
+      (
+        label: '2.0',
+        subtitle: 'Modul lengkap',
+        asset: 'assets/prompts/promt 2.0.md',
+        icon: Icons.auto_awesome,
+        color: Color(0xFF66BB6A),
+      ),
+    ];
+
+    final pasteController = TextEditingController();
+    try {
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogCtx) {
+          var step = 'select'; // 'select' | 'loading' | 'paste' | 'ready' | 'error'
+          var progress = 1;
+          var selectedLabel = '';
+          var selectedAsset = '';
+          var compiledResult = '';
+          var errorMsg = '';
+          var pasteInlineError = '';
+          var cancelled = false;
+          Timer? smoothTimer;
+
+          void closeDialog() {
+            cancelled = true;
+            smoothTimer?.cancel();
+            Navigator.of(dialogCtx).pop();
+          }
+
+          return StatefulBuilder(
+            builder: (ctx, setDialogState) {
+              Future<void> launchTubeTranscriptPage() async {
+                final url = _tubeTranscriptUri(videoId);
+                try {
+                  await launchUrl(url, mode: LaunchMode.externalApplication);
+                } catch (_) {}
+              }
+
+              Future<void> openTubeTranscriptForPrompt(
+                String label,
+                String assetPath,
+              ) async {
+                smoothTimer?.cancel();
+                pasteController.clear();
+                setDialogState(() {
+                  selectedLabel = label;
+                  selectedAsset = assetPath;
+                  compiledResult = '';
+                  errorMsg = '';
+                  pasteInlineError = '';
+                  progress = 1;
+                  step = 'paste';
+                });
+                await launchTubeTranscriptPage();
+              }
+
+              Future<void> applyPastedTranscript(String rawText) async {
+                final cleaned = rawText.replaceAll('\r\n', '\n').trim();
+                if (cleaned.isEmpty) {
+                  setDialogState(() {
+                    pasteInlineError =
+                        'Clipboard masih kosong. Klik "Salin" di TubeTranscript dulu atau tempel manual di kolom bawah.';
+                  });
+                  return;
+                }
+                final isJustUrl = RegExp(r'^https?://\S+$').hasMatch(cleaned);
+                if (isJustUrl) {
+                  setDialogState(() {
+                    pasteInlineError =
+                        'Teks yang tersalin masih berupa link URL, bukan isi transkrip.';
+                  });
+                  return;
+                }
+                if (rawId.isNotEmpty) {
+                  _transcriptCache[rawId] = cleaned;
+                }
+                final combined = await _buildTranscriptWithPrompt(
+                  selectedAsset,
+                  cleaned,
+                );
+                if (cancelled || !ctx.mounted) return;
+                setDialogState(() {
+                  progress = 100;
+                  compiledResult = combined;
+                  pasteInlineError = '';
+                  step = 'ready';
+                });
+              }
+
+              Future<void> handlePasteButton() async {
+                final manualText = pasteController.text.trim();
+                if (manualText.isNotEmpty) {
+                  await applyPastedTranscript(manualText);
+                  return;
+                }
+                try {
+                  final clipData = await Clipboard.getData(
+                    Clipboard.kTextPlain,
+                  );
+                  await applyPastedTranscript(clipData?.text ?? '');
+                } catch (_) {
+                  if (!ctx.mounted) return;
+                  setDialogState(() {
+                    pasteInlineError =
+                        'Browser menahan akses clipboard otomatis. Tempel (Ctrl+V) manual ke kolom di bawah lalu tekan Paste Transkrip.';
+                  });
+                }
+              }
+
+              Future<void> startWithPrompt(
+                String label,
+                String assetPath,
+              ) async {
+                if (_useTubeTranscript) {
+                  await openTubeTranscriptForPrompt(label, assetPath);
+                  return;
+                }
+
+                smoothTimer?.cancel();
+                setDialogState(() {
+                  step = 'loading';
+                  progress = 1;
+                  selectedLabel = label;
+                  selectedAsset = assetPath;
+                  compiledResult = '';
+                  errorMsg = '';
+                });
+
+                smoothTimer = Timer.periodic(
+                  const Duration(milliseconds: 120),
+                  (t) {
+                    if (cancelled || !ctx.mounted || step != 'loading') {
+                      t.cancel();
+                      return;
+                    }
+                    if (progress < 90) {
+                      setDialogState(() {
+                        progress = (progress + 3).clamp(1, 90);
+                      });
+                    }
+                  },
+                );
+
+                try {
+                  final transcriptText = await _fetchTranscriptText(
+                    videoId,
+                    (pct) {
+                      if (cancelled || !ctx.mounted) return;
+                      setDialogState(() {
+                        if (pct > progress) progress = pct.clamp(1, 100);
+                      });
+                    },
+                  );
+                  if (cancelled || !ctx.mounted) return;
+                  final combined = await _buildTranscriptWithPrompt(
+                    assetPath,
+                    transcriptText,
+                  );
+                  smoothTimer?.cancel();
+                  if (cancelled || !ctx.mounted) return;
+                  setDialogState(() {
+                    progress = 100;
+                    compiledResult = combined;
+                    step = 'ready';
+                  });
+                } catch (e) {
+                  smoothTimer?.cancel();
+                  if (cancelled || !ctx.mounted) return;
+                  setDialogState(() {
+                    errorMsg = e.toString().replaceAll('Exception: ', '');
+                    step = 'error';
+                  });
+                }
+              }
+
+              final cachedForVideo = rawId.isNotEmpty
+                  ? (_transcriptCache[rawId] ?? '')
+                  : '';
+
+              return Dialog(
+                backgroundColor: const Color(0xFF1A1A1A),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  side: const BorderSide(color: Color(0xFF333333)),
+                ),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 460),
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 12, 18),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        // Header dengan tombol silang (X) di kanan atas
+                        Row(
+                          children: [
+                            const Icon(
+                              Icons.subtitles_outlined,
+                              color: Color(0xFFFF0033),
+                              size: 20,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    'Transkrip + Prompt',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  Text(
+                                    videoTitle,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Colors.white54,
+                                      fontSize: 11.5,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: 'Tutup / Batal',
+                              onPressed: closeDialog,
+                              icon: const Icon(
+                                Icons.close,
+                                color: Colors.white70,
+                                size: 20,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const Divider(color: Color(0xFF2D2D2D), height: 16),
+                        if (step == 'select') ...[
+                          const Text(
+                            'Pilih jenis prompt untuk mengambil & menyalin transkrip:',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 12.5,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          InkWell(
+                            borderRadius: BorderRadius.circular(10),
+                            onTap: () {
+                              final nextVal = !_useTubeTranscript;
+                              if (mounted) {
+                                setState(() {
+                                  _useTubeTranscript = nextVal;
+                                });
+                              }
+                              setDialogState(() {});
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 8,
+                              ),
+                              decoration: BoxDecoration(
+                                color: _useTubeTranscript
+                                    ? const Color(0xFF1F2A22)
+                                    : const Color(0xFF222222),
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(
+                                  color: _useTubeTranscript
+                                      ? const Color(
+                                          0xFF66BB6A,
+                                        ).withValues(alpha: 0.7)
+                                      : const Color(0xFF333333),
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  SizedBox(
+                                    width: 22,
+                                    height: 22,
+                                    child: Checkbox(
+                                      value: _useTubeTranscript,
+                                      activeColor: const Color(0xFF2E7D32),
+                                      onChanged: (v) {
+                                        final nextVal = v ?? false;
+                                        if (mounted) {
+                                          setState(() {
+                                            _useTubeTranscript = nextVal;
+                                          });
+                                        }
+                                        setDialogState(() {});
+                                      },
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        const Text(
+                                          'Gunakan TubeTranscript.com',
+                                          style: TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 12.5,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                        Text(
+                                          _useTubeTranscript
+                                              ? 'Aktif: pilih prompt -> buka tubetranscript.com lalu paste transkrip'
+                                              : 'Centang jika YouTube membatasi IP / gagal ambil otomatis',
+                                          style: const TextStyle(
+                                            color: Colors.white54,
+                                            fontSize: 10.5,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              for (
+                                var i = 0;
+                                i < promptOptions.length;
+                                i++
+                              ) ...[
+                                if (i > 0) const SizedBox(width: 8),
+                                Expanded(
+                                  child: InkWell(
+                                    borderRadius: BorderRadius.circular(10),
+                                    onTap: () => startWithPrompt(
+                                      promptOptions[i].label,
+                                      promptOptions[i].asset,
+                                    ),
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 16,
+                                        horizontal: 8,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFF242424),
+                                        borderRadius: BorderRadius.circular(
+                                          10,
+                                        ),
+                                        border: Border.all(
+                                          color: promptOptions[i].color
+                                              .withValues(alpha: 0.45),
+                                        ),
+                                      ),
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(
+                                            promptOptions[i].icon,
+                                            color: promptOptions[i].color,
+                                            size: 26,
+                                          ),
+                                          const SizedBox(height: 8),
+                                          Text(
+                                            promptOptions[i].label,
+                                            textAlign: TextAlign.center,
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 13.5,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 3),
+                                          Text(
+                                            promptOptions[i].subtitle,
+                                            textAlign: TextAlign.center,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(
+                                              color: Colors.white54,
+                                              fontSize: 10.5,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ] else if (step == 'paste') ...[
+                          Container(
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF222222),
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: const Color(0xFF343434),
+                              ),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Prompt "$selectedLabel" siap diisi dari TubeTranscript',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
+                                const Text(
+                                  '1. Di browser TubeTranscript, tunggu transkrip tampil lalu tekan "Salin".\n2. Kembali ke sini lalu tekan tombol "Paste Transkrip".',
+                                  style: TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 12,
+                                    height: 1.35,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF1565C0),
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                            icon: const Icon(Icons.content_paste_go, size: 19),
+                            label: const Text(
+                              'Paste Transkrip',
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            onPressed: handlePasteButton,
+                          ),
+                          if (cachedForVideo.isNotEmpty) ...[
+                            const SizedBox(height: 8),
+                            OutlinedButton.icon(
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.lightGreenAccent,
+                                side: BorderSide(
+                                  color: Colors.lightGreenAccent.withValues(
+                                    alpha: 0.45,
+                                  ),
+                                ),
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 9,
+                                  horizontal: 10,
+                                ),
+                              ),
+                              icon: const Icon(Icons.history, size: 17),
+                              label: Text(
+                                'Pakai Transkrip Tersimpan (${cachedForVideo.length} karakter)',
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontSize: 12),
+                              ),
+                              onPressed: () =>
+                                  applyPastedTranscript(cachedForVideo),
+                            ),
+                          ],
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: pasteController,
+                            minLines: 2,
+                            maxLines: 3,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                            ),
+                            decoration: InputDecoration(
+                              hintText:
+                                  'Opsional: tempel manual di sini jika browser memblokir baca clipboard...',
+                              hintStyle: const TextStyle(
+                                color: Colors.white38,
+                                fontSize: 11.5,
+                              ),
+                              filled: true,
+                              fillColor: const Color(0xFF121212),
+                              contentPadding: const EdgeInsets.all(10),
+                              enabledBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(8),
+                                borderSide: const BorderSide(
+                                  color: Color(0xFF333333),
+                                ),
+                              ),
+                              focusedBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(8),
+                                borderSide: const BorderSide(
+                                  color: Color(0xFF42A5F5),
+                                ),
+                              ),
+                            ),
+                          ),
+                          if (pasteInlineError.isNotEmpty) ...[
+                            const SizedBox(height: 8),
+                            Text(
+                              pasteInlineError,
+                              style: const TextStyle(
+                                color: Colors.orangeAccent,
+                                fontSize: 11.5,
+                              ),
+                            ),
+                          ],
+                          const SizedBox(height: 10),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 6,
+                            alignment: WrapAlignment.spaceBetween,
+                            children: [
+                              TextButton.icon(
+                                onPressed: launchTubeTranscriptPage,
+                                icon: const Icon(Icons.open_in_new, size: 15),
+                                label: const Text(
+                                  'Buka Ulang',
+                                  style: TextStyle(fontSize: 12),
+                                ),
+                              ),
+                              TextButton.icon(
+                                onPressed: () async {
+                                  final ytUrl =
+                                      'https://www.youtube.com/watch?v=$rawId';
+                                  await Clipboard.setData(
+                                    ClipboardData(text: ytUrl),
+                                  );
+                                  if (mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(
+                                        content: Text(
+                                          'Link YouTube disalin ke Clipboard.',
+                                        ),
+                                      ),
+                                    );
+                                  }
+                                },
+                                icon: const Icon(Icons.link, size: 15),
+                                label: const Text(
+                                  'Salin Link YT',
+                                  style: TextStyle(fontSize: 12),
+                                ),
+                              ),
+                              TextButton(
+                                onPressed: () {
+                                  setDialogState(() {
+                                    pasteInlineError = '';
+                                    step = 'select';
+                                  });
+                                },
+                                child: const Text(
+                                  'Kembali',
+                                  style: TextStyle(fontSize: 12),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ] else if (step == 'loading') ...[
+                          const SizedBox(height: 16),
+                          Center(
+                            child: SizedBox(
+                              width: 88,
+                              height: 88,
+                              child: Stack(
+                                alignment: Alignment.center,
+                                children: [
+                                  SizedBox(
+                                    width: 88,
+                                    height: 88,
+                                    child: CircularProgressIndicator(
+                                      value: progress / 100.0,
+                                      strokeWidth: 6,
+                                      backgroundColor: const Color(0xFF333333),
+                                      color: const Color(0xFFFF0033),
+                                    ),
+                                  ),
+                                  Text(
+                                    '$progress%',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          Text(
+                            'Mengambil transkrip (Prompt $selectedLabel)...',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 13,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                        ] else if (step == 'ready') ...[
+                          const SizedBox(height: 10),
+                          const Icon(
+                            Icons.check_circle,
+                            color: Colors.lightGreenAccent,
+                            size: 46,
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            'Transkrip + Prompt $selectedLabel Siap (100%)',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 14,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            '${compiledResult.length} karakter siap disalin',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white54,
+                              fontSize: 12,
+                            ),
+                          ),
+                          const SizedBox(height: 18),
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF2E7D32),
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                            icon: const Icon(Icons.copy, size: 18),
+                            label: const Text(
+                              'Copy',
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            onPressed: () async {
+                              try {
+                                await Clipboard.setData(
+                                  ClipboardData(text: compiledResult),
+                                );
+                              } catch (_) {}
+                              if (mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    backgroundColor: const Color(0xFF1B5E20),
+                                    content: Text(
+                                      '✅ Transkrip + Prompt $selectedLabel berhasil di-copy ke Clipboard!',
+                                    ),
+                                  ),
+                                );
+                              }
+                              if (ctx.mounted) {
+                                setDialogState(() {
+                                  step = 'select';
+                                  progress = 1;
+                                });
+                              }
+                            },
+                          ),
+                        ] else if (step == 'error') ...[
+                          const SizedBox(height: 8),
+                          const Icon(
+                            Icons.error_outline,
+                            color: Colors.redAccent,
+                            size: 42,
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            errorMsg,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.redAccent,
+                              fontSize: 12.5,
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF2E7D32),
+                              foregroundColor: Colors.white,
+                            ),
+                            icon: const Icon(Icons.open_in_new, size: 16),
+                            label: const Text('Buka via TubeTranscript.com'),
+                            onPressed: () async {
+                              if (mounted) {
+                                setState(() {
+                                  _useTubeTranscript = true;
+                                });
+                              }
+                              await openTubeTranscriptForPrompt(
+                                selectedLabel,
+                                selectedAsset,
+                              );
+                            },
+                          ),
+                          const SizedBox(height: 8),
+                          OutlinedButton(
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: Colors.white,
+                              side: const BorderSide(color: Color(0xFF444444)),
+                            ),
+                            onPressed: () {
+                              setDialogState(() {
+                                step = 'select';
+                                progress = 1;
+                              });
+                            },
+                            child: const Text('Kembali ke Pilihan Prompt'),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      );
+    } finally {
+      pasteController.dispose();
+    }
+  }
+
   bool get _isFastUnsubscribeActive =>
       skipUnsubscribeConfirmUntil != null &&
       DateTime.now().isBefore(skipUnsubscribeConfirmUntil!);
@@ -1855,6 +2960,10 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         selectedChannelId = '';
       }
     });
+
+    if (isStandaloneMode || _isHpDevice) {
+      await _saveStandaloneData();
+    }
 
     if (!isStandaloneMode) {
       try {
@@ -3258,10 +4367,25 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                           color: const Color(0xFFFF0033),
                           borderRadius: BorderRadius.circular(6),
                         ),
-                        child: const Icon(
-                          Icons.play_arrow,
-                          color: Colors.white,
-                          size: 18,
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.play_arrow,
+                              color: Colors.white,
+                              size: 18,
+                            ),
+                            SizedBox(width: 2),
+                            Text(
+                              'Yor',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w800,
+                                letterSpacing: -0.3,
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                       const SizedBox(width: 8),
@@ -3895,9 +5019,6 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               ('likes', '👍 Like Terbanyak'),
               ('time', '🕒 Waktu Upload'),
             ];
-            final isCustomYear =
-                period.endsWith('y') &&
-                int.tryParse(period.substring(0, period.length - 1)) != null;
 
             Widget regionChoice(String value, String label) {
               final active = selectedRegion == value;
@@ -4344,91 +5465,6 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             ),
           ),
         ],
-      ),
-    );
-  }
-
-  Widget _buildMobileActiveFilterBar() {
-    return Container(
-      color: const Color(0xFF0F0F0F),
-      padding: const EdgeInsets.fromLTRB(10, 2, 10, 6),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(
-          children: [
-            // CHIP WILAYAH: [🌐 Semua] [🇮🇩 Nasional] [🌍 Internasional] LANGSUNG DI LAYAR!
-            ...[
-              ('all', '🌐 Semua'),
-              ('Nasional', '🇮🇩 Nasional'),
-              ('Internasional', '🌍 Internasional'),
-              ('Belum diketahui', 'Belum diketahui'),
-            ].map((reg) {
-              final active = selectedRegion == reg.$1;
-              return Padding(
-                padding: const EdgeInsets.only(right: 6),
-                child: ChoiceChip(
-                  label: Text(reg.$2),
-                  selected: active,
-                  selectedColor: reg.$1 == 'Nasional'
-                      ? const Color(0xFFD32F2F)
-                      : (reg.$1 == 'Internasional'
-                            ? const Color(0xFF1976D2)
-                            : (reg.$1 == 'Belum diketahui'
-                                  ? const Color(0xFF616161)
-                                  : Colors.white)),
-                  backgroundColor: const Color(0xFF222222),
-                  labelStyle: TextStyle(
-                    color: active
-                        ? (reg.$1 == 'all' ? Colors.black : Colors.white)
-                        : Colors.white,
-                    fontWeight: FontWeight.bold,
-                    fontSize: 11.5,
-                  ),
-                  onSelected: (_) {
-                    setState(() {
-                      selectedRegion = reg.$1;
-                      currentPage = 1;
-                    });
-                    _saveUiPreferences();
-                    _fetchVideos();
-                  },
-                ),
-              );
-            }),
-            const SizedBox(width: 4),
-            // Tombol Urutan aktif
-            ActionChip(
-              backgroundColor: const Color(0xFF222222),
-              side: const BorderSide(color: Color(0xFF383838)),
-              label: Text(
-                sortBy == 'views'
-                    ? '🔥 View'
-                    : (sortBy == 'likes' ? '👍 Like' : '🕒 Waktu'),
-                style: const TextStyle(
-                  fontSize: 11.5,
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              onPressed: _showMobileFilterBottomSheet,
-            ),
-            const SizedBox(width: 6),
-            ActionChip(
-              backgroundColor: const Color(0xFF222222),
-              side: const BorderSide(color: Color(0xFF383838)),
-              label: Text(
-                '$limit Video',
-                style: const TextStyle(fontSize: 11.5, color: Colors.white70),
-              ),
-              onPressed: _showMobileFilterBottomSheet,
-            ),
-            const SizedBox(width: 8),
-            Text(
-              'Total: $totalVideos',
-              style: const TextStyle(fontSize: 11, color: Colors.white38),
-            ),
-          ],
-        ),
       ),
     );
   }
@@ -5268,6 +6304,8 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                     _fetchVideos();
                   } else if (value == 'open_yt') {
                     _openYouTubeVideo(v);
+                  } else if (value == 'transcript') {
+                    _showTranscriptPromptDialog(v);
                   }
                 },
                 itemBuilder: (popupCtx) => [
@@ -5312,7 +6350,31 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                           size: 18,
                         ),
                         SizedBox(width: 10),
-                        Text('Tonton di YouTube'),
+                        Expanded(
+                          child: Text(
+                            'Tonton di YouTube',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const PopupMenuItem(
+                    value: 'transcript',
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.subtitles_outlined,
+                          color: Colors.white70,
+                          size: 18,
+                        ),
+                        SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            'Transkrip',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
                       ],
                     ),
                   ),

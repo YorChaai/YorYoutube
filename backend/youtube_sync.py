@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
+import time
 from typing import Callable
 from datetime import datetime, timedelta, timezone
 import httpx
@@ -220,7 +221,7 @@ def sync_public_subscriptions_by_channel(my_channel_id: str, api_key: str = "") 
             resp = client.get(f"{YT_API_BASE}/subscriptions", params=params)
             data = resp.json()
             if "error" in data:
-                break
+                raise ValueError(data["error"].get("message", "Gagal mengambil daftar subscriptions."))
 
             for item in data.get("items", []):
                 snippet = item.get("snippet", {})
@@ -311,7 +312,10 @@ def refresh_all_channel_statistics(api_key: str = "", oauth_token: str = "") -> 
                 params={**params, "part": "snippet,statistics,contentDetails", "id": ",".join(cids)},
                 headers=headers,
             )
-            items = resp.json().get("items", [])
+            r_data = resp.json()
+            if resp.status_code != 200 or "error" in r_data:
+                continue
+            items = r_data.get("items", [])
             with db.get_conn() as conn:
                 for ch in items:
                     cid = ch["id"]
@@ -324,12 +328,23 @@ def refresh_all_channel_statistics(api_key: str = "", oauth_token: str = "") -> 
                     v_count = int(stats.get("videoCount", 0))
                     sub_count = int(stats.get("subscriberCount", 0))
                     conn.execute(
-                        "UPDATE channels SET yt_video_count=?, subscriber_count=?, region=?, handle=CASE WHEN ? != '' THEN ? ELSE handle END WHERE channel_id=?",
-                        (v_count, sub_count, reg, handle, handle, cid),
+                        """
+                        UPDATE channels
+                        SET yt_video_count=?,
+                            subscriber_count=?,
+                            region=CASE WHEN ? != 'Belum diketahui' AND COALESCE(region, 'Belum diketahui') = 'Belum diketahui' THEN ? ELSE region END,
+                            handle=CASE WHEN ? != '' THEN ? ELSE handle END
+                        WHERE channel_id=?
+                        """,
+                        (v_count, sub_count, reg, reg, handle, handle, cid),
                     )
                     conn.execute(
-                        "UPDATE videos SET region=? WHERE channel_id=?",
-                        (reg, cid),
+                        """
+                        UPDATE videos
+                        SET region=CASE WHEN ? != 'Belum diketahui' AND COALESCE(region, 'Belum diketahui') = 'Belum diketahui' THEN ? ELSE region END
+                        WHERE channel_id=?
+                        """,
+                        (reg, reg, cid),
                     )
                     updated += 1
     return updated
@@ -462,50 +477,67 @@ def refresh_all_channels_comprehensive(
     recent_cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT video_id FROM videos WHERE published_at < ?",
-            (recent_cutoff,),
+            "SELECT video_id, published_at FROM videos"
         ).fetchall()
-        known_old_vids = {r["video_id"] for r in rows}
+        all_existing_vids = {r["video_id"] for r in rows}
+        known_old_vids = {r["video_id"] for r in rows if (r["published_at"] or "") < recent_cutoff}
 
-    vid_to_cid: dict[str, str] = {}
+    unsynced_chs = [c for c in real_chs if c.get("synced_video_count", 0) == 0]
+    rss_chs = [c for c in real_chs if c.get("synced_video_count", 0) > 0]
+
     done_count = 0
+    newly_inserted_count = 0
+
+    # 1. Sync channel baru secara berurutan agar tidak terjadi race condition / lock di SQLite
+    for ch in unsynced_chs:
+        try:
+            sync_channel_videos(ch, api_key=api_key, oauth_token=oauth_token, max_videos=50)
+        except Exception:
+            pass
+        done_count += 1
+        if on_progress:
+            on_progress(done_count, total_chs)
+
+    # 2. Cek seluruh 15 item RSS terbaru untuk channel lainnya (dengan retry jika kena timeout/429)
+    vid_to_cid: dict[str, str] = {}
 
     def _check_channel(ch: dict) -> list[tuple[str, str]]:
         cid = ch["channel_id"]
-        # Jika channel belum pernah disinkronisasi sama sekali, tarik 50 video pertamanya
-        if ch.get("synced_video_count", 0) == 0:
-            try:
-                sync_channel_videos(ch, api_key=api_key, oauth_token=oauth_token, max_videos=50)
-            except Exception:
-                pass
-            return []
-
-        # Cek 15 video paling baru dari channel ini (menggunakan feed resmi YouTube yang super cepat & 0 kuota)
         found: list[tuple[str, str]] = []
-        try:
-            r = httpx.get(
-                f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}",
-                timeout=8.0,
-            )
-            if r.status_code == 200:
-                vids = re.findall(r"<yt:videoId>([^<]+)</yt:videoId>", r.text)[:10]
-                for v in vids:
-                    if v not in known_old_vids:
-                        found.append((v, cid))
-        except Exception:
-            pass
+        url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
+        for attempt in range(2):
+            try:
+                r = httpx.get(url, timeout=10.0)
+                if r.status_code == 200:
+                    vids = re.findall(r"<yt:videoId>([^<]+)</yt:videoId>", r.text)
+                    for v in vids:
+                        if v not in known_old_vids:
+                            found.append((v, cid))
+                    return found
+                if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                    time.sleep(0.4)
+                    continue
+                return found
+            except Exception:
+                if attempt == 0:
+                    time.sleep(0.4)
         return found
 
-    with ThreadPoolExecutor(max_workers=35) as pool:
-        futures = [pool.submit(_check_channel, ch) for ch in real_chs]
-        for fut in as_completed(futures):
-            done_count += 1
-            if on_progress:
-                on_progress(done_count, total_chs)
-            for vid, cid in fut.result():
-                vid_to_cid[vid] = cid
+    if rss_chs:
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            futures = [pool.submit(_check_channel, ch) for ch in rss_chs]
+            for fut in as_completed(futures):
+                done_count += 1
+                if on_progress:
+                    on_progress(done_count, total_chs)
+                for vid, cid in fut.result():
+                    vid_to_cid[vid] = cid
 
     if not vid_to_cid:
+        if unsynced_chs:
+            with db.get_conn() as conn:
+                after_count = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+                return max(0, after_count - len(all_existing_vids))
         return 0
 
     all_vids = list(vid_to_cid.keys())
@@ -513,47 +545,55 @@ def refresh_all_channels_comprehensive(
     with httpx.Client(timeout=25.0) as client:
         for i in range(0, len(all_vids), 50):
             chunk = all_vids[i : i + 50]
-            try:
-                v_resp = client.get(
-                    f"{YT_API_BASE}/videos",
-                    params={
-                        **params,
-                        "part": "snippet,statistics,contentDetails",
-                        "id": ",".join(chunk),
-                    },
-                    headers=headers,
+            v_resp = client.get(
+                f"{YT_API_BASE}/videos",
+                params={
+                    **params,
+                    "part": "snippet,statistics,contentDetails",
+                    "id": ",".join(chunk),
+                },
+                headers=headers,
+            )
+            v_data = v_resp.json()
+            if v_resp.status_code != 200 or "error" in v_data:
+                err_msg = v_data.get("error", {}).get("message", f"YouTube API error ({v_resp.status_code})")
+                raise RuntimeError(err_msg)
+            for v_item in v_data.get("items", []):
+                vid = v_item["id"]
+                snip = v_item.get("snippet", {})
+                stats = v_item.get("statistics", {})
+                cdet = v_item.get("contentDetails", {})
+                cid = snip.get("channelId") or vid_to_cid.get(vid, "")
+                ch_obj = ch_map.get(cid, {})
+                thumbs = snip.get("thumbnails", {})
+                thumb_url = (
+                    (thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url")
+                    or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
                 )
-                for v_item in v_resp.json().get("items", []):
-                    vid = v_item["id"]
-                    snip = v_item.get("snippet", {})
-                    stats = v_item.get("statistics", {})
-                    cdet = v_item.get("contentDetails", {})
-                    cid = snip.get("channelId") or vid_to_cid.get(vid, "")
-                    ch_obj = ch_map.get(cid, {})
-                    thumbs = snip.get("thumbnails", {})
-                    thumb_url = (
-                        (thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url")
-                        or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
-                    )
-                    rows_to_save.append(
-                        {
-                            "video_id": vid,
-                            "channel_id": cid,
-                            "channel_title": ch_obj.get("title") or snip.get("channelTitle", "YouTube"),
-                            "channel_thumbnail": ch_obj.get("thumbnail_url", ""),
-                            "title": snip.get("title", "Untitled"),
-                            "thumbnail_url": thumb_url,
-                            "published_at": snip.get("publishedAt", datetime.now(timezone.utc).isoformat()),
-                            "view_count": int(stats.get("viewCount", 0)),
-                            "like_count": int(stats.get("likeCount", 0)),
-                            "duration": parse_iso_duration(cdet.get("duration", "")),
-                            "is_demo": 0,
-                        }
-                    )
-            except Exception:
-                pass
+                if vid not in all_existing_vids:
+                    newly_inserted_count += 1
+                rows_to_save.append(
+                    {
+                        "video_id": vid,
+                        "channel_id": cid,
+                        "channel_title": ch_obj.get("title") or snip.get("channelTitle", "YouTube"),
+                        "channel_thumbnail": ch_obj.get("thumbnail_url", ""),
+                        "title": snip.get("title", "Untitled"),
+                        "thumbnail_url": thumb_url,
+                        "published_at": snip.get("publishedAt", datetime.now(timezone.utc).isoformat()),
+                        "view_count": int(stats.get("viewCount", 0)),
+                        "like_count": int(stats.get("likeCount", 0)),
+                        "duration": parse_iso_duration(cdet.get("duration", "")),
+                        "is_demo": 0,
+                    }
+                )
 
-    return db.upsert_videos(rows_to_save)
+    db.upsert_videos(rows_to_save)
+    if unsynced_chs:
+        with db.get_conn() as conn:
+            after_count = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+            return max(newly_inserted_count, after_count - len(all_existing_vids))
+    return newly_inserted_count
 
 
 def search_and_cache_subscribed_videos(

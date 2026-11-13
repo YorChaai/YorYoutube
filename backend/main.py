@@ -344,7 +344,7 @@ def _run_background_refresh(channel_id: str, api_key: str, oauth_token: str) -> 
                 REFRESH_STATE["done_channels"] = done
                 REFRESH_STATE["progress"] = min(99, max(5, int(done * 95 / max(1, total))))
 
-            youtube_sync.refresh_all_channels_comprehensive(
+            added_new = youtube_sync.refresh_all_channels_comprehensive(
                 all_chs,
                 api_key=api_key,
                 oauth_token=oauth_token,
@@ -352,7 +352,7 @@ def _run_background_refresh(channel_id: str, api_key: str, oauth_token: str) -> 
             )
 
         after_total = db.query_videos(limit=25, page=1)["total"]
-        REFRESH_STATE["new_videos"] = max(0, after_total - before_total)
+        REFRESH_STATE["new_videos"] = max(0, after_total - before_total) if channel_id else max(added_new, after_total - before_total)
         REFRESH_STATE["total_videos"] = after_total
         REFRESH_STATE["progress"] = 100
         REFRESH_STATE["done_ready"] = True
@@ -440,6 +440,51 @@ def watch_video(video_id: str, payload: WatchPayload | None = None) -> dict:
     return {"status": "ok", **res}
 
 
+@app.get("/api/videos/{video_id}/transcript")
+def get_video_transcript(video_id: str) -> dict:
+    clean_id = (video_id or "").strip()
+    if clean_id.startswith("demo_") and clean_id.count("_") >= 2:
+        clean_id = clean_id.split("_", 2)[2]
+    if not clean_id:
+        raise HTTPException(status_code=400, detail="Video ID tidak valid.")
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError:
+        raise HTTPException(status_code=500, detail="Paket youtube-transcript-api belum terpasang di backend.")
+
+    api = YouTubeTranscriptApi()
+    try:
+        try:
+            rows = api.fetch(clean_id, languages=["id", "en"])
+        except Exception as first:
+            tracks = api.list(clean_id)
+            track = next(iter(tracks))
+            rows = track.fetch()
+    except Exception as exc:
+        msg = str(exc)
+        err_name = type(exc).__name__
+        if (
+            "IpBlocked" in err_name
+            or "RequestBlocked" in err_name
+            or "blocking requests from your IP" in msg
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="IP internet saat ini sedang dibatasi sementara oleh YouTube. Centang TubeTranscript.com untuk mengambil transkrip lewat browser.",
+            )
+        raise HTTPException(status_code=404, detail=f"Gagal mengambil transkrip: {exc}")
+
+    segments = [str(row.text).replace("\n", " ").strip() for row in rows]
+    segments = [s for s in segments if s]
+    if not segments:
+        raise HTTPException(status_code=404, detail="Video tidak memiliki teks transkrip.")
+    return {
+        "video_id": clean_id,
+        "text": " ; ".join(segments),
+        "segments_count": len(segments),
+    }
+
+
 @app.post("/api/channels/{channel_id}/watch")
 def watch_channel(channel_id: str, payload: WatchPayload | None = None) -> dict:
     dev = payload.device if payload and payload.device else "laptop"
@@ -457,7 +502,7 @@ def update_channel_region(channel_id: str, payload: RegionPayload) -> dict:
 @app.post("/api/channels/{channel_id}/subscribe")
 def subscribe_channel_endpoint(channel_id: str) -> dict:
     db.subscribe_channel(channel_id)
-    return {"status": "ok", "channel_id": channel_id, "status": "subscribed"}
+    return {"ok": True, "channel_id": channel_id, "status": "subscribed"}
 
 
 @app.post("/api/channels/{channel_id}/unfollow")
@@ -465,7 +510,7 @@ def unfollow_channel_endpoint(channel_id: str) -> dict:
     db.delete_channel(channel_id)
     if SESSION_UI_STATE.get("channel_id") == channel_id:
         SESSION_UI_STATE["channel_id"] = ""
-    return {"status": "ok", "channel_id": channel_id, "status": "unfollowed"}
+    return {"ok": True, "channel_id": channel_id, "status": "unfollowed"}
 
 
 @app.delete("/api/channels/{channel_id}")
