@@ -75,12 +75,12 @@ void main() {
       expect(find.text('Refresh YouTube'), findsNothing);
       expect(find.text('Tambah Channel'), findsNothing);
 
-      // 3. Cek Filter & Urutkan di sebelah kiri search bar compact + info filter ikut ter-hide saat scroll
+      // 3. Cek Filter & Urutkan di sebelah kanan search bar compact + info filter ikut ter-hide saat scroll
       expect(find.text('Filter & Urutkan'), findsOneWidget);
       final filterRect = tester.getRect(find.text('Filter & Urutkan'));
       final searchFieldFinder = find.byType(TextField).first;
       final searchRect = tester.getRect(searchFieldFinder);
-      expect(filterRect.right, lessThan(searchRect.left));
+      expect(filterRect.left, greaterThan(searchRect.right));
       expect(searchRect.width, lessThanOrEqualTo(360));
       expect(find.textContaining('Total: 36 video'), findsOneWidget);
 

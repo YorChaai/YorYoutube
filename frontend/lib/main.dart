@@ -8098,8 +8098,6 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          _buildFilterSortButton(height: height, compact: compactFilter),
-          SizedBox(width: compactFilter ? 5 : 8),
           Flexible(
             child: ConstrainedBox(
               constraints: BoxConstraints(maxWidth: searchMaxWidth),
@@ -8111,6 +8109,8 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               ),
             ),
           ),
+          SizedBox(width: compactFilter ? 5 : 8),
+          _buildFilterSortButton(height: height, compact: compactFilter),
         ],
       ),
     );
