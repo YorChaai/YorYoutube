@@ -350,40 +350,56 @@ def _youtube_shorts_playlist_id(cid: str) -> str:
     return ""
 
 
-def _is_youtube_short(video_id: str, client: httpx.Client | None = None) -> bool:
+def _probe_short_kind(video_id: str, client: httpx.Client | None = None) -> str:
     """
-    Membedakan YouTube Shorts vs video reguler berdasarkan format URL (/shorts/{id}):
-    - Shorts -> HTTP 200 di /shorts/{id} (walaupun durasi > 60 detik)
-    - Video reguler -> HTTP 303 redirect ke /watch?v={id} (walaupun durasi < 60 detik)
+    Mendeteksi jenis URL video ('short', 'regular', atau 'unknown' saat error jaringan/rate-limit):
+    - Shorts -> HTTP 200 di /shorts/{id} (walaupun durasi > 60 detik) -> 'short'
+    - Video reguler -> HTTP 301-308 redirect ke /watch?v={id} atau 404 -> 'regular'
+    - Gagal jaringan / 429 / 5xx -> 'unknown' (jangan diam-diam dianggap reguler pada jalur fallback)
     """
     if not video_id:
-        return False
-    try:
-        if client is not None:
-            head_fn = getattr(client, "head", None)
-            if not callable(head_fn):
-                return False
-            try:
-                resp = head_fn(
-                    f"https://www.youtube.com/shorts/{video_id}",
-                    follow_redirects=False,
-                )
-            except TypeError:
-                resp = head_fn(f"https://www.youtube.com/shorts/{video_id}")
-        else:
-            with httpx.Client(timeout=6.0, follow_redirects=False) as hc:
-                resp = hc.head(f"https://www.youtube.com/shorts/{video_id}")
+        return "regular"
+
+    def _once(hc: httpx.Client) -> str:
+        head_fn = getattr(hc, "head", None)
+        if not callable(head_fn):
+            return "unknown"
+        try:
+            resp = head_fn(
+                f"https://www.youtube.com/shorts/{video_id}",
+                follow_redirects=False,
+            )
+        except TypeError:
+            resp = head_fn(f"https://www.youtube.com/shorts/{video_id}")
         code = getattr(resp, "status_code", 0)
-        if code in (301, 302, 303, 307, 308):
-            return False
+        if code in (301, 302, 303, 307, 308, 404):
+            return "regular"
         if code == 200:
             final_url = str(getattr(resp, "url", "") or "")
             if final_url and "/watch" in final_url:
-                return False
-            return True
-        return False
-    except Exception:
-        return False
+                return "regular"
+            return "short"
+        return "unknown"
+
+    for attempt in range(2):
+        try:
+            if client is not None:
+                kind = _once(client)
+            else:
+                with httpx.Client(timeout=6.0, follow_redirects=False) as hc:
+                    kind = _once(hc)
+            if kind != "unknown":
+                return kind
+        except Exception:
+            pass
+        if attempt == 0:
+            time.sleep(0.15)
+    return "unknown"
+
+
+def _is_youtube_short(video_id: str, client: httpx.Client | None = None) -> bool:
+    """True jika YouTube menyajikan video tersebut pada endpoint format /shorts/{id}."""
+    return _probe_short_kind(video_id, client=client) == "short"
 
 
 def _rss_playlist_has_entries(client: httpx.Client, playlist_id: str) -> bool:
@@ -423,6 +439,7 @@ def sync_channel_videos(
     max_videos: int = 100,
     start_date: str = "",
     end_date: str = "",
+    on_progress: Callable[[int], None] | None = None,
 ) -> int:
     cid = channel["channel_id"]
     if cid.startswith("UC_demo_"):
@@ -459,6 +476,8 @@ def sync_channel_videos(
         }
 
     with httpx.Client(timeout=25.0, follow_redirects=False) as client:
+        if on_progress:
+            on_progress(5)
         while len(video_ids) < max_videos and pages_scanned < max_pages:
             req_params = {
                 **params,
@@ -518,6 +537,8 @@ def sync_channel_videos(
                     video_ids.append(vid)
 
             page_token = data.get("nextPageToken")
+            if on_progress:
+                on_progress(min(55, max(8, int(len(video_ids) * 50 / max_videos) + 5)))
             if reached_cutoff or not page_token or len(video_ids) >= max_videos:
                 break
 
@@ -527,6 +548,9 @@ def sync_channel_videos(
                 if lvid not in seen_v:
                     video_ids.append(lvid)
                     seen_v.add(lvid)
+
+        if on_progress:
+            on_progress(55)
 
         # Batch fetch statistics (viewCount, likeCount) & duration in chunks of 50 (only 1 unit per 50 videos!)
         rows_to_save: list[dict] = []
@@ -555,12 +579,22 @@ def sync_channel_videos(
                 snip = v_item.get("snippet", {})
                 stats = v_item.get("statistics", {})
                 cdet = v_item.get("contentDetails", {})
+                dur_str = parse_iso_duration(cdet.get("duration", ""))
+                dur_sec = db.duration_to_seconds(dur_str)
+                is_live_val = 1 if snip.get("liveBroadcastContent") == "live" else 0
+                fmt_checked = 1
+                if is_live_val == 0 and 0 < dur_sec <= 185:
+                    kind = _probe_short_kind(vid, client)
+                    if kind == "short":
+                        continue
+                    if kind == "unknown" and using_fallback_uploads:
+                        continue
+                    fmt_checked = 1 if kind == "regular" else 0
                 thumbs = snip.get("thumbnails", {})
                 thumb_url = (
                     (thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url")
                     or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
                 )
-                is_live_val = 1 if snip.get("liveBroadcastContent") == "live" else 0
                 if is_live_val:
                     still_live_ids.add(vid)
                 rows_to_save.append(
@@ -574,16 +608,21 @@ def sync_channel_videos(
                         "published_at": snip.get("publishedAt", datetime.now(timezone.utc).isoformat()),
                         "view_count": int(stats.get("viewCount", 0)),
                         "like_count": int(stats.get("likeCount", 0)),
-                        "duration": parse_iso_duration(cdet.get("duration", "")),
+                        "duration": dur_str,
                         "is_demo": 0,
                         "is_live": is_live_val,
+                        "format_checked": fmt_checked,
                     }
                 )
+            if on_progress and video_ids:
+                on_progress(min(96, 55 + int((i + len(chunk)) * 41 / len(video_ids))))
 
     saved_count = db.upsert_videos(rows_to_save)
     ended_live = [lvid for lvid in existing_live_ids if lvid in checked_vids and lvid not in still_live_ids]
     if ended_live:
         db.mark_videos_not_live(ended_live)
+    if on_progress:
+        on_progress(100)
     return saved_count
 
 
@@ -638,6 +677,8 @@ def refresh_all_channels_comprehensive(
 
     # Cek 15 item RSS terbaru + feed live UULV untuk seluruh channel sekaligus via pool 40 worker & keep-alive connection
     vid_to_cid: dict[str, str] = {}
+    fallback_vids: set[str] = set()
+    uulv_vids: set[str] = set()
     limits = httpx.Limits(max_connections=60, max_keepalive_connections=40)
     with httpx.Client(timeout=6.0, limits=limits, follow_redirects=True) as rss_client:
         def _fetch_rss(url: str) -> str:
@@ -655,9 +696,9 @@ def refresh_all_channels_comprehensive(
                         time.sleep(0.2 * (attempt + 1))
             return ""
 
-        def _check_channel(ch: dict) -> list[tuple[str, str]]:
+        def _check_channel(ch: dict) -> list[tuple[str, str, bool, bool]]:
             cid = ch["channel_id"]
-            found: list[tuple[str, str]] = []
+            found: list[tuple[str, str, bool, bool]] = []
             seen_local: set[str] = set()
             uulf_pid = _youtube_longform_playlist_id(cid)
             xml_main = _fetch_rss(f"https://www.youtube.com/feeds/videos.xml?playlist_id={uulf_pid}") if uulf_pid else ""
@@ -669,10 +710,10 @@ def refresh_all_channels_comprehensive(
                 for v in vid_tag_re.findall(xml_main):
                     v = v.strip()
                     if v and v not in known_old_vids and v not in seen_local:
-                        if used_channel_fallback and _is_youtube_short(v, rss_client):
+                        if used_channel_fallback and _probe_short_kind(v, rss_client) == "short":
                             continue
                         seen_local.add(v)
-                        found.append((v, cid))
+                        found.append((v, cid, used_channel_fallback, False))
             if cid.startswith("UC") and len(cid) > 2:
                 xml_live = _fetch_rss(f"https://www.youtube.com/feeds/videos.xml?playlist_id=UULV{cid[2:]}")
                 if xml_live:
@@ -691,7 +732,7 @@ def refresh_all_channels_comprehensive(
                             or v in zero_dur_vids
                         ):
                             seen_local.add(v)
-                            found.append((v, cid))
+                            found.append((v, cid, False, True))
             return found
 
         with ThreadPoolExecutor(max_workers=40) as pool:
@@ -700,8 +741,12 @@ def refresh_all_channels_comprehensive(
                 done_count += 1
                 if on_progress and (done_count % 10 == 0 or done_count == total_chs):
                     on_progress(done_count, total_chs)
-                for vid, cid in fut.result():
+                for vid, cid, is_fb, is_uulv in fut.result():
                     vid_to_cid[vid] = cid
+                    if is_fb:
+                        fallback_vids.add(vid)
+                    if is_uulv:
+                        uulv_vids.add(vid)
 
     for lvid, lcid in existing_live_map.items():
         vid_to_cid.setdefault(lvid, lcid)
@@ -729,12 +774,45 @@ def refresh_all_channels_comprehensive(
                 err_msg = v_data.get("error", {}).get("message", f"YouTube API error ({v_resp.status_code})")
                 raise RuntimeError(err_msg)
             checked_vids.update(chunk)
+            raw_items = v_data.get("items", [])
+            need_probe: list[str] = []
+            for v_item in raw_items:
+                vid = v_item["id"]
+                snip = v_item.get("snippet", {})
+                cdet = v_item.get("contentDetails", {})
+                dur_sec = db.duration_to_seconds(parse_iso_duration(cdet.get("duration", "")))
+                is_live_val = 1 if snip.get("liveBroadcastContent") == "live" else 0
+                if is_live_val == 0 and 0 < dur_sec <= 185:
+                    need_probe.append(vid)
+
+            probe_results: dict[str, str] = {}
+            if len(need_probe) > 3 and isinstance(client, httpx.Client):
+                with httpx.Client(timeout=6.0, follow_redirects=False) as probe_hc:
+                    with ThreadPoolExecutor(max_workers=10) as p_pool:
+                        futs = {p_pool.submit(_probe_short_kind, pvid, probe_hc): pvid for pvid in need_probe}
+                        for pfut in as_completed(futs):
+                            probe_results[futs[pfut]] = pfut.result()
+            else:
+                for pvid in need_probe:
+                    probe_results[pvid] = _probe_short_kind(pvid, client)
+
             chunk_rows: list[dict] = []
-            for v_item in v_data.get("items", []):
+            for v_item in raw_items:
                 vid = v_item["id"]
                 snip = v_item.get("snippet", {})
                 stats = v_item.get("statistics", {})
                 cdet = v_item.get("contentDetails", {})
+                dur_str = parse_iso_duration(cdet.get("duration", ""))
+                dur_sec = db.duration_to_seconds(dur_str)
+                is_live_val = 1 if snip.get("liveBroadcastContent") == "live" else 0
+                fmt_checked = 1
+                if is_live_val == 0 and 0 < dur_sec <= 185:
+                    kind = probe_results.get(vid, "unknown")
+                    if kind == "short":
+                        continue
+                    if kind == "unknown" and (vid in fallback_vids or vid in uulv_vids):
+                        continue
+                    fmt_checked = 1 if kind == "regular" else 0
                 cid = snip.get("channelId") or vid_to_cid.get(vid, "")
                 ch_obj = ch_map.get(cid, {})
                 thumbs = snip.get("thumbnails", {})
@@ -742,7 +820,6 @@ def refresh_all_channels_comprehensive(
                     (thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url")
                     or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
                 )
-                is_live_val = 1 if snip.get("liveBroadcastContent") == "live" else 0
                 if is_live_val:
                     still_live_vids.add(vid)
                 if vid not in all_existing_vids:
@@ -759,9 +836,10 @@ def refresh_all_channels_comprehensive(
                         "published_at": snip.get("publishedAt", datetime.now(timezone.utc).isoformat()),
                         "view_count": int(stats.get("viewCount", 0)),
                         "like_count": int(stats.get("likeCount", 0)),
-                        "duration": parse_iso_duration(cdet.get("duration", "")),
+                        "duration": dur_str,
                         "is_demo": 0,
                         "is_live": is_live_val,
+                        "format_checked": fmt_checked,
                     }
                 )
             db.upsert_videos(chunk_rows)

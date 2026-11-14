@@ -701,6 +701,12 @@ def test_sync_channel_videos_custom_range_cap_100_and_preserves_old(isolated_cli
     assert "vid_2024_0" not in all_ids
     assert len([x for x in all_ids if x.startswith("vid_2025_")]) == 100
 
+    st_res = isolated_client.get("/api/channels/UC_eno_test/reload-status")
+    assert st_res.status_code == 200
+    st_body = st_res.json()
+    assert st_body["running"] is False
+    assert st_body["progress"] == 100
+
 
 def test_shorts_excluded_by_format_and_under_60s_regular_kept(isolated_client, monkeypatch):
     """Shorts (>60s atau <60s) wajib dikecualikan lewat UULF & HEAD /shorts, sedangkan video reguler <60s tetap disimpan."""
@@ -940,6 +946,93 @@ def test_purge_existing_shorts_endpoint_preserves_regular_short_videos(isolated_
     assert "vid_old_reg_under1m" in remaining_ids
     # Re-running finds 0 unchecked candidates
     assert db.list_unchecked_short_candidates() == []
+
+
+def test_fallback_refresh_fails_closed_when_short_probe_errors(isolated_client, monkeypatch):
+    """Jika RSS UULF gagal sementara lalu fallback ke channel_id & HEAD /shorts error/429, video <=3m tidak boleh lolos (fail-closed)."""
+    import youtube_sync
+
+    db.set_setting("api_key", "FAKE_KEY")
+    db.upsert_channel(channel_id="UC_flaky", title="Flaky Channel", uploads_playlist_id="UU_flaky")
+
+    class _Resp:
+        def __init__(self, status_code, payload=None, text="", url=""):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = text
+            self.url = url
+
+        def json(self):
+            return self._payload
+
+    class _FlakyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def head(self, url, follow_redirects=False):
+            if url.endswith("/shorts/vid_short_err"):
+                raise RuntimeError("Simulated 429/timeout on HEAD")
+            return _Resp(303, url="https://www.youtube.com/watch?v=vid_reg_ok_35s")
+
+        def get(self, url, params=None, headers=None):
+            params = params or {}
+            if "playlist_id=UULF_flaky" in str(url):
+                return _Resp(429, text="")
+            if "channel_id=UC_flaky" in str(url):
+                return _Resp(
+                    200,
+                    text="<feed><yt:videoId>vid_short_err</yt:videoId><yt:videoId>vid_reg_ok_35s</yt:videoId></feed>",
+                )
+            if "playlist_id=UULV_flaky" in str(url):
+                return _Resp(404, text="")
+            if str(url).endswith("/videos"):
+                return _Resp(
+                    200,
+                    {
+                        "items": [
+                            {
+                                "id": "vid_short_err",
+                                "snippet": {
+                                    "channelId": "UC_flaky",
+                                    "channelTitle": "Flaky Channel",
+                                    "title": "Short Leaked On Timeout",
+                                    "publishedAt": "2026-11-14T14:45:00Z",
+                                    "liveBroadcastContent": "none",
+                                    "thumbnails": {},
+                                },
+                                "statistics": {"viewCount": "10", "likeCount": "1"},
+                                "contentDetails": {"duration": "PT34S"},
+                            },
+                            {
+                                "id": "vid_reg_ok_35s",
+                                "snippet": {
+                                    "channelId": "UC_flaky",
+                                    "channelTitle": "Flaky Channel",
+                                    "title": "Regular 35s Clip",
+                                    "publishedAt": "2026-11-14T14:40:00Z",
+                                    "liveBroadcastContent": "none",
+                                    "thumbnails": {},
+                                },
+                                "statistics": {"viewCount": "20", "likeCount": "2"},
+                                "contentDetails": {"duration": "PT35S"},
+                            },
+                        ]
+                    },
+                )
+            return _Resp(404)
+
+    monkeypatch.setattr(youtube_sync.httpx, "Client", _FlakyClient)
+    inserted = youtube_sync.refresh_all_channels_comprehensive(db.list_channels(), api_key="FAKE_KEY")
+    assert inserted == 1
+    ids = {v["video_id"] for v in db.query_videos(channel_id="UC_flaky", limit=50)["items"]}
+    assert "vid_reg_ok_35s" in ids
+    assert "vid_short_err" not in ids
 
 
 

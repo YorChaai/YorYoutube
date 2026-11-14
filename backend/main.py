@@ -599,6 +599,21 @@ def add_channel(payload: AddChannelPayload) -> dict:
         raise HTTPException(status_code=502, detail=f"Gagal menghubungi YouTube: {e}")
 
 
+CHANNEL_RELOAD_PROGRESS: dict[str, dict] = {}
+
+
+@app.get("/api/channels/{channel_id}/reload-status")
+def get_channel_reload_status(channel_id: str) -> dict:
+    """Status progress real-time (0-100%) saat memuat ulang video 1 creator."""
+    with _STATE_LOCK:
+        return dict(
+            CHANNEL_RELOAD_PROGRESS.get(
+                channel_id,
+                {"running": False, "progress": 0, "error": ""},
+            )
+        )
+
+
 @app.post("/api/channels/{channel_id}/reload")
 def reload_single_channel(channel_id: str, payload: ChannelReloadPayload | None = None) -> dict:
     """Muat ulang / tarik video 1 creator (mendukung Custom Date Range & batas maksimal 100 video tanpa menghapus video lama)."""
@@ -616,6 +631,21 @@ def reload_single_channel(channel_id: str, payload: ChannelReloadPayload | None 
     end_date = (payload.end_date if payload else "").strip()
     max_videos = max(1, min(int((payload.max_videos if payload else 100) or 100), 10000))
 
+    with _STATE_LOCK:
+        CHANNEL_RELOAD_PROGRESS[channel_id] = {
+            "running": True,
+            "progress": 2,
+            "error": "",
+        }
+
+    def _on_progress(pct: int) -> None:
+        with _STATE_LOCK:
+            st = CHANNEL_RELOAD_PROGRESS.setdefault(
+                channel_id,
+                {"running": True, "progress": 0, "error": ""},
+            )
+            st["progress"] = max(int(st.get("progress", 0)), min(100, int(pct)))
+
     try:
         synced = youtube_sync.sync_channel_videos(
             ch,
@@ -624,9 +654,12 @@ def reload_single_channel(channel_id: str, payload: ChannelReloadPayload | None 
             max_videos=max_videos,
             start_date=start_date,
             end_date=end_date,
+            on_progress=_on_progress,
         )
+        _on_progress(98)
         _sync_live_snapshot_in_place()
         total_now = db.query_videos(channel_id=channel_id, hide_filter="both", limit=25, page=1)["total"]
+        _on_progress(100)
         return {
             "status": "ok",
             "channel_id": channel_id,
@@ -634,9 +667,25 @@ def reload_single_channel(channel_id: str, payload: ChannelReloadPayload | None 
             "total_channel_videos": total_now,
         }
     except RuntimeError as e:
+        with _STATE_LOCK:
+            CHANNEL_RELOAD_PROGRESS[channel_id] = {
+                "running": False,
+                "progress": 0,
+                "error": str(e),
+            }
         raise HTTPException(status_code=502, detail=str(e))
     except (httpx.HTTPError, json.JSONDecodeError) as e:
+        with _STATE_LOCK:
+            CHANNEL_RELOAD_PROGRESS[channel_id] = {
+                "running": False,
+                "progress": 0,
+                "error": f"Gagal menghubungi YouTube: {e}",
+            }
         raise HTTPException(status_code=502, detail=f"Gagal menghubungi YouTube: {e}")
+    finally:
+        with _STATE_LOCK:
+            if channel_id in CHANNEL_RELOAD_PROGRESS:
+                CHANNEL_RELOAD_PROGRESS[channel_id]["running"] = False
 
 
 @app.post("/api/videos/purge-shorts")

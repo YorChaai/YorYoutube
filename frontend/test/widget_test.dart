@@ -1293,7 +1293,8 @@ void main() {
       addTearDown(() => tester.binding.setSurfaceSize(null));
 
       var reloadHits = 0;
-      Map<String, dynamic> handleBackend(String method, Uri uri) {
+      Completer<void>? reloadGate;
+      Future<Map<String, dynamic>> handleBackend(String method, Uri uri) async {
         final path = uri.path;
         if (path == '/api/state') {
           return {
@@ -1397,8 +1398,18 @@ void main() {
             'live_streams': const [],
           };
         }
+        if (path == '/api/channels/UC_ferry/reload-status' && method == 'GET') {
+          return {
+            'running': reloadGate != null && !reloadGate!.isCompleted,
+            'progress': 65,
+            'error': '',
+          };
+        }
         if (path == '/api/channels/UC_ferry/reload' && method == 'POST') {
           reloadHits += 1;
+          if (reloadGate != null) {
+            await reloadGate!.future;
+          }
           return {
             'status': 'ok',
             'channel_id': 'UC_ferry',
@@ -1483,14 +1494,24 @@ void main() {
           await tester.pump();
           expect(find.text('Reload (5000 video)'), findsOneWidget);
 
+          reloadGate = Completer<void>();
           await tester.tap(find.byKey(const Key('creator_range_submit_btn_UC_ferry')));
           await tester.pump();
-          await tester.pump(const Duration(milliseconds: 300));
+          // Initial progress badge appears (red circular percentage indicator)
+          expect(find.byKey(const Key('creator_reload_progress_UC_ferry')), findsOneWidget);
+          // Poll interval (350ms) fetches 65% from /reload-status
+          await tester.pump(const Duration(milliseconds: 400));
+          expect(find.text('65%'), findsOneWidget);
 
+          reloadGate!.complete();
+          await tester.pumpAndSettle();
+
+          expect(find.byKey(const Key('creator_reload_progress_UC_ferry')), findsNothing);
           expect(reloadHits, equals(1));
           expect(tester.takeException(), isNull);
         },
-        createHttpClient: (_) => _TestBackendHttpClient(handleBackend),
+        createHttpClient: (_) =>
+            _TestBackendHttpClient((_, _) => {}, asyncHandler: handleBackend),
       );
     },
   );
@@ -1574,13 +1595,21 @@ void main() {
 
 class _TestBackendHttpClient implements HttpClient {
   final Map<String, dynamic> Function(String method, Uri uri) handler;
+  final Future<Map<String, dynamic>> Function(String method, Uri uri)?
+      asyncHandler;
   final ({int statusCode, String body})? Function(String method, Uri uri)?
       rawHandler;
-  _TestBackendHttpClient(this.handler, {this.rawHandler});
+  _TestBackendHttpClient(this.handler, {this.rawHandler, this.asyncHandler});
 
   @override
   Future<HttpClientRequest> openUrl(String method, Uri url) async =>
-      _TestHttpRequest(method, url, handler, rawHandler: rawHandler);
+      _TestHttpRequest(
+        method,
+        url,
+        handler,
+        rawHandler: rawHandler,
+        asyncHandler: asyncHandler,
+      );
 
   @override
   Future<HttpClientRequest> getUrl(Uri url) => openUrl('GET', url);
@@ -1598,6 +1627,8 @@ class _TestHttpRequest implements HttpClientRequest {
   @override
   final Uri uri;
   final Map<String, dynamic> Function(String method, Uri uri) handler;
+  final Future<Map<String, dynamic>> Function(String method, Uri uri)?
+      asyncHandler;
   final ({int statusCode, String body})? Function(String method, Uri uri)?
       rawHandler;
   final HttpHeaders _headers = _TestHttpHeaders();
@@ -1607,6 +1638,7 @@ class _TestHttpRequest implements HttpClientRequest {
     this.uri,
     this.handler, {
     this.rawHandler,
+    this.asyncHandler,
   });
 
   @override
@@ -1644,7 +1676,10 @@ class _TestHttpRequest implements HttpClientRequest {
     if (uri.host != '127.0.0.1' && uri.host != 'localhost') {
       return _TestHttpResponse(404, '{}');
     }
-    final body = jsonEncode(handler(method, uri));
+    final payload = asyncHandler != null
+        ? await asyncHandler!(method, uri)
+        : handler(method, uri);
+    final body = jsonEncode(payload);
     return _TestHttpResponse(200, body);
   }
 

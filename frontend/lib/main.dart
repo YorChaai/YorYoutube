@@ -118,6 +118,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   bool _purgingShorts = false;
   final Set<String> _localUnsubscribedIds = {};
   final Set<String> _reloadingChannelIds = {};
+  final Map<String, int> _reloadingChannelProgress = {};
 
   // Database lokal mandiri di dalam aplikasi (untuk jalan sendiri di HP tanpa Python backend)
   final List<Map<String, dynamic>> _localChannels = [];
@@ -1211,6 +1212,29 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     await _fetchVideos();
     _triggerAutoRefreshYouTube();
     if (isStandaloneMode) {
+      if (_isHpDevice) {
+        try {
+          final db = await _openStandaloneDatabase();
+          final doneRows = await db.query(
+            'settings',
+            where: 'key = ?',
+            whereArgs: const ['shorts_reverify_v23_done'],
+          );
+          if (doneRows.isEmpty) {
+            for (final v in _localVideos) {
+              final dsec =
+                  int.tryParse((v['duration_seconds'] ?? 0).toString()) ?? 0;
+              if (dsec > 0 && dsec <= 185) {
+                v['format_checked'] = 0;
+              }
+            }
+            await db.insert('settings', {
+              'key': 'shorts_reverify_v23_done',
+              'value': '1',
+            }, conflictAlgorithm: ConflictAlgorithm.replace);
+          }
+        } catch (_) {}
+      }
       unawaited(_maybeAutoPurgeStandaloneShorts());
     }
   }
@@ -1461,6 +1485,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           return selectedChannelId.isEmpty || cid == selectedChannelId;
         }).toList();
         await _standaloneFastRefreshChannels(targetChs);
+        unawaited(_maybeAutoPurgeStandaloneShorts());
         await _saveStandaloneData();
         final newVids = (_localVideos.length - beforeCount).clamp(0, 999999);
         if (!mounted) return;
@@ -1745,26 +1770,42 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   }
 
   /// Membedakan Shorts vs video reguler lewat endpoint resmi /shorts/{id}:
-  /// - Shorts -> HTTP 200 di /shorts/{id} (walau durasi > 60 detik)
-  /// - Video reguler -> HTTP 303 redirect ke /watch?v={id} (walau durasi < 60 detik)
+  /// - Shorts -> HTTP 200 di /shorts/{id} (walau durasi > 60 detik) -> 'short'
+  /// - Video reguler -> HTTP 301-308 / 404 -> 'regular'
+  /// - Timeout / rate limit (429/5xx) -> 'unknown' (fail-closed di jalur fallback)
+  Future<String> _probeYoutubeShortKind(
+    http.Client client,
+    String videoId,
+  ) async {
+    if (kIsWeb || videoId.isEmpty) return 'unknown';
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        final req = http.Request(
+          'HEAD',
+          Uri.parse('https://www.youtube.com/shorts/$videoId'),
+        )..followRedirects = false;
+        final streamed = await client.send(req).timeout(
+          const Duration(seconds: 6),
+        );
+        await streamed.stream.drain<void>().catchError((_) {});
+        final code = streamed.statusCode;
+        if ((code >= 300 && code < 400) || code == 404) {
+          return 'regular';
+        }
+        if (code == 200) {
+          return 'short';
+        }
+      } catch (_) {}
+      if (attempt == 0) {
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+    }
+    return 'unknown';
+  }
+
   Future<bool> _isYoutubeShort(http.Client client, String videoId) async {
     if (kIsWeb || videoId.isEmpty) return false;
-    try {
-      final req = http.Request(
-        'HEAD',
-        Uri.parse('https://www.youtube.com/shorts/$videoId'),
-      )..followRedirects = false;
-      final streamed = await client.send(req).timeout(
-        const Duration(seconds: 5),
-      );
-      await streamed.stream.drain<void>().catchError((_) {});
-      if (streamed.statusCode >= 300 && streamed.statusCode < 400) {
-        return false;
-      }
-      return streamed.statusCode == 200;
-    } catch (_) {
-      return false;
-    }
+    return (await _probeYoutubeShortKind(client, videoId)) == 'short';
   }
 
   Future<void> _standaloneFastRefreshChannels(
@@ -1828,6 +1869,8 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final pubRegex = RegExp(r'<published>([^<]+)</published>');
 
     final client = http.Client();
+    final fallbackVidIds = <String>{};
+    final uulvVidIds = <String>{};
     try {
       var nextIdx = 0;
       var doneCount = 0;
@@ -1891,8 +1934,10 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               for (final m in vidRegex.allMatches(mainXml)) {
                 final vid = (m.group(1) ?? '').trim();
                 if (vid.isNotEmpty && !knownOldVidIds.contains(vid)) {
-                  if (usedChannelFallback && await _isYoutubeShort(client, vid)) {
-                    continue;
+                  if (usedChannelFallback) {
+                    final kind = await _probeYoutubeShortKind(client, vid);
+                    if (kind == 'short') continue;
+                    fallbackVidIds.add(vid);
                   }
                   newVidMeta[vid] = meta;
                 }
@@ -1922,6 +1967,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                       !knownOldVidIds.contains(vid) ||
                       zeroDurVidIds.contains(vid) ||
                       existingLiveIds.contains(vid)) {
+                    uulvVidIds.add(vid);
                     newVidMeta[vid] = meta;
                   }
                 }
@@ -1983,6 +2029,35 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           }
           checkedIds.addAll(slice);
           final vItems = (vData['items'] as List?) ?? [];
+          final toProbe = <String>[];
+          for (final v in vItems) {
+            final vid = (v['id'] ?? '').toString();
+            if (vid.isEmpty || kIsWeb) continue;
+            final vsnip = v['snippet'] ?? {};
+            final isLiveVal =
+                (vsnip['liveBroadcastContent'] ?? '').toString() == 'live'
+                    ? 1
+                    : 0;
+            final durStr = _parseIsoDuration(
+              (v['contentDetails']?['duration'] ?? '').toString(),
+            );
+            final durSec = _durationToSeconds(durStr);
+            if (isLiveVal == 0 && durSec > 0 && durSec <= 185) {
+              toProbe.add(vid);
+            }
+          }
+          final probeResults = <String, String>{};
+          if (toProbe.isNotEmpty) {
+            final entries = await Future.wait(
+              toProbe.map((pvid) async {
+                final k = await _probeYoutubeShortKind(client, pvid);
+                return MapEntry(pvid, k);
+              }),
+            );
+            for (final e in entries) {
+              probeResults[e.key] = e.value;
+            }
+          }
           for (final v in vItems) {
             final vid = (v['id'] ?? '').toString();
             if (vid.isEmpty) continue;
@@ -1994,10 +2069,23 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             final durStr = _parseIsoDuration(
               (v['contentDetails']?['duration'] ?? '').toString(),
             );
+            final durSec = _durationToSeconds(durStr);
             final isLiveVal =
                 (vsnip['liveBroadcastContent'] ?? '').toString() == 'live'
                     ? 1
                     : 0;
+            var fmtChecked = 1;
+            if (!kIsWeb && isLiveVal == 0 && durSec > 0 && durSec <= 185) {
+              final kind = probeResults[vid] ?? 'unknown';
+              final failClosedSource =
+                  fallbackVidIds.contains(vid) || uulvVidIds.contains(vid);
+              if (kind == 'short' ||
+                  (kind == 'unknown' && failClosedSource)) {
+                _localVideos.removeWhere((old) => old['video_id'] == vid);
+                continue;
+              }
+              fmtChecked = (kind == 'regular') ? 1 : 0;
+            }
             if (isLiveVal == 1) {
               stillLiveIds.add(vid);
             }
@@ -2023,9 +2111,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               _localVideos[existingIdx]['like_count'] =
                   int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0;
               _localVideos[existingIdx]['duration'] = durStr;
-              _localVideos[existingIdx]['duration_seconds'] =
-                  _durationToSeconds(durStr);
+              _localVideos[existingIdx]['duration_seconds'] = durSec;
               _localVideos[existingIdx]['is_live'] = isLiveVal;
+              if (fmtChecked == 1) {
+                _localVideos[existingIdx]['format_checked'] = 1;
+              }
               continue;
             }
             if (existingVidIds.contains(vid)) continue;
@@ -2048,10 +2138,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               'like_count':
                   int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0,
               'duration': durStr,
-              'duration_seconds': _durationToSeconds(durStr),
+              'duration_seconds': durSec,
               'watched_count': _getCreatorWatchedCount(cid),
               'is_demo': 0,
               'is_live': isLiveVal,
+              'format_checked': fmtChecked,
             });
           }
         }
@@ -2181,6 +2272,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     String startDate = '',
     String endDate = '',
     int maxVideos = 100,
+    void Function(int pct)? onProgress,
   }) async {
     final cid = (channel['channel_id'] ?? '').toString();
     if (cid.isEmpty || cid.startsWith('UC_demo_')) return 0;
@@ -2189,6 +2281,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         'Masukkan YouTube API Key dulu di menu Pengaturan API (⚙️).',
       );
     }
+    onProgress?.call(5);
     final title = (channel['title'] ?? cid).toString();
     final thumbUrl = (channel['thumbnail_url'] ?? '').toString();
     final rawUploads = (channel['uploads_playlist_id'] ?? '').toString();
@@ -2305,6 +2398,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         }
 
         pageToken = plJson['nextPageToken']?.toString();
+        final estPages = (hasRange ? 10 : maxPages).clamp(1, 200);
+        final pagePct = (8 + (((page + 1) / estPages) * 47).round()).clamp(8, 55);
+        onProgress?.call(pagePct);
         if (reachedStartCutoff || pageToken == null || pageToken.isEmpty) {
           break;
         }
@@ -2313,6 +2409,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       syncClient.close();
     }
 
+    onProgress?.call(videoIds.isEmpty ? 95 : 55);
     var savedCount = 0;
     for (var i = 0; i < videoIds.length; i += 50) {
       final chunk = videoIds.sublist(
@@ -2327,57 +2424,78 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       final vRes = await http.get(vUri).timeout(const Duration(seconds: 12));
       if (vRes.statusCode != 200) continue;
       final vItems = (jsonDecode(vRes.body)['items'] as List?) ?? [];
-      for (final v in vItems) {
-        final vid = v['id'].toString();
-        final vsnip = v['snippet'] ?? {};
-        final vstats = v['statistics'] ?? {};
-        final existingIdx = _localVideos.indexWhere(
-          (old) => old['video_id'] == vid,
-        );
-        final existing = existingIdx >= 0 ? _localVideos[existingIdx] : null;
-        final durStr = _parseIsoDuration(
-          (v['contentDetails']?['duration'] ?? '').toString(),
-        );
-        final nextVideo = <String, dynamic>{
-          'video_id': vid,
-          'channel_id': cid,
-          'channel_title': title,
-          'channel_thumbnail': thumbUrl,
-          'title': (vsnip['title'] ?? 'Untitled').toString(),
-          'thumbnail_url':
-              ((vsnip['thumbnails']?['high'] ??
-                          vsnip['thumbnails']?['medium'])?['url'] ??
-                      'https://i.ytimg.com/vi/$vid/hqdefault.jpg')
-                  .toString(),
-          'published_at':
-              (vsnip['publishedAt'] ??
-                      DateTime.now().toUtc().toIso8601String())
-                  .toString(),
-          'view_count':
-              int.tryParse((vstats['viewCount'] ?? '0').toString()) ?? 0,
-          'like_count':
-              int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0,
-          'duration': durStr,
-          'duration_seconds': _durationToSeconds(durStr),
-          'views_hp': existing?['views_hp'] ?? 0,
-          'views_laptop': existing?['views_laptop'] ?? 0,
-          'views_total': existing?['views_total'] ?? 0,
-          'watched_count':
-              existing?['watched_count'] ?? _getCreatorWatchedCount(cid),
-          'is_demo': 0,
-          'is_live': (vsnip['liveBroadcastContent'] ?? '').toString() == 'live'
-              ? 1
-              : 0,
-        };
-        if (existingIdx >= 0) {
-          _localVideos[existingIdx] = nextVideo;
-        } else {
-          _localVideos.add(nextVideo);
+      final probeClient = (!kIsWeb && vItems.isNotEmpty) ? http.Client() : null;
+      try {
+        for (final v in vItems) {
+          final vid = v['id'].toString();
+          final vsnip = v['snippet'] ?? {};
+          final vstats = v['statistics'] ?? {};
+          final durStr = _parseIsoDuration(
+            (v['contentDetails']?['duration'] ?? '').toString(),
+          );
+          final durSec = _durationToSeconds(durStr);
+          final isLiveVal =
+              (vsnip['liveBroadcastContent'] ?? '').toString() == 'live' ? 1 : 0;
+          var fmtChecked = 1;
+          if (probeClient != null && isLiveVal == 0 && durSec > 0 && durSec <= 185) {
+            final kind = await _probeYoutubeShortKind(probeClient, vid);
+            if (kind == 'short' || (kind == 'unknown' && usingFallbackUploads)) {
+              _localVideos.removeWhere((old) => old['video_id'] == vid);
+              continue;
+            }
+            fmtChecked = (kind == 'regular') ? 1 : 0;
+          }
+          final existingIdx = _localVideos.indexWhere(
+            (old) => old['video_id'] == vid,
+          );
+          final existing = existingIdx >= 0 ? _localVideos[existingIdx] : null;
+          final nextVideo = <String, dynamic>{
+            'video_id': vid,
+            'channel_id': cid,
+            'channel_title': title,
+            'channel_thumbnail': thumbUrl,
+            'title': (vsnip['title'] ?? 'Untitled').toString(),
+            'thumbnail_url':
+                ((vsnip['thumbnails']?['high'] ??
+                            vsnip['thumbnails']?['medium'])?['url'] ??
+                        'https://i.ytimg.com/vi/$vid/hqdefault.jpg')
+                    .toString(),
+            'published_at':
+                (vsnip['publishedAt'] ??
+                        DateTime.now().toUtc().toIso8601String())
+                    .toString(),
+            'view_count':
+                int.tryParse((vstats['viewCount'] ?? '0').toString()) ?? 0,
+            'like_count':
+                int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0,
+            'duration': durStr,
+            'duration_seconds': durSec,
+            'views_hp': existing?['views_hp'] ?? 0,
+            'views_laptop': existing?['views_laptop'] ?? 0,
+            'views_total': existing?['views_total'] ?? 0,
+            'watched_count':
+                existing?['watched_count'] ?? _getCreatorWatchedCount(cid),
+            'is_demo': 0,
+            'is_live': isLiveVal,
+            'format_checked': fmtChecked,
+          };
+          if (existingIdx >= 0) {
+            _localVideos[existingIdx] = nextVideo;
+          } else {
+            _localVideos.add(nextVideo);
+          }
+          savedCount++;
         }
-        savedCount++;
+      } finally {
+        probeClient?.close();
+      }
+      if (videoIds.isNotEmpty) {
+        final doneRatio = ((i + chunk.length) / videoIds.length).clamp(0.0, 1.0);
+        onProgress?.call((55 + (doneRatio * 40)).round().clamp(55, 95));
       }
     }
     await _saveStandaloneData();
+    onProgress?.call(100);
     return savedCount;
   }
 
@@ -2390,7 +2508,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final cid = (ch['channel_id'] ?? '').toString();
     final title = (ch['title'] ?? cid).toString();
     if (cid.isEmpty || _reloadingChannelIds.contains(cid)) return;
-    setState(() => _reloadingChannelIds.add(cid));
+    Timer? pollTimer;
+    setState(() {
+      _reloadingChannelIds.add(cid);
+      _reloadingChannelProgress[cid] = 2;
+    });
     try {
       int syncedCount = 0;
       if (isStandaloneMode) {
@@ -2399,8 +2521,38 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           startDate: startDate,
           endDate: endDate,
           maxVideos: maxVideos,
+          onProgress: (pct) {
+            if (!mounted) return;
+            final prev = _reloadingChannelProgress[cid] ?? 0;
+            final clamped = pct.clamp(0, 100);
+            if (clamped > prev) {
+              setState(() => _reloadingChannelProgress[cid] = clamped);
+            }
+          },
         );
       } else {
+        pollTimer = Timer.periodic(const Duration(milliseconds: 350), (_) async {
+          if (!mounted || !_reloadingChannelIds.contains(cid)) return;
+          try {
+            final stRes = await http
+                .get(
+                  Uri.parse(
+                    '$baseUrl/api/channels/${Uri.encodeComponent(cid)}/reload-status',
+                  ),
+                )
+                .timeout(const Duration(seconds: 3));
+            if (stRes.statusCode == 200 && mounted) {
+              final st = jsonDecode(stRes.body);
+              final pct = int.tryParse((st['progress'] ?? 0).toString()) ?? 0;
+              final prev = _reloadingChannelProgress[cid] ?? 0;
+              if (pct > prev) {
+                setState(
+                  () => _reloadingChannelProgress[cid] = pct.clamp(0, 100),
+                );
+              }
+            }
+          } catch (_) {}
+        });
         final res = await http
             .post(
               Uri.parse('$baseUrl/api/channels/${Uri.encodeComponent(cid)}/reload'),
@@ -2412,6 +2564,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               }),
             )
             .timeout(const Duration(minutes: 5));
+        pollTimer.cancel();
         if (res.statusCode != 200) {
           final err = jsonDecode(res.body);
           throw Exception(err['detail'] ?? 'Gagal memuat ulang data channel');
@@ -2419,6 +2572,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         final body = jsonDecode(res.body);
         syncedCount =
             int.tryParse((body['videos_synced'] ?? 0).toString()) ?? 0;
+      }
+      if (mounted) {
+        setState(() => _reloadingChannelProgress[cid] = 100);
       }
       await _fetchVideos();
       if (!mounted) return;
@@ -2445,10 +2601,15 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         );
       }
     } finally {
+      pollTimer?.cancel();
       if (mounted) {
-        setState(() => _reloadingChannelIds.remove(cid));
+        setState(() {
+          _reloadingChannelIds.remove(cid);
+          _reloadingChannelProgress.remove(cid);
+        });
       } else {
         _reloadingChannelIds.remove(cid);
+        _reloadingChannelProgress.remove(cid);
       }
     }
   }
@@ -5580,7 +5741,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
 
   Future<void> _maybeAutoPurgeStandaloneShorts() async {
     if (kIsWeb || _purgingShorts) return;
-    if (_standaloneShortCandidates().length <= 20) return;
+    if (_standaloneShortCandidates().isEmpty) return;
     await _purgeStandaloneShorts(showFeedback: false);
   }
 
@@ -5614,16 +5775,16 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         final results = await Future.wait(
           slice.map((v) async {
             final vid = (v['video_id'] ?? '').toString();
-            final isShort = await _isYoutubeShort(client, vid);
-            return MapEntry(v, isShort);
+            final kind = await _probeYoutubeShortKind(client, vid);
+            return MapEntry(v, kind);
           }),
         );
         for (final entry in results) {
           final v = entry.key;
           final vid = (v['video_id'] ?? '').toString();
-          if (entry.value) {
+          if (entry.value == 'short') {
             if (vid.isNotEmpty) shortIds.add(vid);
-          } else {
+          } else if (entry.value == 'regular') {
             v['format_checked'] = 1;
           }
         }
@@ -8299,15 +8460,18 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final isReloading = _reloadingChannelIds.contains(cid);
 
     if (isReloading) {
-      return const Padding(
-        padding: EdgeInsets.all(10),
-        child: SizedBox(
-          width: 18,
-          height: 18,
-          child: CircularProgressIndicator(
-            strokeWidth: 2,
-            color: Color(0xFFFF0033),
-          ),
+      final pct = _reloadingChannelProgress[cid] ?? 0;
+      return Container(
+        key: Key('creator_reload_progress_$cid'),
+        width: 34,
+        height: 34,
+        margin: const EdgeInsets.symmetric(horizontal: 4),
+        decoration: BoxDecoration(
+          color: const Color(0xFFFF0033),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Center(
+          child: _buildCircularPercentIndicator(pct, Colors.white),
         ),
       );
     }
