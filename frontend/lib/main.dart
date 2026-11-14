@@ -117,6 +117,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   final TextEditingController _searchCtrl = TextEditingController();
   final TextEditingController _dayInputCtrl = TextEditingController();
   final FocusNode _dayFocusNode = FocusNode();
+  final GlobalKey _dayBoxKey = GlobalKey();
   final FocusNode _mobileSearchFocusNode = FocusNode();
   final ScrollController _videoScrollController = ScrollController();
   bool _showMobileSearch = false;
@@ -918,7 +919,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       return 'Custom Date Range';
     }
     if (_isCustomDayPeriod(period)) {
-      return '${period.substring(0, period.length - 1)} Hari Lalu';
+      return '${period.substring(0, period.length - 1)} Day';
     }
     if (_isCustomYearPeriod(period)) {
       return '${period.substring(0, period.length - 1)} Tahun Lalu';
@@ -5638,9 +5639,37 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               );
             }
 
+            void commitDayInput({bool unfocus = false}) {
+              if (unfocus && _dayFocusNode.hasFocus) {
+                _dayFocusNode.unfocus();
+              }
+              final trimmed = _dayInputCtrl.text.trim();
+              final parsed = int.tryParse(trimmed);
+              final currentlyDay = _isCustomDayPeriod(period);
+              if (parsed != null && parsed >= 1) {
+                final nextPeriod = '${parsed}d';
+                if (period != nextPeriod) {
+                  _applyPeriodChoice(nextPeriod);
+                  if (ctx.mounted) setModalState(() {});
+                  _saveUiPreferences();
+                  _fetchVideos();
+                }
+              } else if (currentlyDay &&
+                  (trimmed.isEmpty || (parsed != null && parsed <= 0))) {
+                _applyPeriodChoice('all');
+                if (ctx.mounted) setModalState(() {});
+                _saveUiPreferences();
+                _fetchVideos();
+              }
+            }
+
             return SafeArea(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
+              child: Padding(
+                padding: EdgeInsets.only(
+                  bottom: MediaQuery.viewInsetsOf(ctx).bottom,
+                ),
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -5906,127 +5935,145 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                             },
                           ),
                         ),
-                        GestureDetector(
-                          onTap: () => _dayFocusNode.requestFocus(),
-                          child: Container(
-                            key: const Key('hari_lalu_box'),
-                            height: 36,
-                            padding: const EdgeInsets.symmetric(horizontal: 10),
-                            decoration: BoxDecoration(
-                              color: isCustomDay
-                                  ? Colors.white
-                                  : const Color(0xFF2C2C2C),
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(
+                        KeyedSubtree(
+                          key: _dayBoxKey,
+                          child: GestureDetector(
+                            onTap: () => _dayFocusNode.requestFocus(),
+                            child: Container(
+                              key: const Key('hari_lalu_box'),
+                              height: 36,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                              ),
+                              decoration: BoxDecoration(
                                 color: isCustomDay
                                     ? Colors.white
-                                    : const Color(0xFF444444),
-                                width: 1.0,
+                                    : const Color(0xFF2C2C2C),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: isCustomDay
+                                      ? Colors.white
+                                      : const Color(0xFF444444),
+                                  width: 1.0,
+                                ),
                               ),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              crossAxisAlignment: CrossAxisAlignment.center,
-                              children: [
-                                if (isCustomDay) ...[
-                                  const Icon(
-                                    Icons.check,
-                                    size: 16,
-                                    color: Colors.black,
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                crossAxisAlignment: CrossAxisAlignment.center,
+                                children: [
+                                  SizedBox(
+                                    width: isCustomDay ? 19 : 0,
+                                    child: isCustomDay
+                                        ? const Padding(
+                                            padding: EdgeInsets.only(right: 3),
+                                            child: Icon(
+                                              Icons.check,
+                                              size: 15,
+                                              color: Colors.black,
+                                            ),
+                                          )
+                                        : null,
+                                  ),
+                                  SizedBox(
+                                    width: 36,
+                                    child: Focus(
+                                      onFocusChange: (hasFocus) {
+                                        if (hasFocus) {
+                                          Future.delayed(
+                                            const Duration(milliseconds: 280),
+                                            () {
+                                              final boxCtx =
+                                                  _dayBoxKey.currentContext;
+                                              if (boxCtx != null &&
+                                                  boxCtx.mounted) {
+                                                Scrollable.ensureVisible(
+                                                  boxCtx,
+                                                  alignment: 0.4,
+                                                  duration: const Duration(
+                                                    milliseconds: 200,
+                                                  ),
+                                                );
+                                              }
+                                            },
+                                          );
+                                        } else {
+                                          commitDayInput();
+                                        }
+                                      },
+                                      child: TextField(
+                                        key: const Key('hari_lalu_input'),
+                                        controller: _dayInputCtrl,
+                                        focusNode: _dayFocusNode,
+                                        keyboardType: TextInputType.number,
+                                        textInputAction: TextInputAction.done,
+                                        inputFormatters: [
+                                          FilteringTextInputFormatter
+                                              .digitsOnly,
+                                        ],
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(
+                                          fontSize: 12.5,
+                                          fontWeight: FontWeight.bold,
+                                          color: isCustomDay
+                                              ? Colors.black
+                                              : Colors.white,
+                                        ),
+                                        decoration: InputDecoration(
+                                          hintText: '2, 3..',
+                                          hintStyle: TextStyle(
+                                            fontSize: 12,
+                                            color: isCustomDay
+                                                ? Colors.black45
+                                                : Colors.white54,
+                                          ),
+                                          border: InputBorder.none,
+                                          isDense: true,
+                                          contentPadding:
+                                              const EdgeInsets.symmetric(
+                                                vertical: 5,
+                                              ),
+                                        ),
+                                        onSubmitted: (_) =>
+                                            commitDayInput(unfocus: true),
+                                      ),
+                                    ),
                                   ),
                                   const SizedBox(width: 4),
-                                ],
-                                SizedBox(
-                                  width: 42,
-                                  child: TextField(
-                                    key: const Key('hari_lalu_input'),
-                                    controller: _dayInputCtrl,
-                                    focusNode: _dayFocusNode,
-                                    keyboardType: TextInputType.number,
-                                    inputFormatters: [
-                                      FilteringTextInputFormatter.digitsOnly,
-                                    ],
-                                    textAlign: TextAlign.center,
+                                  Text(
+                                    'Day',
                                     style: TextStyle(
-                                      fontSize: 13,
-                                      fontWeight: FontWeight.bold,
+                                      fontSize: 12.5,
+                                      fontWeight: isCustomDay
+                                          ? FontWeight.bold
+                                          : FontWeight.normal,
                                       color: isCustomDay
                                           ? Colors.black
-                                          : Colors.white,
+                                          : Colors.white70,
                                     ),
-                                    decoration: InputDecoration(
-                                      hintText: '2, 3..',
-                                      hintStyle: TextStyle(
-                                        fontSize: 12,
-                                        color: isCustomDay
-                                            ? Colors.black45
-                                            : Colors.white54,
-                                      ),
-                                      border: InputBorder.none,
-                                      isDense: true,
-                                      contentPadding:
-                                          const EdgeInsets.symmetric(
-                                            vertical: 5,
-                                          ),
-                                    ),
-                                    onChanged: (val) {
-                                      final trimmed = val.trim();
-                                      final parsed = int.tryParse(trimmed);
-                                      final currentlyDay = _isCustomDayPeriod(
-                                        period,
-                                      );
-                                      if (parsed != null && parsed >= 1) {
-                                        _applyPeriodChoice('${parsed}d');
-                                        setModalState(() {});
-                                        _saveUiPreferences();
-                                        _fetchVideos();
-                                      } else if (currentlyDay &&
-                                          (trimmed.isEmpty ||
-                                              (parsed != null &&
-                                                  parsed <= 0))) {
+                                  ),
+                                  if (isCustomDay) ...[
+                                    const SizedBox(width: 3),
+                                    InkWell(
+                                      key: const Key('hari_lalu_clear'),
+                                      borderRadius: BorderRadius.circular(10),
+                                      onTap: () {
                                         _applyPeriodChoice('all');
                                         setModalState(() {});
                                         _saveUiPreferences();
                                         _fetchVideos();
-                                      }
-                                    },
-                                  ),
-                                ),
-                                const SizedBox(width: 4),
-                                Text(
-                                  'Hari Lalu',
-                                  style: TextStyle(
-                                    fontSize: 12.5,
-                                    fontWeight: isCustomDay
-                                        ? FontWeight.bold
-                                        : FontWeight.normal,
-                                    color: isCustomDay
-                                        ? Colors.black
-                                        : Colors.white70,
-                                  ),
-                                ),
-                                if (isCustomDay) ...[
-                                  const SizedBox(width: 4),
-                                  InkWell(
-                                    key: const Key('hari_lalu_clear'),
-                                    borderRadius: BorderRadius.circular(10),
-                                    onTap: () {
-                                      _applyPeriodChoice('all');
-                                      setModalState(() {});
-                                      _saveUiPreferences();
-                                      _fetchVideos();
-                                    },
-                                    child: const Padding(
-                                      padding: EdgeInsets.all(2),
-                                      child: Icon(
-                                        Icons.close,
-                                        size: 14,
-                                        color: Colors.black54,
+                                      },
+                                      child: const Padding(
+                                        padding: EdgeInsets.all(2),
+                                        child: Icon(
+                                          Icons.close,
+                                          size: 14,
+                                          color: Colors.black54,
+                                        ),
                                       ),
                                     ),
-                                  ),
+                                  ],
                                 ],
-                              ],
+                              ),
                             ),
                           ),
                         ),
@@ -6277,7 +6324,10 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                             borderRadius: BorderRadius.circular(10),
                           ),
                         ),
-                        onPressed: () => Navigator.pop(ctx),
+                        onPressed: () {
+                          commitDayInput(unfocus: true);
+                          Navigator.pop(ctx);
+                        },
                         child: Text(
                           'Terapkan (Total $totalVideos Video)',
                           style: const TextStyle(fontWeight: FontWeight.bold),
@@ -6287,6 +6337,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                   ],
                 ),
               ),
+            ),
             );
           },
         );

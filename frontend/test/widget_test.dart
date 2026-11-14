@@ -141,7 +141,7 @@ void main() {
       expect(find.text('🔕 Unsubscribe'), findsNothing);
       expect(find.byIcon(Icons.more_vert), findsWidgets);
 
-      // Pastikan filter waktu All Time, Today, This Week, This Month, This Year, Custom Date, Custom Date Range + Hari Lalu tersedia di dalam pop-up
+      // Pastikan filter waktu All Time, Today, This Week, This Month, This Year, Custom Date, Custom Date Range + Day tersedia di dalam pop-up
       expect(find.text('All Time'), findsOneWidget);
       expect(find.text('Today'), findsOneWidget);
       expect(find.text('This Week'), findsOneWidget);
@@ -149,7 +149,7 @@ void main() {
       expect(find.text('This Year'), findsOneWidget);
       expect(find.text('Custom Date'), findsOneWidget);
       expect(find.text('Custom Date Range'), findsOneWidget);
-      expect(find.text('Hari Lalu'), findsOneWidget);
+      expect(find.text('Day'), findsOneWidget);
       expect(find.text('Reset'), findsNothing);
       final customRangeRect = tester.getRect(
         find.widgetWithText(ChoiceChip, 'Custom Date Range'),
@@ -428,8 +428,25 @@ void main() {
         isFalse,
       );
 
-      // Uji Hari Lalu: isi 2 -> otomatis pindah ke 2 Hari Lalu, This Week nonaktif, video 2 hari lalu tampil
+      // Uji Day: ketik multi-digit (8 -> 80) tidak langsung menutup keyboard atau commit sebelum Done/blur
+      await tester.enterText(find.byKey(const Key('hari_lalu_input')), '8');
+      await tester.pump();
+      expect(
+        tester
+            .widget<ChoiceChip>(find.widgetWithText(ChoiceChip, 'This Week'))
+            .selected,
+        isTrue,
+      );
+      expect(find.byKey(const Key('hari_lalu_clear')), findsNothing);
+      await tester.enterText(find.byKey(const Key('hari_lalu_input')), '80');
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('hari_lalu_clear')), findsOneWidget);
+      expect(find.textContaining('80 Day'), findsWidgets);
+
+      // Uji angka 2 -> 2 Day tampil setelah Done
       await tester.enterText(find.byKey(const Key('hari_lalu_input')), '2');
+      await tester.testTextInput.receiveAction(TextInputAction.done);
       await tester.pumpAndSettle();
       expect(
         tester
@@ -438,9 +455,9 @@ void main() {
         isFalse,
       );
       expect(find.byKey(const Key('hari_lalu_clear')), findsOneWidget);
-      expect(find.textContaining('2 Hari Lalu'), findsWidgets);
+      expect(find.textContaining('2 Day'), findsWidgets);
 
-      // Klik tombol clear (X) di Hari Lalu -> kembali ke All Time
+      // Klik tombol clear (X) di Day -> kembali ke All Time
       await tester.tap(find.byKey(const Key('hari_lalu_clear')));
       await tester.pumpAndSettle();
       expect(
