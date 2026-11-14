@@ -1,21 +1,21 @@
 {
   "backend/db.py": {
-    "mtime": 1794655552.6645992,
-    "seen": 1794655746.2485626,
-    "ast_hash": "64618e10b2b153ab64cca0d918f6541a",
-    "semantic_hash": "64618e10b2b153ab64cca0d918f6541a"
+    "mtime": 1794675707.5660286,
+    "seen": 1794680867.8362265,
+    "ast_hash": "05c942bd9ca29d252f56fb873670d1dd",
+    "semantic_hash": ""
   },
   "backend/main.py": {
-    "mtime": 1794655552.7321303,
-    "seen": 1794655746.2485626,
-    "ast_hash": "9afeb86712676b22ddd9cfcc1d9cf474",
-    "semantic_hash": "9afeb86712676b22ddd9cfcc1d9cf474"
+    "mtime": 1794680741.666345,
+    "seen": 1794680867.8362265,
+    "ast_hash": "7f5e6bbea1d4782e2e807e27100b3f93",
+    "semantic_hash": ""
   },
   "backend/youtube_sync.py": {
-    "mtime": 1794581582.4776845,
-    "seen": 1794655746.2485626,
-    "ast_hash": "f81bdef161df19c53db6907e0e0f3929",
-    "semantic_hash": "f81bdef161df19c53db6907e0e0f3929"
+    "mtime": 1794680738.0185783,
+    "seen": 1794680867.8362265,
+    "ast_hash": "eba727119214cd3f3acb3e90112f79ba",
+    "semantic_hash": ""
   },
   "frontend/android/app/build.gradle.kts": {
     "mtime": 1794145532.2869382,
@@ -42,16 +42,16 @@
     "semantic_hash": "087a01c04d081ae02a8e5db89f4bf3f3"
   },
   "frontend/lib/main.dart": {
-    "mtime": 1794655652.1585033,
-    "seen": 1794655746.2485626,
-    "ast_hash": "0a7e0f517c835e1a5fc47575cac82ffe",
-    "semantic_hash": "0a7e0f517c835e1a5fc47575cac82ffe"
+    "mtime": 1794680774.4522426,
+    "seen": 1794680867.8362265,
+    "ast_hash": "28e49910579a9e32355a0486a232f0c7",
+    "semantic_hash": ""
   },
   "frontend/test/widget_test.dart": {
-    "mtime": 1794655652.8014328,
-    "seen": 1794655746.2485626,
-    "ast_hash": "4e210d38a954b42c475bb9761e315f9e",
-    "semantic_hash": "4e210d38a954b42c475bb9761e315f9e"
+    "mtime": 1794680833.931397,
+    "seen": 1794680867.8362265,
+    "ast_hash": "1bd87d86338bf5a40bb74f3a3450d8ba",
+    "semantic_hash": ""
   },
   "frontend/web/manifest.json": {
     "mtime": 1794145532.4819703,
@@ -126,10 +126,10 @@
     "semantic_hash": "09bc55ab603832d4356e7e3c5b294cda"
   },
   "backend/requirements.txt": {
-    "mtime": 1794145931.093489,
-    "seen": 1794230530.797031,
-    "ast_hash": "22c8848bab4ca16d82958ff843b8b065",
-    "semantic_hash": ""
+    "mtime": 1794576854.2645385,
+    "seen": 1794666596.1967087,
+    "ast_hash": "2d7072c87eb1e3d2d8bc84df69037aa5",
+    "semantic_hash": "2d7072c87eb1e3d2d8bc84df69037aa5"
   },
   "frontend/README.md": {
     "mtime": 1794145532.4449716,
@@ -139,98 +139,158 @@
   },
   "frontend/analysis_options.yaml": {
     "mtime": 1794145532.2777898,
-    "seen": 1794230530.797031,
+    "seen": 1794666596.1967087,
     "ast_hash": "9e65f4b9beebb674c0dc252f70a5c177",
-    "semantic_hash": ""
+    "semantic_hash": "9e65f4b9beebb674c0dc252f70a5c177"
   },
   "frontend/pubspec.yaml": {
-    "mtime": 1794194280.9059172,
-    "seen": 1794230530.797031,
-    "ast_hash": "94e0c35bc88688065ecc10c225224283",
+    "mtime": 1794675708.7751918,
+    "seen": 1794680867.8362265,
+    "ast_hash": "d2e9f9712188a477e46842f8c3852c9a",
     "semantic_hash": ""
   },
   "frontend/web/index.html": {
-    "mtime": 1794145532.4766793,
-    "seen": 1794230530.797031,
-    "ast_hash": "99649a1004187ddc045062ca5a2202a9",
-    "semantic_hash": ""
+    "mtime": 1794647322.5890582,
+    "seen": 1794666596.1967087,
+    "ast_hash": "52605055c0a971194840f556b1ba9ad7",
+    "semantic_hash": "52605055c0a971194840f556b1ba9ad7"
   },
   "frontend/windows/CMakeLists.txt": {
     "mtime": 1794145532.4990523,
-    "seen": 1794230530.797031,
+    "seen": 1794666596.1967087,
     "ast_hash": "03acd388b6a57ffcacc6428a1f542034",
-    "semantic_hash": ""
+    "semantic_hash": "03acd388b6a57ffcacc6428a1f542034"
   },
   "frontend/windows/flutter/CMakeLists.txt": {
     "mtime": 1769708762.6439104,
-    "seen": 1794230530.797031,
+    "seen": 1794666596.1967087,
     "ast_hash": "bbf66fed5180bd9ae8198b8d7c4a0001",
-    "semantic_hash": ""
+    "semantic_hash": "bbf66fed5180bd9ae8198b8d7c4a0001"
   },
   "frontend/windows/runner/CMakeLists.txt": {
     "mtime": 1769708762.6439104,
-    "seen": 1794230530.797031,
+    "seen": 1794666596.1967087,
     "ast_hash": "028602ab9754bffe716659ada7590d29",
-    "semantic_hash": ""
+    "semantic_hash": "028602ab9754bffe716659ada7590d29"
   },
   "frontend/android/app/src/main/res/mipmap-hdpi/ic_launcher.png": {
-    "mtime": 1769708762.6058342,
-    "seen": 1794230530.797031,
-    "ast_hash": "13e9c72ec37fac220397aa819fa1ef2d",
-    "semantic_hash": ""
+    "mtime": 1794561397.926389,
+    "seen": 1794666596.1967087,
+    "ast_hash": "e26ea8de69337e32abec05876dd293ec",
+    "semantic_hash": "e26ea8de69337e32abec05876dd293ec"
   },
   "frontend/android/app/src/main/res/mipmap-mdpi/ic_launcher.png": {
-    "mtime": 1769708762.6058342,
-    "seen": 1794230530.797031,
-    "ast_hash": "6270344430679711b81476e29878caa7",
-    "semantic_hash": ""
+    "mtime": 1794561397.9213924,
+    "seen": 1794666596.1967087,
+    "ast_hash": "299dc6163e8580118163c7a84ed15257",
+    "semantic_hash": "299dc6163e8580118163c7a84ed15257"
   },
   "frontend/android/app/src/main/res/mipmap-xhdpi/ic_launcher.png": {
-    "mtime": 1769708762.6058342,
-    "seen": 1794230530.797031,
-    "ast_hash": "a0a8db5985280b3679d99a820ae2db79",
-    "semantic_hash": ""
+    "mtime": 1794561397.9318998,
+    "seen": 1794666596.1967087,
+    "ast_hash": "db3a182c4151331b1e0a319389e1f8ea",
+    "semantic_hash": "db3a182c4151331b1e0a319389e1f8ea"
   },
   "frontend/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png": {
-    "mtime": 1769708762.6058342,
-    "seen": 1794230530.797031,
-    "ast_hash": "afe1b655b9f32da22f9a4301bb8e6ba8",
-    "semantic_hash": ""
+    "mtime": 1794561397.938901,
+    "seen": 1794666596.1967087,
+    "ast_hash": "7a0fef3689b4f8a696602a2a709dffcf",
+    "semantic_hash": "7a0fef3689b4f8a696602a2a709dffcf"
   },
   "frontend/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png": {
-    "mtime": 1769708762.6157835,
-    "seen": 1794230530.797031,
-    "ast_hash": "57838d52c318faff743130c3fcfae0c6",
-    "semantic_hash": ""
+    "mtime": 1794561397.9459047,
+    "seen": 1794666596.1967087,
+    "ast_hash": "c0c854e6898cd74f2d1353439a2be2b6",
+    "semantic_hash": "c0c854e6898cd74f2d1353439a2be2b6"
   },
   "frontend/web/favicon.png": {
-    "mtime": 1769708762.6434264,
-    "seen": 1794230530.797031,
-    "ast_hash": "5dcef449791fa27946b3d35ad8803796",
-    "semantic_hash": ""
+    "mtime": 1794561397.949904,
+    "seen": 1794666596.1967087,
+    "ast_hash": "c79a1e91696ccb5bda8dbd4faa565408",
+    "semantic_hash": "c79a1e91696ccb5bda8dbd4faa565408"
   },
   "frontend/web/icons/Icon-192.png": {
-    "mtime": 1769708762.6439104,
-    "seen": 1794230530.797031,
-    "ast_hash": "ac9a721a12bbc803b44f645561ecb1e1",
-    "semantic_hash": ""
+    "mtime": 1794561397.9569063,
+    "seen": 1794666596.1967087,
+    "ast_hash": "c0c854e6898cd74f2d1353439a2be2b6",
+    "semantic_hash": "c0c854e6898cd74f2d1353439a2be2b6"
   },
   "frontend/web/icons/Icon-512.png": {
-    "mtime": 1769708762.6439104,
-    "seen": 1794230530.797031,
-    "ast_hash": "96e752610906ba2a93c65f8abe1645f1",
-    "semantic_hash": ""
+    "mtime": 1794561397.9639306,
+    "seen": 1794666596.1967087,
+    "ast_hash": "712d3e6cf0d272b7ceb827fe991e7140",
+    "semantic_hash": "712d3e6cf0d272b7ceb827fe991e7140"
   },
   "frontend/web/icons/Icon-maskable-192.png": {
-    "mtime": 1786808344.388857,
-    "seen": 1794230530.797031,
-    "ast_hash": "c457ef57daa1d16f64b27b786ec2ea3c",
-    "semantic_hash": ""
+    "mtime": 1794561397.9709358,
+    "seen": 1794666596.1967087,
+    "ast_hash": "e7ae0646a4db50f5570d8490e6d65ae3",
+    "semantic_hash": "e7ae0646a4db50f5570d8490e6d65ae3"
   },
   "frontend/web/icons/Icon-maskable-512.png": {
-    "mtime": 1786808344.3725297,
-    "seen": 1794230530.797031,
-    "ast_hash": "301a7604d45b3e739efc881eb04896ea",
+    "mtime": 1794561397.9764442,
+    "seen": 1794666596.1967087,
+    "ast_hash": "32de493da848b33791347227c12fe34d",
+    "semantic_hash": "32de493da848b33791347227c12fe34d"
+  },
+  "backend/test_app.py": {
+    "mtime": 1794680798.8900537,
+    "seen": 1794680867.8362265,
+    "ast_hash": "4c793ac5f0d930e1c49eed7a14a71ffb",
+    "semantic_hash": ""
+  },
+  "DEBUG_AND_AUDIT_PLAYBOOK.md": {
+    "mtime": 1794656737.7518132,
+    "seen": 1794666596.1967087,
+    "ast_hash": "b9f550782dccad823317ae84ac6a9b35",
+    "semantic_hash": "b9f550782dccad823317ae84ac6a9b35"
+  },
+  "asset/e2b14491-ab39-4f8b-a402-fa8b70ca4e43_ExportBlock-38d5c116-3888-4869-947b-d10f59a85f0c/Social Media Knowledge 798320328b6448a7a5db82a24db58984.html": {
+    "mtime": 1794624574.0,
+    "seen": 1794666596.1967087,
+    "ast_hash": "9914e46ddc70c07b5e0e50af117c0551",
+    "semantic_hash": "9914e46ddc70c07b5e0e50af117c0551"
+  },
+  "frontend/assets/prompts/promt 2.0.md": {
+    "mtime": 1793933843.541883,
+    "seen": 1794666596.1967087,
+    "ast_hash": "6ec44e2b52dca85c1b5059647b5fe859",
+    "semantic_hash": "6ec44e2b52dca85c1b5059647b5fe859"
+  },
+  "frontend/assets/prompts/promt 3.0.md": {
+    "mtime": 1794567203.9729218,
+    "seen": 1794666596.1967087,
+    "ast_hash": "d6ee818a2ea3a209d929c52300f898e7",
+    "semantic_hash": "d6ee818a2ea3a209d929c52300f898e7"
+  },
+  "frontend/assets/prompts/promt formal.md": {
+    "mtime": 1794495766.0355847,
+    "seen": 1794666596.1967087,
+    "ast_hash": "3d27d20c3308006ddf1d444df96c5bde",
+    "semantic_hash": "3d27d20c3308006ddf1d444df96c5bde"
+  },
+  "frontend/assets/prompts/promt kutip.md": {
+    "mtime": 1794567200.4338312,
+    "seen": 1794666596.1967087,
+    "ast_hash": "0a93ae5d742bdd03fc5b9fb7c0619e93",
+    "semantic_hash": "0a93ae5d742bdd03fc5b9fb7c0619e93"
+  },
+  "graphify-out/converted/perbandingan_notion_vs_yor_follower_8456c823.md": {
+    "mtime": 1794655693.9400666,
+    "seen": 1794666596.1967087,
+    "ast_hash": "591be96a2104966b26bcbefb9292d804",
+    "semantic_hash": "591be96a2104966b26bcbefb9292d804"
+  },
+  "phone-update-check.png": {
+    "mtime": 1794324852.900104,
+    "seen": 1794666596.1967087,
+    "ast_hash": "a6d64963e43dc4fae94627dd52557b79",
+    "semantic_hash": "a6d64963e43dc4fae94627dd52557b79"
+  },
+  "AGENTS.md": {
+    "mtime": 1794667282.7475395,
+    "seen": 1794680867.8362265,
+    "ast_hash": "cd04d307caade45de45b371f274c865f",
     "semantic_hash": ""
   }
 }

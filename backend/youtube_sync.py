@@ -911,11 +911,15 @@ def search_and_cache_subscribed_videos(
                 except Exception:
                     return 0
 
-            vid_to_cid = {
-                vid: cid
-                for vid, cid in vid_to_cid.items()
-                if not _is_youtube_short(vid, client)
-            }
+            vid_kinds: dict[str, str] = {}
+            filtered_vid_to_cid: dict[str, str] = {}
+            for vid, cid in vid_to_cid.items():
+                kind = _probe_short_kind(vid, client)
+                if kind == "short":
+                    continue
+                vid_kinds[vid] = kind
+                filtered_vid_to_cid[vid] = cid
+            vid_to_cid = filtered_vid_to_cid
             if not vid_to_cid:
                 return 0
 
@@ -940,6 +944,15 @@ def search_and_cache_subscribed_videos(
                 cid = snip.get("channelId") or vid_to_cid.get(vid, "")
                 if cid not in ch_map:
                     continue
+                dur_str = parse_iso_duration(cdet.get("duration", ""))
+                dur_sec = db.duration_to_seconds(dur_str)
+                is_live_val = 1 if snip.get("liveBroadcastContent") == "live" else 0
+                fmt_checked = 1
+                if is_live_val == 0 and 0 < dur_sec <= 185:
+                    kind = vid_kinds.get(vid, "unknown")
+                    if kind == "unknown":
+                        # Fail-closed bila probe gagal: biarkan ditandai belum terverifikasi agar tidak lolos permanen sebagai video reguler.
+                        fmt_checked = 0
                 ch_obj = ch_map[cid]
                 thumbs = snip.get("thumbnails", {})
                 thumb_url = (
@@ -957,9 +970,10 @@ def search_and_cache_subscribed_videos(
                         "published_at": snip.get("publishedAt", datetime.now(timezone.utc).isoformat()),
                         "view_count": int(stats.get("viewCount", 0)),
                         "like_count": int(stats.get("likeCount", 0)),
-                        "duration": parse_iso_duration(cdet.get("duration", "")),
+                        "duration": dur_str,
                         "is_demo": 0,
-                        "is_live": 1 if snip.get("liveBroadcastContent") == "live" else 0,
+                        "is_live": is_live_val,
+                        "format_checked": fmt_checked,
                     }
                 )
             return db.upsert_videos(rows_to_save)

@@ -442,7 +442,12 @@ def _run_background_refresh(
     max_videos: int = 100,
 ) -> None:
     try:
-        before_total = db.query_videos(limit=25, page=1)["total"]
+        count_kwargs = (
+            {"channel_id": channel_id, "hide_filter": "both"}
+            if channel_id
+            else {}
+        )
+        before_total = db.query_videos(limit=25, page=1, **count_kwargs)["total"]
         # 1. Tarik daftar channel Subscriptions terbaru secara PERMANEN via Channel ID user + API Key (aktif selamanya!)
         my_cid = db.get_setting("my_channel_id", "")
         if my_cid and api_key and not channel_id:
@@ -497,7 +502,7 @@ def _run_background_refresh(
             )
 
         _sync_live_snapshot_in_place()
-        after_total = db.query_videos(limit=25, page=1)["total"]
+        after_total = db.query_videos(limit=25, page=1, **count_kwargs)["total"]
         with _STATE_LOCK:
             REFRESH_STATE["new_videos"] = max(0, after_total - before_total) if channel_id else max(added_new, after_total - before_total)
             REFRESH_STATE["total_videos"] = after_total

@@ -1764,6 +1764,103 @@ void main() {
       expect(tester.takeException(), isNull);
     },
   );
+
+  testWidgets(
+    'Creator card displays subscriber_count and Import JSON syncs to backend without dispose errors',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1280, 800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      bool importCalled = false;
+      bool exportCalled = false;
+
+      await HttpOverrides.runZoned(() async {
+        await tester.pumpWidget(const PersonalYouTubeApp());
+        await tester.pumpAndSettle();
+
+        // Buka modal Sync USB & klik Export JSON -> memanggil /api/sync/export-bundle
+        await tester.tap(find.text('Sync USB (HP ⇄ Laptop)'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Export JSON'));
+        await tester.pumpAndSettle();
+        expect(exportCalled, isTrue);
+
+        // Buka lagi dan klik Import JSON -> tempel JSON -> Terapkan Sync
+        await tester.tap(find.text('Sync USB (HP ⇄ Laptop)'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Import JSON'));
+        await tester.pumpAndSettle();
+        await tester.enterText(
+          find.byType(TextField).last,
+          jsonEncode({
+            'device': 'hp',
+            'videos': [],
+            'channels': [
+              {'channel_id': 'UC_sub', 'title': 'Sub Ch', 'views_hp': 2},
+            ],
+          }),
+        );
+        await tester.tap(find.text('Terapkan Sync'));
+        await tester.pumpAndSettle();
+        expect(importCalled, isTrue);
+
+        // Pilih creator di sidebar -> header creator menampilkan jumlah subscribers
+        await tester.tap(find.text('Sub Ch').first);
+        await tester.pumpAndSettle();
+        expect(find.textContaining('1.2M subscribers'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      }, createHttpClient: (_) {
+        return _TestBackendHttpClient((method, uri) {
+          if (uri.path == '/api/state') {
+            return {
+              'channels': [
+                {
+                  'channel_id': 'UC_sub',
+                  'title': 'Sub Ch',
+                  'handle': '@subch',
+                  'subscriber_count': 1200000,
+                  'yt_video_count': 10,
+                  'synced_video_count': 1,
+                  'views_hp': 0,
+                  'views_laptop': 0,
+                  'views_total': 0,
+                  'watched_count': 0,
+                  'is_hidden': 0,
+                  'status': 'subscribed',
+                },
+              ],
+              'live_streams': [],
+              'has_api_key': false,
+              'api_key_preview': '',
+              'has_oauth_token': false,
+              'session_state': {'hide_filter': 'unhide', 'sidebar_mode': 'full'},
+              'refresh_state': {'running': false, 'progress': 0, 'done_ready': false, 'new_videos': 0},
+            };
+          }
+          if (uri.path == '/api/videos') {
+            return {
+              'items': [],
+              'total': 0,
+              'page': 1,
+              'limit': 50,
+              'total_pages': 1,
+              'live_streams': [],
+            };
+          }
+          if (uri.path == '/api/sync/export-bundle') {
+            exportCalled = true;
+            return {'device': 'laptop', 'videos': [], 'channels': []};
+          }
+          if (uri.path == '/api/sync/import-bundle') {
+            importCalled = true;
+            return {'status': 'ok', 'videos': [], 'channels': []};
+          }
+          return {'status': 'ok'};
+        });
+      });
+    },
+  );
 }
 
 class _TestBackendHttpClient implements HttpClient {

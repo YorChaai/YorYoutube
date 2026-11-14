@@ -4470,6 +4470,18 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       skipUnsubscribeConfirmUntil != null &&
       DateTime.now().isBefore(skipUnsubscribeConfirmUntil!);
 
+  void _syncLocalUnsubscribedState(String channelId, String status) {
+    if (channelId.isEmpty) return;
+    if (status == 'unfollowed') {
+      _localUnsubscribedIds.add(channelId);
+      _localVideos.removeWhere(
+        (v) => (v['channel_id'] ?? '').toString() == channelId,
+      );
+    } else if (status == 'subscribed') {
+      _localUnsubscribedIds.remove(channelId);
+    }
+  }
+
   Future<void> _executeUnsubscribe(
     String channelId,
     String channelTitle,
@@ -4478,11 +4490,31 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final nowIso = DateTime.now().toUtc().toIso8601String();
     // Update status menjadi 'unfollowed' dengan timestamp terbaru untuk rekonsiliasi sync
     setState(() {
+      var foundLocal = false;
       for (final c in _localChannels) {
         if ((c['channel_id'] ?? '').toString() == channelId) {
           c['status'] = 'unfollowed';
           c['updated_at'] = nowIso;
+          foundLocal = true;
         }
+      }
+      if (!foundLocal && _isHpDevice) {
+        Map<String, dynamic>? matched;
+        for (final c in channels) {
+          if ((c['channel_id'] ?? '').toString() == channelId) {
+            matched = c;
+            break;
+          }
+        }
+        final tombstone = matched != null
+            ? Map<String, dynamic>.from(matched)
+            : <String, dynamic>{
+                'channel_id': channelId,
+                'title': channelTitle,
+              };
+        tombstone['status'] = 'unfollowed';
+        tombstone['updated_at'] = nowIso;
+        _localChannels.add(tombstone);
       }
       channels.removeWhere((c) => c['channel_id'] == channelId);
       videos.removeWhere((v) => v['channel_id'] == channelId);
@@ -4946,13 +4978,17 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           final rcHp = int.tryParse((rc['views_hp'] ?? 0).toString()) ?? 0;
           final rcLap = int.tryParse((rc['views_laptop'] ?? 0).toString()) ?? 0;
           if (cached == null) {
-            // Keep the laptop's creator list available on the phone after
-            // disconnecting, instead of losing creators absent from the seed.
-            if ((rc['status'] ?? 'subscribed') != 'unfollowed') {
+            final rcStatus = (rc['status'] ?? 'subscribed').toString();
+            if (rcStatus == 'unfollowed') {
+              _syncLocalUnsubscribedState(cid, 'unfollowed');
+            } else {
+              // Keep the laptop's creator list available on the phone after
+              // disconnecting, instead of losing creators absent from the seed.
               final added = Map<String, dynamic>.from(rc);
               added['views_total'] = rcHp + rcLap;
               added['watched_count'] = rcHp + rcLap;
               _localChannels.add(added);
+              _syncLocalUnsubscribedState(cid, rcStatus);
             }
             continue;
           }
@@ -4965,7 +5001,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           cached['views_laptop'] = nextLap;
           cached['views_total'] = nextHp + nextLap;
           cached['watched_count'] = nextHp + nextLap;
-          if (rc['status'] != null) cached['status'] = rc['status'];
+          if (rc['status'] != null) {
+            final nextStatus = rc['status'].toString();
+            cached['status'] = nextStatus;
+            _syncLocalUnsubscribedState(cid, nextStatus);
+          }
           _reconcileChannelHide(cached, Map<String, dynamic>.from(rc as Map));
           final rcUpd = (rc['updated_at'] ?? '').toString();
           final exUpd = (cached['updated_at'] ?? '').toString();
@@ -5032,38 +5072,52 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   }
 
   Future<void> _exportSyncJson() async {
-    final payload = {
-      'device': _deviceType,
-      'exported_at': DateTime.now().toUtc().toIso8601String(),
-      'videos': [
-        for (final v in (_localVideos.isNotEmpty ? _localVideos : videos))
-          if ((int.tryParse((v['views_hp'] ?? 0).toString()) ?? 0) > 0 ||
-              (int.tryParse((v['views_laptop'] ?? 0).toString()) ?? 0) > 0)
+    String? jsonStr;
+    if (!isStandaloneMode && baseUrl.isNotEmpty) {
+      try {
+        final res = await http
+            .get(Uri.parse('$baseUrl/api/sync/export-bundle'))
+            .timeout(const Duration(seconds: 6));
+        if (res.statusCode == 200 && res.body.trim().isNotEmpty) {
+          jsonStr = res.body;
+        }
+      } catch (_) {}
+    }
+    if (jsonStr == null) {
+      final payload = {
+        'device': _deviceType,
+        'exported_at': DateTime.now().toUtc().toIso8601String(),
+        'videos': [
+          for (final v in (_localVideos.isNotEmpty ? _localVideos : videos))
+            if ((int.tryParse((v['views_hp'] ?? 0).toString()) ?? 0) > 0 ||
+                (int.tryParse((v['views_laptop'] ?? 0).toString()) ?? 0) > 0)
+              {
+                'video_id': v['video_id'],
+                'views_hp': v['views_hp'] ?? 0,
+                'views_laptop': v['views_laptop'] ?? 0,
+                'updated_at':
+                    v['updated_at'] ?? DateTime.now().toUtc().toIso8601String(),
+              },
+        ],
+        'channels': [
+          for (final c
+              in (_localChannels.isNotEmpty ? _localChannels : channels))
             {
-              'video_id': v['video_id'],
-              'views_hp': v['views_hp'] ?? 0,
-              'views_laptop': v['views_laptop'] ?? 0,
+              'channel_id': c['channel_id'],
+              'title': c['title'],
+              'handle': c['handle'] ?? '',
+              'views_hp': c['views_hp'] ?? 0,
+              'views_laptop': c['views_laptop'] ?? 0,
+              'status': c['status'] ?? 'subscribed',
+              'is_hidden': _isHiddenFlag(c['is_hidden']) ? 1 : 0,
+              'hidden_updated_at': (c['hidden_updated_at'] ?? '').toString(),
               'updated_at':
-                  v['updated_at'] ?? DateTime.now().toUtc().toIso8601String(),
+                  c['updated_at'] ?? DateTime.now().toUtc().toIso8601String(),
             },
-      ],
-      'channels': [
-        for (final c in (_localChannels.isNotEmpty ? _localChannels : channels))
-          {
-            'channel_id': c['channel_id'],
-            'title': c['title'],
-            'handle': c['handle'] ?? '',
-            'views_hp': c['views_hp'] ?? 0,
-            'views_laptop': c['views_laptop'] ?? 0,
-            'status': c['status'] ?? 'subscribed',
-            'is_hidden': _isHiddenFlag(c['is_hidden']) ? 1 : 0,
-            'hidden_updated_at': (c['hidden_updated_at'] ?? '').toString(),
-            'updated_at':
-                c['updated_at'] ?? DateTime.now().toUtc().toIso8601String(),
-          },
-      ],
-    };
-    final jsonStr = jsonEncode(payload);
+        ],
+      };
+      jsonStr = jsonEncode(payload);
+    }
     await Clipboard.setData(ClipboardData(text: jsonStr));
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -5079,11 +5133,12 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
 
   Future<void> _importSyncJson() async {
     final ctrl = TextEditingController();
-    try {
-      await showDialog<void>(
-        context: context,
-        builder: (ctx) {
-          return AlertDialog(
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        return _DisposeOnUnmount(
+          onDispose: ctrl.dispose,
+          child: AlertDialog(
             backgroundColor: const Color(0xFF1E1E1E),
             title: const Text(
               'Import Paket Data Sync',
@@ -5132,23 +5187,22 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                   foregroundColor: Colors.white,
                 ),
                 onPressed: () {
+                  final rawText = ctrl.text;
                   Navigator.pop(ctx);
-                  _applySyncDataString(ctrl.text);
+                  _applySyncDataString(rawText);
                 },
                 child: const Text('Terapkan Sync'),
               ),
             ],
-          );
-        },
-      );
-    } finally {
-      ctrl.dispose();
-    }
+          ),
+        );
+      },
+    );
   }
 
   Future<void> _applySyncDataString(String rawJson) async {
     try {
-      final data = jsonDecode(rawJson.trim());
+      final data = jsonDecode(rawJson.trim()) as Map<String, dynamic>;
       final remoteVids = (data['videos'] as List?) ?? [];
       final remoteChs = (data['channels'] as List?) ?? [];
       final remoteVidMap = {
@@ -5157,6 +5211,24 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       final remoteChMap = {
         for (final c in remoteChs) (c['channel_id'] ?? '').toString(): c,
       };
+
+      if (!isStandaloneMode && baseUrl.isNotEmpty) {
+        final backendPayload = <String, dynamic>{
+          'device': (data['device'] ?? 'bundle').toString(),
+          'videos': remoteVids,
+          'channels': remoteChs,
+        };
+        final res = await http
+            .post(
+              Uri.parse('$baseUrl/api/sync/import-bundle'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode(backendPayload),
+            )
+            .timeout(const Duration(seconds: 8));
+        if (res.statusCode != 200) {
+          throw Exception('Backend gagal menerapkan sync (${res.statusCode})');
+        }
+      }
 
       final localChIds = <String>{
         for (final c in _localChannels) (c['channel_id'] ?? '').toString(),
@@ -5197,7 +5269,19 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             c['views_laptop'] = nextLap;
             c['views_total'] = nextHp + nextLap;
             c['watched_count'] = nextHp + nextLap;
-            if (rc['status'] != null) c['status'] = rc['status'];
+            final rcUpd = (rc['updated_at'] ?? '').toString();
+            final exUpd = (c['updated_at'] ?? '').toString();
+            if (rc['status'] != null && _isNewerOrEqualIso(rcUpd, exUpd)) {
+              final nextStatus = rc['status'].toString();
+              c['status'] = nextStatus;
+              c['updated_at'] = rcUpd;
+              _syncLocalUnsubscribedState(cid, nextStatus);
+            } else {
+              _syncLocalUnsubscribedState(
+                cid,
+                (c['status'] ?? 'subscribed').toString(),
+              );
+            }
             _reconcileChannelHide(c, Map<String, dynamic>.from(rc as Map));
           }
         }
@@ -5207,7 +5291,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               !localChIds.contains(cid) &&
               entry.value is Map) {
             final rc = Map<String, dynamic>.from(entry.value as Map);
-            _localChannels.add(rc);
+            final rcStatus = (rc['status'] ?? 'subscribed').toString();
+            _syncLocalUnsubscribedState(cid, rcStatus);
+            if (rcStatus != 'unfollowed') {
+              _localChannels.add(rc);
+            }
           }
         }
         _sortChannelsByWatchedDesc(_localChannels);
@@ -5436,7 +5524,15 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                               if (trimmed.isEmpty) continue;
                               final cols = trimmed.split(',');
                               final first = cols[0].trim();
-                              if (first.isEmpty) continue;
+                              if (first.isEmpty ||
+                                  const {
+                                    'channel id',
+                                    'channel_id',
+                                    'id',
+                                    'nama channel',
+                                  }.contains(first.toLowerCase())) {
+                                continue;
+                              }
                               if (first.startsWith('UC') && cols.length >= 2) {
                                 final cid = first;
                                 final col1 = cols[1].trim();
@@ -8800,7 +8896,10 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final thumbUrl = (ch['thumbnail_url'] ?? '').toString();
     final isHidden = _isHiddenFlag(ch['is_hidden']);
     final ytSubs =
-        int.tryParse((ch['yt_subscriber_count'] ?? 0).toString()) ?? 0;
+        int.tryParse(
+          (ch['yt_subscriber_count'] ?? ch['subscriber_count'] ?? 0).toString(),
+        ) ??
+        0;
     final ytVids = int.tryParse((ch['yt_video_count'] ?? 0).toString()) ?? 0;
     final syncedCount = isStandaloneMode
         ? _localVideos

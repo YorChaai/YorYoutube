@@ -1114,6 +1114,123 @@ def test_usb_prepare_endpoint_sets_adb_reverse(isolated_client, monkeypatch):
     assert ["adb", "-s", "SERIAL123", "reverse", "tcp:8000", "tcp:8000"] in calls
 
 
+def test_search_and_cache_marks_failed_short_probe_unchecked(isolated_client, monkeypatch):
+    """Search YouTube harus membuang Shorts & menandai probe yang gagal sebagai format_checked=0."""
+    import youtube_sync
+
+    db.upsert_channel(channel_id="UC_srch", title="Search Ch", uploads_playlist_id="UU_srch")
+
+    class _FakeResp:
+        def __init__(self, status_code=200, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, params=None, headers=None):
+            if url.endswith("/search"):
+                return _FakeResp(
+                    200,
+                    {
+                        "items": [
+                            {"id": {"videoId": "vid_short"}, "snippet": {"channelId": "UC_srch"}},
+                            {"id": {"videoId": "vid_unknown"}, "snippet": {"channelId": "UC_srch"}},
+                            {"id": {"videoId": "vid_reg"}, "snippet": {"channelId": "UC_srch"}},
+                        ]
+                    },
+                )
+            if url.endswith("/videos"):
+                return _FakeResp(
+                    200,
+                    {
+                        "items": [
+                            {
+                                "id": "vid_unknown",
+                                "snippet": {"channelId": "UC_srch", "title": "Unknown Clip", "publishedAt": "2026-11-10T00:00:00Z"},
+                                "statistics": {"viewCount": "10", "likeCount": "1"},
+                                "contentDetails": {"duration": "PT40S"},
+                            },
+                            {
+                                "id": "vid_reg",
+                                "snippet": {"channelId": "UC_srch", "title": "Regular Clip", "publishedAt": "2026-11-10T00:00:00Z"},
+                                "statistics": {"viewCount": "20", "likeCount": "2"},
+                                "contentDetails": {"duration": "PT50S"},
+                            },
+                        ]
+                    },
+                )
+            return _FakeResp(404, {})
+
+        def head(self, url, **kwargs):
+            if "vid_short" in url:
+                return _FakeResp(200)
+            if "vid_reg" in url:
+                return _FakeResp(303)
+            return _FakeResp(429)
+
+    monkeypatch.setattr(youtube_sync.httpx, "Client", _FakeClient)
+    monkeypatch.setattr(youtube_sync.time, "sleep", lambda *_: None)
+
+    saved = youtube_sync.search_and_cache_subscribed_videos(q="clip", api_key="fake_key")
+    assert saved == 2
+    with db.get_conn() as conn:
+        rows = {
+            r["video_id"]: r["format_checked"]
+            for r in conn.execute("SELECT video_id, format_checked FROM videos WHERE channel_id = 'UC_srch'").fetchall()
+        }
+    assert "vid_short" not in rows
+    assert rows["vid_unknown"] == 0
+    assert rows["vid_reg"] == 1
+
+
+def test_background_refresh_counts_hidden_channel_new_videos(isolated_client, monkeypatch):
+    """Refresh 1 channel berstatus Hide tetap melaporkan jumlah video baru yang akurat."""
+    import main as app_main
+
+    db.upsert_channel(channel_id="UC_hid_ref", title="Hidden Creator", uploads_playlist_id="UU_hid_ref")
+    db.set_channel_hidden("UC_hid_ref", True)
+
+    def _fake_sync_channel(ch, **kwargs):
+        db.upsert_videos(
+            [
+                {
+                    "video_id": "v_hid_1",
+                    "channel_id": "UC_hid_ref",
+                    "channel_title": "Hidden Creator",
+                    "channel_thumbnail": "",
+                    "title": "Hidden New Upload",
+                    "thumbnail_url": "https://i.ytimg.com/vi/v_hid_1/hqdefault.jpg",
+                    "published_at": "2026-11-14T12:00:00Z",
+                    "view_count": 100,
+                    "like_count": 10,
+                    "duration": "12:00",
+                    "is_demo": 0,
+                    "is_live": 0,
+                    "format_checked": 1,
+                }
+            ]
+        )
+        return 1
+
+    monkeypatch.setattr(app_main.youtube_sync, "sync_channel_videos", _fake_sync_channel)
+    app_main._run_background_refresh(channel_id="UC_hid_ref", api_key="fake", oauth_token="")
+    assert app_main.REFRESH_STATE["new_videos"] == 1
+    assert app_main.REFRESH_STATE["progress"] == 100
+    assert app_main.REFRESH_STATE["done_ready"] is True
+
+
+
 
 
 
