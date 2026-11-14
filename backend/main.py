@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import asynccontextmanager
 import csv
 import io
 import json
@@ -9,14 +10,22 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import db
 import youtube_sync
 
-app = FastAPI(title="Personal YouTube Subscriptions Hub")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    db.init_db()
+    db.seed_demo_if_empty()
+    yield
+
+
+app = FastAPI(title="Personal YouTube Subscriptions Hub", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,6 +34,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def disable_frontend_cache(request, call_next):
+    response = await call_next(request)
+    if not request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 # State sementara sesi berjalan: bertahan saat Refresh halaman (F5),
 # dan otomatis kembali ke default saat aplikasi di-restart.
@@ -36,7 +55,7 @@ SESSION_UI_STATE: dict = {
     "range_end": "",
     "start_at": "",
     "end_at": "",
-    "region": "all",
+    "hide_filter": "unhide",  # 'unhide' | 'hide' | 'both'
     "channel_id": "",
     "q": "",
     "page": 1,
@@ -91,22 +110,7 @@ def _extract_yt_video_id(raw_value: str) -> str:
 
 
 def _get_permanent_limits() -> tuple[int, dict[str, int]]:
-    default_limit_str = db.get_setting("default_limit", "25")
-    try:
-        default_limit = int(default_limit_str)
-        if default_limit not in (25, 50, 100):
-            default_limit = 25
-    except ValueError:
-        default_limit = 25
-
-    raw_map = db.get_setting("tab_limits_json", "{}")
-    try:
-        tab_limits = json.loads(raw_map)
-        if not isinstance(tab_limits, dict):
-            tab_limits = {}
-    except Exception:
-        tab_limits = {}
-    return default_limit, tab_limits
+    return 50, {}
 
 
 def _save_permanent_limit(tab_key: str, limit_val: int) -> None:
@@ -116,12 +120,6 @@ def _save_permanent_limit(tab_key: str, limit_val: int) -> None:
     tab_limits[tab_key or "home"] = limit_val
     db.set_setting("default_limit", str(limit_val))
     db.set_setting("tab_limits_json", json.dumps(tab_limits))
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    db.init_db()
-    db.seed_demo_if_empty()
 
 
 class SettingsPayload(BaseModel):
@@ -154,7 +152,7 @@ class UiStatePayload(BaseModel):
     range_end: str | None = None
     start_at: str | None = None
     end_at: str | None = None
-    region: str | None = None
+    hide_filter: str | None = None
     channel_id: str | None = None
     q: str | None = None
     page: int | None = None
@@ -171,8 +169,8 @@ class WatchPayload(BaseModel):
     device: str = "laptop"
 
 
-class RegionPayload(BaseModel):
-    region: str = "Nasional"
+class HidePayload(BaseModel):
+    hidden: bool = True
 
 
 class DeviceSyncPayload(BaseModel):
@@ -222,8 +220,8 @@ def update_ui_state(payload: UiStatePayload) -> dict:
             SESSION_UI_STATE["start_at"] = payload.start_at
         if payload.end_at is not None:
             SESSION_UI_STATE["end_at"] = payload.end_at
-        if payload.region is not None:
-            SESSION_UI_STATE["region"] = payload.region
+        if payload.hide_filter is not None and payload.hide_filter in ("unhide", "hide", "both"):
+            SESSION_UI_STATE["hide_filter"] = payload.hide_filter
         if payload.channel_id is not None:
             SESSION_UI_STATE["channel_id"] = payload.channel_id
         if payload.q is not None:
@@ -258,10 +256,10 @@ def update_ui_state(payload: UiStatePayload) -> dict:
 def get_videos(
     sort_by: str = "time",
     period: str = "all",
-    region: str = "all",
+    hide_filter: str = "unhide",
     channel_id: str = "",
     q: str = "",
-    limit: int = 25,
+    limit: int = 50,
     page: int = 1,
     min_minutes: int = 0,
     max_minutes: int = 120,
@@ -271,31 +269,27 @@ def get_videos(
     range_start: str = "",
     range_end: str = "",
 ) -> dict:
+    norm_hide = hide_filter if hide_filter in ("unhide", "hide", "both") else "unhide"
     # Simpan kondisi terakhir ke SESSION_UI_STATE agar saat Refresh halaman (F5) tidak hilang
     with _STATE_LOCK:
         SESSION_UI_STATE["sort_by"] = sort_by
         SESSION_UI_STATE["period"] = period
         SESSION_UI_STATE["start_at"] = start_at
         SESSION_UI_STATE["end_at"] = end_at
-        if custom_date or period == "custom_date":
-            SESSION_UI_STATE["custom_date"] = custom_date
-        if range_start or period == "custom_range":
-            SESSION_UI_STATE["range_start"] = range_start
-        if range_end or period == "custom_range":
-            SESSION_UI_STATE["range_end"] = range_end
-        SESSION_UI_STATE["region"] = region
+        SESSION_UI_STATE["custom_date"] = custom_date if period == "custom_date" else ""
+        SESSION_UI_STATE["range_start"] = range_start if period == "custom_range" else ""
+        SESSION_UI_STATE["range_end"] = range_end if period == "custom_range" else ""
+        SESSION_UI_STATE["hide_filter"] = norm_hide
         SESSION_UI_STATE["channel_id"] = channel_id
         SESSION_UI_STATE["q"] = q
         SESSION_UI_STATE["page"] = max(1, page)
         SESSION_UI_STATE["min_minutes"] = min_minutes
         SESSION_UI_STATE["max_minutes"] = max_minutes
-    if limit in (25, 50, 100):
-        _save_permanent_limit(channel_id or "home", limit)
 
     res = db.query_videos(
         sort_by=sort_by,
         period=period,
-        region=region,
+        hide_filter=norm_hide,
         channel_id=channel_id,
         q=q,
         limit=limit,
@@ -320,7 +314,7 @@ def get_videos(
             res = db.query_videos(
                 sort_by=sort_by,
                 period=period,
-                region=region,
+                hide_filter=norm_hide,
                 channel_id=channel_id,
                 q=q,
                 limit=limit,
@@ -330,31 +324,6 @@ def get_videos(
                 start_at=start_at,
                 end_at=end_at,
             )
-            # Jika masih 0 karena user tidak sengaja sedang mengklik 1 channel tertentu di sidebar (misal 2Nine Fit),
-            # otomatis cari di seluruh 927 channel Subscriptions agar video yang dicari tetap ketemu!
-            if res["total"] == 0 and channel_id:
-                youtube_sync.search_and_cache_subscribed_videos(
-                    q=q,
-                    channel_id="",
-                    api_key=api_key,
-                    oauth_token=oauth_token,
-                )
-                res = db.query_videos(
-                    sort_by=sort_by,
-                    period=period,
-                    region=region,
-                    channel_id="",
-                    q=q,
-                    limit=limit,
-                    page=page,
-                    min_minutes=min_minutes,
-                    max_minutes=max_minutes,
-                    start_at=start_at,
-                    end_at=end_at,
-                )
-                if res["total"] > 0:
-                    with _STATE_LOCK:
-                        SESSION_UI_STATE["channel_id"] = ""
 
     # Jika user klik salah satu dari 930 channel di sidebar yang videonya belum pernah ditarik sama sekali (0 video), tarik 1x
     if channel_id and res["total"] == 0 and period == "all" and not q and page == 1 and min_minutes == 0 and max_minutes >= 120:
@@ -368,7 +337,7 @@ def get_videos(
                     res = db.query_videos(
                         sort_by=sort_by,
                         period=period,
-                        region=region,
+                        hide_filter=norm_hide,
                         channel_id=channel_id,
                         q=q,
                         limit=limit,
@@ -396,15 +365,8 @@ def _run_background_refresh(channel_id: str, api_key: str, oauth_token: str) -> 
                 youtube_sync.import_oauth_subscriptions(oauth_token, mode="subscriptions")
             except Exception:
                 pass
-        all_chs = [c for c in db.list_channels() if not c["channel_id"].startswith("UC_demo_")]
-
-        # Recheck channel country/language so old videos inherit the latest
-        # classification too. Missing metadata remains explicitly unknown.
-        if not channel_id:
-            try:
-                youtube_sync.refresh_all_channel_statistics(api_key=api_key, oauth_token=oauth_token)
-            except Exception:
-                pass
+        # Proses seluruh channel aktif baik yang normal (unhide) maupun yang tersembunyi (hide)
+        all_chs = [c for c in db.list_channels(hide_filter="both") if not c["channel_id"].startswith("UC_demo_")]
 
         if channel_id:
             target_chs = [c for c in all_chs if c["channel_id"] == channel_id]
@@ -496,6 +458,21 @@ def refresh_youtube_consume() -> dict:
     return {"status": "ok", **summary}
 
 
+@app.get("/api/settings")
+def get_settings() -> dict:
+    api_key = db.get_setting("api_key", "")
+    oauth_token = db.get_setting("oauth_token", "")
+    default_limit, tab_limits = _get_permanent_limits()
+    return {
+        "status": "ok",
+        "has_api_key": bool(api_key),
+        "api_key_preview": (api_key[:6] + "..." + api_key[-4:]) if len(api_key) > 10 else ("Terpasang" if api_key else ""),
+        "has_oauth_token": bool(oauth_token),
+        "default_limit": default_limit,
+        "tab_limits": tab_limits,
+    }
+
+
 @app.post("/api/settings")
 def save_settings(payload: SettingsPayload) -> dict:
     if payload.api_key and payload.api_key.strip():
@@ -506,9 +483,9 @@ def save_settings(payload: SettingsPayload) -> dict:
 
 
 @app.get("/api/channels")
-def get_channels_list(region: str = "all") -> dict:
-    channels = db.list_channels(region=region)
-    return {"status": "ok", "channels": channels, "region": region}
+def get_channels_list(hide_filter: str = "both") -> dict:
+    channels = db.list_channels(hide_filter=hide_filter)
+    return {"status": "ok", "channels": channels, "hide_filter": hide_filter}
 
 
 @app.post("/api/channels")
@@ -619,10 +596,13 @@ def watch_channel(channel_id: str, payload: WatchPayload | None = None) -> dict:
     return {"status": "ok", **res}
 
 
-@app.post("/api/channels/{channel_id}/region")
-def update_channel_region(channel_id: str, payload: RegionPayload) -> dict:
-    reg = db.set_channel_region(channel_id, payload.region)
-    return {"status": "ok", "channel_id": channel_id, "region": reg}
+@app.post("/api/channels/{channel_id}/hide")
+def update_channel_hide(channel_id: str, payload: HidePayload) -> dict:
+    res = db.set_channel_hidden(channel_id, payload.hidden)
+    with _STATE_LOCK:
+        if payload.hidden and SESSION_UI_STATE.get("channel_id") == channel_id and SESSION_UI_STATE.get("hide_filter", "unhide") == "unhide":
+            SESSION_UI_STATE["channel_id"] = ""
+    return {"status": "ok", **res}
 
 
 @app.post("/api/channels/{channel_id}/subscribe")
@@ -652,7 +632,7 @@ def remove_channel(channel_id: str) -> dict:
 @app.post("/api/sync/exchange")
 def sync_exchange_device(payload: DeviceSyncPayload) -> dict:
     """Sinkronisasi langsung HP ⇄ Laptop via Kabel USB / Jaringan Lokal."""
-    return db.sync_device_data(payload.dict())
+    return db.sync_device_data(payload.model_dump())
 
 
 @app.get("/api/sync/export-bundle")
@@ -668,7 +648,7 @@ def export_sync_bundle_endpoint() -> Response:
 
 @app.post("/api/sync/import-bundle")
 def import_sync_bundle_endpoint(payload: DeviceSyncPayload) -> dict:
-    return db.sync_device_data(payload.dict())
+    return db.sync_device_data(payload.model_dump())
 
 
 @app.delete("/api/demo")
@@ -802,6 +782,68 @@ def import_channels_csv(payload: ImportCsvPayload) -> dict:
     return {"status": "ok", "added": added}
 
 
+@app.get("/flutter_service_worker.js")
+def unregister_legacy_service_worker() -> Response:
+    js = (
+        "self.addEventListener('install', () => self.skipWaiting());\n"
+        "self.addEventListener('activate', (event) => {\n"
+        "  event.waitUntil((async () => {\n"
+        "    const keys = await caches.keys();\n"
+        "    await Promise.all(keys.map((k) => caches.delete(k)));\n"
+        "    await self.registration.unregister();\n"
+        "    const clients = await self.clients.matchAll({ type: 'window' });\n"
+        "    clients.forEach((c) => c.navigate(c.url));\n"
+        "  })());\n"
+        "});\n"
+    )
+    return Response(content=js, media_type="application/javascript")
+
+
 WEB_BUILD_DIR = Path(__file__).parent.parent / "frontend" / "build" / "web"
+
+
+def _web_build_version() -> str:
+    main_js = WEB_BUILD_DIR / "main.dart.js"
+    if main_js.exists():
+        return str(main_js.stat().st_mtime_ns)
+    return "1"
+
+
+@app.get("/")
+@app.get("/index.html")
+def serve_web_index() -> Response:
+    index_path = WEB_BUILD_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Web build belum tersedia.")
+    html = index_path.read_text(encoding="utf-8")
+    version = _web_build_version()
+    html = html.replace('src="flutter_bootstrap.js"', f'src="flutter_bootstrap.js?v={version}"')
+    return Response(content=html, media_type="text/html; charset=utf-8")
+
+
+@app.get("/flutter_bootstrap.js")
+def serve_flutter_bootstrap() -> Response:
+    bootstrap_path = WEB_BUILD_DIR / "flutter_bootstrap.js"
+    if not bootstrap_path.exists():
+        raise HTTPException(status_code=404, detail="flutter_bootstrap.js belum tersedia.")
+    js = bootstrap_path.read_text(encoding="utf-8")
+    version = _web_build_version()
+    js = js.replace('"main.dart.js"', f'"main.dart.js?v={version}"')
+    js = js.replace(
+        "_flutter.loader.load({",
+        f'_flutter.loader.load({{\n  config: {{ assetBase: "/web_v/{version}/" }},',
+    )
+    return Response(content=js, media_type="application/javascript; charset=utf-8")
+
+
+@app.get("/web_v/{version}/{subpath:path}")
+def serve_versioned_web_asset(version: str, subpath: str) -> FileResponse:
+    root = WEB_BUILD_DIR.resolve()
+    target = (root / subpath).resolve()
+    if not target.is_relative_to(root) or not target.is_file():
+        raise HTTPException(status_code=404, detail="Asset tidak ditemukan.")
+    return FileResponse(target)
+
+
 if WEB_BUILD_DIR.exists():
     app.mount("/", StaticFiles(directory=str(WEB_BUILD_DIR), html=True), name="web")

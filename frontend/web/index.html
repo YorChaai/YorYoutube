@@ -31,6 +31,24 @@
 
   <title>frontend</title>
   <link rel="manifest" href="manifest.json">
+  <script>
+    (function () {
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistrations().then(function (regs) {
+          if (!regs.length) return;
+          Promise.all(regs.map(function (r) { return r.unregister(); })).then(function () {
+            if ('caches' in window) {
+              return caches.keys().then(function (keys) {
+                return Promise.all(keys.map(function (k) { return caches.delete(k); }));
+              });
+            }
+          }).then(function () {
+            window.location.reload();
+          });
+        });
+      }
+    })();
+  </script>
 </head>
 <body>
   <!--

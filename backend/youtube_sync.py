@@ -112,9 +112,6 @@ def resolve_and_add_channel(identifier: str, api_key: str = "", oauth_token: str
         snippet = ch.get("snippet", {})
         title = snippet.get("title") or raw
         handle = snippet.get("customUrl") or (raw if raw.startswith("@") else "")
-        country = snippet.get("country", "")
-        default_lang = snippet.get("defaultLanguage", "")
-        region = db.classify_region(title, handle, country=country, default_lang=default_lang)
         thumbs = snippet.get("thumbnails", {})
         thumb_url = (thumbs.get("medium") or thumbs.get("default") or {}).get("url", "")
         uploads_pid = (
@@ -129,12 +126,10 @@ def resolve_and_add_channel(identifier: str, api_key: str = "", oauth_token: str
             thumbnail_url=thumb_url,
             uploads_playlist_id=uploads_pid,
             source="manual",
-            region=region,
-            country=country,
             status="subscribed",
             force_subscribe=True,
         )
-        return {"channel_id": cid, "title": title, "handle": handle, "uploads_playlist_id": uploads_pid, "region": region}
+        return {"channel_id": cid, "title": title, "handle": handle, "uploads_playlist_id": uploads_pid}
 
 
 def import_oauth_subscriptions(oauth_token: str, mode: str = "subscriptions") -> int:
@@ -290,29 +285,6 @@ def sync_public_subscriptions_by_channel(my_channel_id: str, api_key: str = "") 
             if not page_token:
                 break
 
-        # Cek negara asli (snippet.country) untuk channel yang baru ditambahkan
-        if newly_added_channels:
-            new_cids = [c["channel_id"] for c in newly_added_channels]
-            for i in range(0, len(new_cids), 50):
-                chunk = new_cids[i : i + 50]
-                try:
-                    c_resp = client.get(
-                        f"{YT_API_BASE}/channels",
-                        params={"part": "snippet", "id": ",".join(chunk), "key": api_key.strip()},
-                    )
-                    for ch_it in c_resp.json().get("items", []):
-                        cid = ch_it["id"]
-                        csnip = ch_it.get("snippet", {})
-                        reg = db.classify_region(
-                            csnip.get("title", ""),
-                            csnip.get("customUrl", ""),
-                            country=csnip.get("country", ""),
-                            default_lang=csnip.get("defaultLanguage", ""),
-                        )
-                        db.set_channel_region(cid, reg)
-                except Exception:
-                    pass
-
     # Langsung tarik video untuk setiap channel baru yang baru saja di-subscribe di YouTube!
     for new_ch in newly_added_channels:
         try:
@@ -324,7 +296,7 @@ def sync_public_subscriptions_by_channel(my_channel_id: str, api_key: str = "") 
 
 
 def refresh_all_channel_statistics(api_key: str = "", oauth_token: str = "") -> int:
-    """Ambil total video asli di YouTube (bisa ribuan video), jumlah subscriber, @handle, dan negara/region untuk seluruh channel."""
+    """Ambil total video asli di YouTube, jumlah subscriber, dan @handle untuk seluruh channel."""
     params, headers = _auth_params_headers(api_key, oauth_token)
     if not params and not headers:
         return 0
@@ -349,9 +321,6 @@ def refresh_all_channel_statistics(api_key: str = "", oauth_token: str = "") -> 
                     snip = ch.get("snippet", {})
                     stats = ch.get("statistics", {})
                     handle = snip.get("customUrl", "")
-                    country = snip.get("country", "")
-                    default_lang = snip.get("defaultLanguage", "")
-                    reg = db.classify_region(snip.get("title", ""), handle, country=country, default_lang=default_lang)
                     v_count = int(stats.get("videoCount", 0))
                     sub_count = int(stats.get("subscriberCount", 0))
                     conn.execute(
@@ -359,19 +328,10 @@ def refresh_all_channel_statistics(api_key: str = "", oauth_token: str = "") -> 
                         UPDATE channels
                         SET yt_video_count=?,
                             subscriber_count=?,
-                            region=CASE WHEN ? != 'Belum diketahui' AND COALESCE(region, 'Belum diketahui') = 'Belum diketahui' THEN ? ELSE region END,
                             handle=CASE WHEN ? != '' THEN ? ELSE handle END
                         WHERE channel_id=?
                         """,
-                        (v_count, sub_count, reg, reg, handle, handle, cid),
-                    )
-                    conn.execute(
-                        """
-                        UPDATE videos
-                        SET region=CASE WHEN ? != 'Belum diketahui' AND COALESCE(region, 'Belum diketahui') = 'Belum diketahui' THEN ? ELSE region END
-                        WHERE channel_id=?
-                        """,
-                        (reg, reg, cid),
+                        (v_count, sub_count, handle, handle, cid),
                     )
                     updated += 1
     return updated
@@ -500,10 +460,9 @@ def refresh_all_channels_comprehensive(
     on_progress: Callable[[int, int], None] | None = None,
 ) -> int:
     """
-    Mengecek SELURUH channel (100% semua 927+ channel, termasuk YouTuber yang jarang upload 1 bulan/tahun sekali):
-    1. Channel yang belum pernah tersinkronisasi sama sekali ditarik via API.
-    2. Seluruh channel lainnya dicek feed video terbarunya secara paralel (0 kuota API untuk cek daftar ID video terbaru),
-       lalu seluruh video baru & video 48 jam terakhir diambil statistik lengkapnya (views, likes, durasi) via batch videos.list (50 video/request).
+    Mengecek SELURUH channel (baik unhide maupun hide, termasuk channel yang belum punya cache):
+    Seluruh channel dicek 15 item RSS terbarunya secara paralel berkecepatan tinggi (0 kuota API),
+    lalu seluruh video baru & video 48 jam terakhir diambil statistik lengkapnya via batch videos.list (50 video/request).
     """
     params, headers = _auth_params_headers(api_key, oauth_token)
     if not params and not headers:
@@ -525,63 +484,45 @@ def refresh_all_channels_comprehensive(
         all_existing_vids = {r["video_id"] for r in rows}
         known_old_vids = {r["video_id"] for r in rows if (r["published_at"] or "") < recent_cutoff}
 
-    unsynced_chs = [c for c in real_chs if c.get("synced_video_count", 0) == 0]
-    rss_chs = [c for c in real_chs if c.get("synced_video_count", 0) > 0]
-
     done_count = 0
     newly_inserted_count = 0
 
-    # 1. Sync channel baru secara berurutan agar tidak terjadi race condition / lock di SQLite
-    for ch in unsynced_chs:
-        try:
-            sync_channel_videos(ch, api_key=api_key, oauth_token=oauth_token, max_videos=50)
-        except Exception:
-            pass
-        done_count += 1
-        if on_progress:
-            on_progress(done_count, total_chs)
-
-    # 2. Cek seluruh 15 item RSS terbaru untuk channel lainnya (dengan koneksi pool & retry jika kena timeout/429)
+    # Cek 15 item RSS terbaru untuk seluruh channel sekaligus via pool 40 worker & keep-alive connection
     vid_to_cid: dict[str, str] = {}
-
-    if rss_chs:
-        with httpx.Client(timeout=10.0, follow_redirects=True) as rss_client:
-            def _check_channel(ch: dict) -> list[tuple[str, str]]:
-                cid = ch["channel_id"]
-                found: list[tuple[str, str]] = []
-                url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
-                for attempt in range(2):
-                    try:
-                        r = rss_client.get(url)
-                        if r.status_code == 200:
-                            vids = re.findall(r"<yt:videoId>([^<]+)</yt:videoId>", r.text)
-                            for v in vids:
-                                if v not in known_old_vids:
-                                    found.append((v, cid))
-                            return found
-                        if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-                            time.sleep(0.4)
-                            continue
+    limits = httpx.Limits(max_connections=60, max_keepalive_connections=40)
+    with httpx.Client(timeout=4.0, limits=limits, follow_redirects=True) as rss_client:
+        def _check_channel(ch: dict) -> list[tuple[str, str]]:
+            cid = ch["channel_id"]
+            found: list[tuple[str, str]] = []
+            url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
+            for attempt in range(2):
+                try:
+                    r = rss_client.get(url)
+                    if r.status_code == 200:
+                        vids = re.findall(r"<yt:videoId>([^<]+)</yt:videoId>", r.text)
+                        for v in vids:
+                            if v not in known_old_vids:
+                                found.append((v, cid))
                         return found
-                    except Exception:
-                        if attempt == 0:
-                            time.sleep(0.4)
-                return found
+                    if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                        time.sleep(0.15)
+                        continue
+                    return found
+                except Exception:
+                    if attempt == 0:
+                        time.sleep(0.15)
+            return found
 
-            with ThreadPoolExecutor(max_workers=20) as pool:
-                futures = [pool.submit(_check_channel, ch) for ch in rss_chs]
-                for fut in as_completed(futures):
-                    done_count += 1
-                    if on_progress:
-                        on_progress(done_count, total_chs)
-                    for vid, cid in fut.result():
-                        vid_to_cid[vid] = cid
+        with ThreadPoolExecutor(max_workers=40) as pool:
+            futures = [pool.submit(_check_channel, ch) for ch in real_chs]
+            for fut in as_completed(futures):
+                done_count += 1
+                if on_progress and (done_count % 10 == 0 or done_count == total_chs):
+                    on_progress(done_count, total_chs)
+                for vid, cid in fut.result():
+                    vid_to_cid[vid] = cid
 
     if not vid_to_cid:
-        if unsynced_chs:
-            with db.get_conn() as conn:
-                after_count = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
-                return max(0, after_count - len(all_existing_vids))
         return 0
 
     all_vids = list(vid_to_cid.keys())
@@ -634,10 +575,6 @@ def refresh_all_channels_comprehensive(
                 )
             db.upsert_videos(chunk_rows)
 
-    if unsynced_chs:
-        with db.get_conn() as conn:
-            after_count = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
-            return max(newly_inserted_count, after_count - len(all_existing_vids))
     return newly_inserted_count
 
 

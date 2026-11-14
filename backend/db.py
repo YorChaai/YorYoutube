@@ -9,36 +9,6 @@ from typing import Iterator
 
 DB_PATH = Path(__file__).parent / "youtube_personal.db"
 
-ID_KEYWORDS = {
-    "indonesia", "indonesian", "nusantara", "jawa", "sunda", "jakarta", "bandung",
-    "jogja", "yogyakarta", "surabaya", "kompas", "detik", "tribun", "liputan",
-    "tempo", "kumparan", "tvone", "inews", "trans7", "antv", "sctv", "netmediatama",
-    "narasi", "mojok", "asumsi", "tirto", "katadata", "idntimes", "gadgetin",
-    "fajrul", "ferry", "raditya", "radit", "malaka", "irwandi", "sumargo",
-    "corbuzier", "milyhya", "hapsah", "tretan", "choki", "pandji",
-}
-
-
-def classify_region(title: str, handle: str = "", country: str = "", default_lang: str = "") -> str:
-    cntry = (country or "").strip().upper()
-    lang = (default_lang or "").strip().lower()
-    if cntry == "ID":
-        return "Nasional"
-    if cntry:
-        return "Internasional"
-    # Indonesian metadata is a positive local signal. Another language alone
-    # does not prove the creator is outside Indonesia.
-    if lang == "id" or lang.startswith("id-"):
-        return "Nasional"
-    text = f"{title or ''} {handle or ''}".lower()
-    words = re.findall(r"[a-zA-Z0-9]+", text)
-    if any(w in ID_KEYWORDS for w in words):
-        return "Nasional"
-    h_low = (handle or "").lower()
-    if "_id" in h_low or ".id" in h_low or "indonesia" in text:
-        return "Nasional"
-    return "Belum diketahui"
-
 
 @contextmanager
 def get_conn() -> Iterator[sqlite3.Connection]:
@@ -114,14 +84,14 @@ def init_db() -> None:
             "ALTER TABLE channels ADD COLUMN yt_video_count INTEGER DEFAULT 0",
             "ALTER TABLE channels ADD COLUMN subscriber_count INTEGER DEFAULT 0",
             "ALTER TABLE channels ADD COLUMN watched_count INTEGER DEFAULT 0",
-            "ALTER TABLE channels ADD COLUMN region TEXT DEFAULT 'Belum diketahui'",
             "ALTER TABLE channels ADD COLUMN status TEXT DEFAULT 'subscribed'",
+            "ALTER TABLE channels ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE channels ADD COLUMN hidden_updated_at TEXT DEFAULT ''",
             "ALTER TABLE channels ADD COLUMN views_hp INTEGER DEFAULT 0",
             "ALTER TABLE channels ADD COLUMN views_laptop INTEGER DEFAULT 0",
             "ALTER TABLE channels ADD COLUMN views_total INTEGER GENERATED ALWAYS AS (COALESCE(views_hp, 0) + COALESCE(views_laptop, 0)) VIRTUAL",
             "ALTER TABLE channels ADD COLUMN updated_at TEXT DEFAULT ''",
             "ALTER TABLE videos ADD COLUMN duration_seconds INTEGER DEFAULT 0",
-            "ALTER TABLE videos ADD COLUMN region TEXT DEFAULT 'Belum diketahui'",
             "ALTER TABLE videos ADD COLUMN views_hp INTEGER DEFAULT 0",
             "ALTER TABLE videos ADD COLUMN views_laptop INTEGER DEFAULT 0",
             "ALTER TABLE videos ADD COLUMN views_total INTEGER GENERATED ALWAYS AS (COALESCE(views_hp, 0) + COALESCE(views_laptop, 0)) VIRTUAL",
@@ -132,15 +102,26 @@ def init_db() -> None:
             except sqlite3.OperationalError:
                 pass
 
+        for drop_sql in (
+            "DROP INDEX IF EXISTS idx_videos_region",
+            "DROP INDEX IF EXISTS idx_channels_region",
+            "ALTER TABLE channels DROP COLUMN region",
+            "ALTER TABLE videos DROP COLUMN region",
+        ):
+            try:
+                conn.execute(drop_sql)
+            except sqlite3.OperationalError:
+                pass
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_duration ON videos(duration_seconds)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_region ON videos(region)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_channels_region ON channels(region)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_channels_status ON channels(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_channels_hidden ON channels(is_hidden)")
 
         now_iso = datetime.now(timezone.utc).isoformat()
         conn.execute("UPDATE channels SET updated_at = ? WHERE updated_at IS NULL OR updated_at = ''", (now_iso,))
         conn.execute("UPDATE videos SET updated_at = ? WHERE updated_at IS NULL OR updated_at = ''", (now_iso,))
         conn.execute("UPDATE channels SET status = 'subscribed' WHERE status IS NULL OR status = ''")
+        conn.execute("UPDATE channels SET is_hidden = 0 WHERE is_hidden IS NULL")
         conn.execute("UPDATE channels SET views_laptop = watched_count WHERE watched_count > 0 AND views_laptop = 0 AND views_hp = 0")
 
         # Backfill duration_seconds untuk semua video yang sudah ada di database
@@ -173,8 +154,6 @@ def upsert_channel(
     thumbnail_url: str = "",
     uploads_playlist_id: str = "",
     source: str = "manual",
-    region: str = "",
-    country: str = "",
     status: str = "subscribed",
     force_subscribe: bool = False,
 ) -> None:
@@ -182,39 +161,35 @@ def upsert_channel(
         uploads_playlist_id = "UU" + channel_id[2:]
     elif not uploads_playlist_id:
         uploads_playlist_id = channel_id
-    if not region:
-        region = classify_region(title, handle, country=country)
     now_iso = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         if force_subscribe:
             conn.execute(
                 """
-                INSERT INTO channels(channel_id, title, handle, thumbnail_url, uploads_playlist_id, source, added_at, region, status, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'subscribed', ?)
+                INSERT INTO channels(channel_id, title, handle, thumbnail_url, uploads_playlist_id, source, added_at, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'subscribed', ?)
                 ON CONFLICT(channel_id) DO UPDATE SET
                     title=excluded.title,
                     handle=CASE WHEN excluded.handle != '' THEN excluded.handle ELSE channels.handle END,
                     thumbnail_url=CASE WHEN excluded.thumbnail_url != '' THEN excluded.thumbnail_url ELSE channels.thumbnail_url END,
                     uploads_playlist_id=excluded.uploads_playlist_id,
-                    region=CASE WHEN excluded.region != '' THEN excluded.region ELSE channels.region END,
                     status='subscribed',
                     updated_at=excluded.updated_at
                 """,
-                (channel_id, title, handle, thumbnail_url, uploads_playlist_id, source, now_iso, region, now_iso),
+                (channel_id, title, handle, thumbnail_url, uploads_playlist_id, source, now_iso, now_iso),
             )
         else:
             conn.execute(
                 """
-                INSERT INTO channels(channel_id, title, handle, thumbnail_url, uploads_playlist_id, source, added_at, region, status, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO channels(channel_id, title, handle, thumbnail_url, uploads_playlist_id, source, added_at, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel_id) DO UPDATE SET
                     title=excluded.title,
                     handle=CASE WHEN excluded.handle != '' THEN excluded.handle ELSE channels.handle END,
                     thumbnail_url=CASE WHEN excluded.thumbnail_url != '' THEN excluded.thumbnail_url ELSE channels.thumbnail_url END,
-                    uploads_playlist_id=excluded.uploads_playlist_id,
-                    region=CASE WHEN channels.region IS NULL OR channels.region = '' OR channels.region = 'Belum diketahui' THEN excluded.region ELSE channels.region END
+                    uploads_playlist_id=excluded.uploads_playlist_id
                 """,
-                (channel_id, title, handle, thumbnail_url, uploads_playlist_id, source, now_iso, region, status, now_iso),
+                (channel_id, title, handle, thumbnail_url, uploads_playlist_id, source, now_iso, status, now_iso),
             )
 
 
@@ -271,19 +246,15 @@ def subscribe_channel(channel_id: str) -> None:
         )
 
 
-def set_channel_region(channel_id: str, region: str) -> str:
-    reg = region if region in ("Nasional", "Internasional", "Belum diketahui") else "Belum diketahui"
+def set_channel_hidden(channel_id: str, hidden: bool) -> dict:
+    hidden_val = 1 if hidden else 0
     now_iso = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         conn.execute(
-            "UPDATE channels SET region = ?, updated_at = ? WHERE channel_id = ?",
-            (reg, now_iso, channel_id),
+            "UPDATE channels SET is_hidden = ?, hidden_updated_at = ? WHERE channel_id = ?",
+            (hidden_val, now_iso, channel_id),
         )
-        conn.execute(
-            "UPDATE videos SET region = ?, updated_at = ? WHERE channel_id = ?",
-            (reg, now_iso, channel_id),
-        )
-    return reg
+    return {"channel_id": channel_id, "is_hidden": hidden_val, "hidden_updated_at": now_iso}
 
 
 def clear_demo_data() -> None:
@@ -297,8 +268,7 @@ def upsert_videos(videos: list[dict]) -> int:
         return 0
     now_iso = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
-        ch_rows = conn.execute("SELECT channel_id, region, status FROM channels").fetchall()
-        ch_region_map = {r["channel_id"]: (r["region"] or "Belum diketahui") for r in ch_rows}
+        ch_rows = conn.execute("SELECT channel_id, status FROM channels").fetchall()
         unfollowed_set = {r["channel_id"] for r in ch_rows if r["status"] == "unfollowed"}
 
         filtered_videos = []
@@ -309,8 +279,6 @@ def upsert_videos(videos: list[dict]) -> int:
                 continue
             if "duration_seconds" not in v:
                 v["duration_seconds"] = duration_to_seconds(v.get("duration", ""))
-            if not v.get("region"):
-                v["region"] = ch_region_map.get(cid) or classify_region(v.get("channel_title", ""))
             if not v.get("updated_at"):
                 v["updated_at"] = now_iso
             filtered_videos.append(v)
@@ -324,11 +292,11 @@ def upsert_videos(videos: list[dict]) -> int:
             INSERT INTO videos(
                 video_id, channel_id, channel_title, channel_thumbnail,
                 title, thumbnail_url, published_at, view_count, like_count,
-                duration, duration_seconds, is_demo, region, updated_at
+                duration, duration_seconds, is_demo, updated_at
             ) VALUES (
                 :video_id, :channel_id, :channel_title, :channel_thumbnail,
                 :title, :thumbnail_url, :published_at, :view_count, :like_count,
-                :duration, :duration_seconds, :is_demo, :region, :updated_at
+                :duration, :duration_seconds, :is_demo, :updated_at
             )
             ON CONFLICT(video_id) DO UPDATE SET
                 title=excluded.title,
@@ -338,8 +306,7 @@ def upsert_videos(videos: list[dict]) -> int:
                 duration=excluded.duration,
                 duration_seconds=excluded.duration_seconds,
                 channel_title=excluded.channel_title,
-                channel_thumbnail=excluded.channel_thumbnail,
-                region=CASE WHEN excluded.region != 'Belum diketahui' THEN excluded.region ELSE videos.region END
+                channel_thumbnail=excluded.channel_thumbnail
             """,
             filtered_videos,
         )
@@ -416,14 +383,23 @@ def increment_channel_watched(channel_id: str, device: str = "laptop", video_id:
     return int(res.get("views_total", 0))
 
 
-def list_channels(region: str = "all", include_unfollowed: bool = False) -> list[dict]:
+def _apply_hide_filter_clause(clauses: list[str], col_expr: str, hide_filter: str) -> None:
+    norm = (hide_filter or "unhide").strip().lower()
+    if norm == "unhide":
+        clauses.append(f"COALESCE({col_expr}, 0) = 0")
+    elif norm == "hide":
+        clauses.append(f"COALESCE({col_expr}, 0) = 1")
+
+
+def list_channels(
+    include_unfollowed: bool = False,
+    hide_filter: str = "both",
+) -> list[dict]:
     clauses = ["1=1"]
     params: list = []
     if not include_unfollowed:
         clauses.append("COALESCE(c.status, 'subscribed') != 'unfollowed'")
-    if region in ("Nasional", "Internasional", "Belum diketahui"):
-        clauses.append("COALESCE(c.region, 'Belum diketahui') = ?")
-        params.append(region)
+    _apply_hide_filter_clause(clauses, "c.is_hidden", hide_filter)
     where_sql = " AND ".join(clauses)
     with get_conn() as conn:
         rows = conn.execute(
@@ -433,8 +409,9 @@ def list_channels(region: str = "all", include_unfollowed: bool = False) -> list
                    COALESCE(c.views_laptop, 0) AS views_laptop,
                    COALESCE(c.views_total, c.watched_count, 0) AS views_total,
                    COALESCE(c.views_total, c.watched_count, 0) AS watched_count,
-                   COALESCE(c.region, 'Belum diketahui') AS region,
                    COALESCE(c.status, 'subscribed') AS status,
+                   COALESCE(c.is_hidden, 0) AS is_hidden,
+                   COALESCE(c.hidden_updated_at, '') AS hidden_updated_at,
                    COUNT(v.video_id) AS synced_video_count,
                    CASE WHEN c.yt_video_count > COUNT(v.video_id) THEN c.yt_video_count ELSE COUNT(v.video_id) END AS video_count
             FROM channels c
@@ -519,6 +496,16 @@ def period_bounds(period: str, now: datetime | None = None) -> tuple[str | None,
     if period == "year":
         start_local = local_now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
         return start_local.astimezone(timezone.utc).strftime(fmt), None
+    if period.endswith("d") and period[:-1].isdigit():
+        days = int(period[:-1])
+        if days >= 1:
+            today_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_local = today_local - timedelta(days=days)
+            end_local = today_local - timedelta(days=days - 1)
+            return (
+                start_local.astimezone(timezone.utc).strftime(fmt),
+                end_local.astimezone(timezone.utc).strftime(fmt),
+            )
     if period.endswith("y") and period[:-1].isdigit():
         years = int(period[:-1])
         if years >= 1:
@@ -533,8 +520,8 @@ def query_videos(
     period: str = "all",
     channel_id: str = "",
     q: str = "",
-    region: str = "all",
-    limit: int = 25,
+    hide_filter: str = "unhide",
+    limit: int = 50,
     page: int = 1,
     min_minutes: int = 0,
     max_minutes: int = 120,
@@ -542,7 +529,7 @@ def query_videos(
     start_at: str = "",
     end_at: str = "",
 ) -> dict:
-    limit = limit if limit in (25, 50, 100) else 25
+    limit = limit if limit in (25, 50, 100) else 50
     page = max(1, page)
     offset = (page - 1) * limit
 
@@ -577,9 +564,11 @@ def query_videos(
     if channel_id:
         clauses.append("videos.channel_id = ?")
         params.append(channel_id)
-    if region in ("Nasional", "Internasional", "Belum diketahui"):
-        clauses.append("COALESCE(videos.region, 'Belum diketahui') = ?")
-        params.append(region)
+    norm_hide = (hide_filter or "unhide").strip().lower()
+    if norm_hide == "unhide":
+        clauses.append("videos.channel_id NOT IN (SELECT channel_id FROM channels WHERE COALESCE(is_hidden, 0) = 1)")
+    elif norm_hide == "hide":
+        clauses.append("videos.channel_id IN (SELECT channel_id FROM channels WHERE COALESCE(is_hidden, 0) = 1)")
     if min_minutes > 0:
         clauses.append("videos.duration_seconds >= ?")
         params.append(min_minutes * 60)
@@ -600,7 +589,7 @@ def query_videos(
                    COALESCE(videos.views_hp, 0) AS views_hp,
                    COALESCE(videos.views_laptop, 0) AS views_laptop,
                    COALESCE(videos.views_total, 0) AS views_total,
-                   COALESCE(videos.region, 'Belum diketahui') AS region,
+                   COALESCE((SELECT c.is_hidden FROM channels c WHERE c.channel_id = videos.channel_id), 0) AS channel_is_hidden,
                    COALESCE((SELECT c.views_hp FROM channels c WHERE c.channel_id = videos.channel_id), 0) AS channel_views_hp,
                    COALESCE((SELECT c.views_laptop FROM channels c WHERE c.channel_id = videos.channel_id), 0) AS channel_views_laptop,
                    COALESCE((SELECT c.views_total FROM channels c WHERE c.channel_id = videos.channel_id), 0) AS watched_count
@@ -702,9 +691,9 @@ def sync_device_data(payload: dict) -> dict:
             if cur.rowcount > 0:
                 updated_videos_count += 1
 
-        # 2. Rekonsiliasi Tabel Channels / Creators (views_hp, views_laptop, status unfollowed/subscribed via updated_at)
+        # 2. Rekonsiliasi Tabel Channels / Creators (views_hp, views_laptop, status via updated_at, is_hidden via hidden_updated_at)
         local_ch_rows = conn.execute(
-            "SELECT channel_id, status, region, COALESCE(views_hp, 0) AS views_hp, COALESCE(views_laptop, 0) AS views_laptop, COALESCE(updated_at, '') AS updated_at FROM channels"
+            "SELECT channel_id, status, COALESCE(is_hidden, 0) AS is_hidden, COALESCE(hidden_updated_at, '') AS hidden_updated_at, COALESCE(views_hp, 0) AS views_hp, COALESCE(views_laptop, 0) AS views_laptop, COALESCE(updated_at, '') AS updated_at FROM channels"
         ).fetchall()
         local_ch_map = {r["channel_id"]: dict(r) for r in local_ch_rows}
 
@@ -716,8 +705,11 @@ def sync_device_data(payload: dict) -> dict:
             c_hp = _safe_nonneg_int(c.get("views_hp", 0))
             c_laptop = _safe_nonneg_int(c.get("views_laptop", 0))
             c_status = str(c.get("status", "subscribed") or "subscribed")
-            c_region = str(c.get("region", "") or "")
+            has_hidden_field = "is_hidden" in c
+            c_is_hidden = 1 if str(c.get("is_hidden", 0)).lower() in ("1", "true") else 0
             c_upd = str(c.get("updated_at", "") or "")
+            has_hid_ts_key = "hidden_updated_at" in c
+            c_hid_upd = str(c.get("hidden_updated_at", "") or "").strip()
 
             existing = local_ch_map.get(cid)
             if existing:
@@ -725,15 +717,22 @@ def sync_device_data(payload: dict) -> dict:
                 new_laptop = max(_safe_nonneg_int(existing["views_laptop"]), c_laptop) if incoming_device in ("laptop", "bundle") else _safe_nonneg_int(existing["views_laptop"])
                 new_status = existing["status"] or "subscribed"
                 new_upd = existing["updated_at"] or ""
-                new_region = existing["region"] or "Belum diketahui"
+                new_hidden = 1 if _safe_nonneg_int(existing.get("is_hidden", 0)) > 0 else 0
+                new_hid_upd = str(existing.get("hidden_updated_at", "") or "").strip()
 
-                # Gunakan timestamp updated_at terbaru untuk rekonsiliasi status unfollowed vs subscribed
+                # Gunakan timestamp updated_at terbaru untuk rekonsiliasi status unfollowed/subscribed
                 if _is_newer_or_equal_ts(c_upd, new_upd):
                     if c_status in ("subscribed", "unfollowed"):
                         new_status = c_status
                     new_upd = c_upd
-                    if c_region in ("Nasional", "Internasional", "Belum diketahui"):
-                        new_region = c_region
+
+                # Rekonsiliasi is_hidden memakai hidden_updated_at khusus agar nonton video tidak menimpa Hide/Unhide
+                if has_hidden_field:
+                    eff_in_hid = c_hid_upd if has_hid_ts_key else c_upd
+                    eff_ex_hid = new_hid_upd if has_hid_ts_key else (new_hid_upd or new_upd)
+                    if _is_newer_or_equal_ts(eff_in_hid, eff_ex_hid):
+                        new_hidden = c_is_hidden
+                        new_hid_upd = eff_in_hid
 
                 conn.execute(
                     """
@@ -742,11 +741,12 @@ def sync_device_data(payload: dict) -> dict:
                         views_laptop = ?,
                         watched_count = ? + ?,
                         status = ?,
-                        region = ?,
+                        is_hidden = ?,
+                        hidden_updated_at = ?,
                         updated_at = ?
                     WHERE channel_id = ?
                     """,
-                    (new_hp, new_laptop, new_hp, new_laptop, new_status, new_region, new_upd or now_iso, cid),
+                    (new_hp, new_laptop, new_hp, new_laptop, new_status, new_hidden, new_hid_upd, new_upd or now_iso, cid),
                 )
                 if new_status == "unfollowed":
                     conn.execute("DELETE FROM videos WHERE channel_id = ?", (cid,))
@@ -754,13 +754,12 @@ def sync_device_data(payload: dict) -> dict:
             else:
                 # Creator baru dari perangkat lain: tambahkan jika tidak unfollowed (atau simpan tombstone jika unfollowed)
                 uploads_pid = "UU" + cid[2:] if cid.startswith("UC") else cid
-                reg = c_region if c_region in ("Nasional", "Internasional", "Belum diketahui") else classify_region(c_title)
                 conn.execute(
                     """
                     INSERT INTO channels(
                         channel_id, title, handle, thumbnail_url, uploads_playlist_id,
-                        source, added_at, region, status, views_hp, views_laptop, watched_count, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'sync', ?, ?, ?, ?, ?, ?, ?)
+                        source, added_at, status, is_hidden, hidden_updated_at, views_hp, views_laptop, watched_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'sync', ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         cid,
@@ -769,8 +768,9 @@ def sync_device_data(payload: dict) -> dict:
                         str(c.get("thumbnail_url", "")),
                         uploads_pid,
                         now_iso,
-                        reg,
                         c_status if c_status in ("subscribed", "unfollowed") else "subscribed",
+                        c_is_hidden,
+                        c_hid_upd,
                         c_hp,
                         c_laptop,
                         c_hp + c_laptop,
@@ -784,7 +784,7 @@ def sync_device_data(payload: dict) -> dict:
             dict(r)
             for r in conn.execute(
                 """
-                SELECT video_id, channel_id, region,
+                SELECT video_id, channel_id,
                        COALESCE(views_hp, 0) AS views_hp,
                        COALESCE(views_laptop, 0) AS views_laptop,
                        COALESCE(views_total, 0) AS views_total,
@@ -799,8 +799,9 @@ def sync_device_data(payload: dict) -> dict:
             for r in conn.execute(
                 """
                 SELECT channel_id, title, handle, thumbnail_url, uploads_playlist_id,
-                       COALESCE(region, 'Belum diketahui') AS region,
                        COALESCE(status, 'subscribed') AS status,
+                       COALESCE(is_hidden, 0) AS is_hidden,
+                       COALESCE(hidden_updated_at, '') AS hidden_updated_at,
                        COALESCE(views_hp, 0) AS views_hp,
                        COALESCE(views_laptop, 0) AS views_laptop,
                        COALESCE(views_total, 0) AS views_total,

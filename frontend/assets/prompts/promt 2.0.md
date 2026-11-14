@@ -1,113 +1,60 @@
 <aside>
 💡
 
-# MASTER PROMPT 2.0: TRANSFORMASI NASKAH & REKONSTRUKSI MODULAR DINAMIS
+TUGAS:
+Tulis ulang secara lengkap dan terstruktur seluruh isi pembicaraan dari teks transkrip di bawah ke dalam dua komponen utama yang SAMA-SAMA LENGKAP:
 
-_(Panduan Standar Penulisan Modul Pengetahuan Berbobot Tinggi, Luwes, dan Bebas Redundansi)_
+1. **Teks Paragraf Lengkap (Penulisan Ulang Utuh)** yang mengalir dari awal sampai akhir.
+2. **Poin-Poin Penting Terstruktur** yang sangat detail dan mendalam (lengkap dengan sub-poin seperti Definisi, Mekanisme, Konteks/Alasan, Studi Kasus, Analogi, Aturan/Batasan, dan Dampak/Kesimpulan).
 
----
+Ambil SEMUA informasi dan perkataan penting dari pembicara — jangan sampai ada yang kelewatan, dipotong, atau diringkas! JANGAN membatasi jumlah kalimat, kata, atau baris! Jangan pernah mengurangi isi di bagian Poin-Poin Penting meskipun sudah ditulis di bagian Paragraf (keduanya harus sama-sama utuh dan detail). Tulis dalam bahasa Indonesia yang rapi. Istilah teknis, ungkapan khas, dan angka tetap dipertahankan seperti di teks sumber.
 
-## 🎯 TUJUAN & FILOSOFI PENULISAN
+PRIORITAS (wajib masuk semua tanpa dipotong di Paragraf maupun di Poin-Poin Penting):
 
-Tulis ulang secara komprehensif, mengalir, dan mendalam seluruh materi dari naskah sumber ke dalam **seri modul Markdown (`.md`) yang mandiri, kaya wawasan, dan nyaman dibaca**.
+1. Seluruh alur pembicaraan yang disampaikan pembicara ditulis ulang menjadi paragraf narasi yang utuh dan mengalir sesuai urutan aslinya.
+2. Klaim/argumen utama + seluruh alasannya secara lengkap.
+3. Definisi konsep kunci beserta penjelasan mekanisme dan detailnya.
+4. Langkah, prosedur, atau prinsip yang dijelaskan secara berurutan.
+5. Angka + satuan + konteksnya secara lengkap (jangan angka telanjang).
+6. Aturan, kondisi, pengecualian, batasan, serta dampak positif/negatif.
+7. Semua contoh, studi kasus, ilustrasi dialog, cerita pengalaman, dan analogi yang dipakai pembicara untuk menjelaskan konsep — tulis lengkap beserta konteks dan konsep yang dijelaskan.
+8. Nama tokoh, buku, teori, metode, istilah teknis.
+9. Kesimpulan atau penutup penting.
 
-Pendekatan ini berpegang pada dua prinsip utama:
+BOLEH DIBERSIHKAN (hanya filler murni):
 
-1. **Zero Information Loss (Substansi 100% Utuh)**: Seluruh argumen inti, mekanisme konsep, studi kasus nyata, nama tokoh, kutipan penting, angka/data, prosedur, dan analogi dipertahankan secara penuh tanpa pemotongan substansi.
-2. **Gaya Penulisan Luwes & Mengalir (Tidak Kaku/Robotik)**: Bahasa yang digunakan adalah bahasa Indonesia modern yang anggun, intelektual, dan mudah dipahami, dengan ritme membaca yang hidup layaknya membaca buku terbitan berkualitas tinggi.
+- Pengulangan kata gagap/identik akibat transkripsi suara yang patah-patah (dirapikan menjadi kalimat yang enak dibaca tanpa mengurangi isi).
+- Gumaman atau transisi kosong murni yang tidak membawa arti.
 
----
+CARA MENGAMBIL KEPUTUSAN:
 
-## 📐 PRINSIP MODULARITAS DINAMIS & FLEKSIBEL (ANTI-KUOTA KAKU)
+- JANGAN membatasi jumlah kata, kalimat, atau baris.
+- JANGAN meringkas atau memotong Poin-Poin Penting dengan alasan sudah tertulis di Teks Paragraf Lengkap. Baik bagian Paragraf maupun bagian Poin-Poin Penting wajib memuat 100% informasi penting secara mandiri dan mendalam.
+- Kalau sebuah kalimat, rincian, atau contoh dari data mentah (raw) mendukung penjelasan, cerita, atau gaya penyampaian pembicara → MASUKKAN SEMUA secara utuh ke dalam paragraf dan poin-poin.
+- Semua yang dibicarakan oleh pembicara ditulis ulang sesuai urutan pembahasannya secara kronologis dari awal sampai akhir.
 
-> [!IMPORTANT]
->
-> **Jumlah modul TIDAK PERNAH dipatok pada angka tertentu (misalnya dilarang memaksakan harus selalu 10 modul).**
->
-> Penentuan jumlah modul harus lahir secara **organik dan alami** dari arsitektur naskah aslinya.
+ATURAN KESETIAAN:
 
-### Pedoman Pembagian Modul:
+1. Hanya dari teks sumber. Tanpa pengetahuan luar, tanpa mengoreksi istilah/angka, tanpa menebak.
+2. Istilah janggal/ambigu akibat transkripsi dipertahankan apa adanya; beri tanda (?) jika memengaruhi makna, dan beri penjelasan konteks di bagian Catatan.
+3. Pertahankan tingkat kepastian dan atribusi: "mungkin/bisa/sering/disebut" jangan diubah jadi "pasti/selalu/terbukti". Klaim pembicara tetap ditulis sebagai klaimnya.
+4. Jangan membuat hubungan sebab-akibat yang tidak dinyatakan teks.
+5. Pertahankan negasi ("tidak", "bukan"), kondisi, dan pengecualian.
+6. Angka selalu ditulis bersama satuan, objek, dan konteks.
+7. Contoh/analogi ditulis lengkap bersama konsep yang dijelaskan; analogi bukan fakta literal.
+8. Pertahankan urutan pembahasan secara kronologis dari awal hingga akhir teks, termasuk urutan prosedur dan kontras (A vs B).
+9. Jangan menambah interpretasi atau kesimpulan sendiri di luar teks.
 
-- **Rentang Bebas & Wajar**: Bebas menentukan berapa pun jumlah modul antara **2 hingga 30 modul** (misalnya: 5, 7, 8, 9, 11, 13, 14, 16 modul, dll.).
-- **Logika Tematik & Keseimbangan Bobot**:
-  - Bab yang sangat panjang, padat teori, atau memiliki bobot krusial dapat berdiri sendiri menjadi **1 modul tunggal**.
-  - Bab-bab yang lebih ringkas namun saling melengkapi dan memiliki benang merah yang sama dapat disatukan secara harmonis ke dalam **1 modul tematik** (misal: menggabungkan 2–3 bab terkait).
-- **Kenyamanan Membaca Pembaca**: Modul dirancang agar tidak terlalu gemuk (membosankan dibaca) dan tidak terlalu pendek/tercecer (terfragmentasi). Pembaca harus mendapatkan pemahaman yang tuntas dan utuh di setiap modul.
+FORMAT OUTPUT (Setiap Bagian/Sub-Bab Wajib Memuat):
 
----
-
-## 🏛️ ARSITEKTUR ISI SETIAP MODUL (STRUKTUR 5 PILAR ADAPTIF)
-
-Setiap file modul disusun dengan struktur 5 bagian yang rapi, dengan kedalaman yang disesuaikan secara cerdas dengan sifat konten buku:
-
-### 1. Banner & Navigasi Modul
-
-- Identitas modul, judul tematik, serta daftar bab atau rentang halaman naskah sumber yang dicakup.
-
-### 2. Teks Narasi Lengkap (Penulisan Ulang Utuh & Mengalir)
-
-- Rekonstruksi naratif penuh dari awal hingga akhir pembahasan bab terkait.
-- Disajikan dalam bentuk paragraf-paragraf yang utuh, dinamis, dan terhubung secara logis tanpa loncatan gagasan.
-- Menghidupkan kembali cerita, latar belakang sejarah, dinamika tokoh, dan argumen penulis dengan gaya tutur yang enak dibaca.
-- Tidak ada batasan jumlah kata atau kalimat—tuliskan selengkap mungkin agar pemahaman mendasar terbangun kokoh.
-
-### 3. Poin-Poin Analisis Mendalam & Terstruktur
-
-- Dekonstruksi sistematis dari setiap konsep dan hukum yang dibahas, disajikan secara berurutan dan terperinci.
-- Setiap poin dibedah menggunakan elemen-elemen esensial yang relevan:
-  - **Definisi & Konsep Kunci**: Penjelasan lugas tentang esensi ide.
-  - **Mekanisme Kerja / Psikologis / Teknis**: Bagaimana konsep tersebut beroperasi di dunia nyata.
-  - **Konteks & Landasan Alasan**: Mengapa prinsip ini berhasil atau gagal.
-  - **Studi Kasus & Fakta Historis Riil**: Cerita nyata, nama tokoh, situasi konkret, dan hasil akhirnya.
-  - **Analogi & Metafora**: Perumpamaan yang digunakan untuk memudahkan pemahaman.
-  - **Aturan Emas / Batasan / Pengecualian**: Syarat keberhasilan dan hal-hal yang pantang dilanggar.
-  - **Dampak & Implikasi Nyata**: Hasil jangka panjang dari penerapan atau pengabaian prinsip.
-
-### 4. Prosedur, Visualisasi Alur, & Diagram Logika
-
-- **Diagram Alir Mermaid (`mermaid`)**: Representasi visual dari alur keputusan, siklus kebiasaan, peta pikiran, atau proses interaksi yang dibahas.
-- **Protokol / Tahapan Aksi Langkah demi Langkah**: Panduan tindakan praktis yang berurutan, jelas, dan dapat langsung dipraktikkan oleh pembaca.
-
-### 5. Toolkit Aksi, Template Siap Pakai, & Glosarium
-
-- **Database Template / Skrip / Lembar Kerja**:
-  - Disesuaikan dengan topik buku (misal: formula skrip diplomasi & negosiasi untuk komunikasi; rumus & kriteria screening untuk saham/investasi; lembar habit stacking & scorecard untuk kebiasaan).
-- **Glosarium & Catatan Konteks**:
-  - Definisi istilah teknis (Bahasa Indonesia & padanan bahasa aslinya).
-  - Catatan penjelasan jika terdapat istilah transkripsi/OCR yang ambigu.
-
----
-
-## ⚖️ PROTOKOL INTEGRITAS INFORMASI (FIDELITAS DATA)
-
-1. **Kebenaran Naskah Sumber**: Seluruh data, angka, nama tokoh, dialog, dan kutipan bersumber langsung dari naskah asli tanpa mengarang bebas.
-2. **Atribusi Presisi**: Pertahankan nuansa kepastian dari naskah (klaim penulis tetap disajikan sebagai argumen penulis, fakta empiris disajikan dengan data pendukungnya).
-3. **Pembersihan Bersih (Clean Sanity)**:
-   - Bersihkan murni cacat teknis OCR/audio: kata berulang akibat gagap/glitch scanner, nomor halaman acak di tengah kalimat, atau teks tabel yang hancur.
-   - Dilarang meninggalkan catatan internal pemalas seperti `TODO`, `[akan diisi]`, atau `[ringkasan singkat]`.
-
----
-
-## 🔍 PROTOKOL DOUBLE-CHECK (VERIFIKASI BERLAPIS)
-
-Sebelum sebuah proyek modul dinyatakan selesai, wajib melalui 2 pintu verifikasi:
-
-1. **Audit Fisik & Kelengkapan Konten**:
-   - Memastikan seluruh modul telah ditulis tuntas ke file fisik di disk (bukan sekadar draft memori).
-   - Memastikan seluruh 5 pilar struktur ada dan terisi dengan bobot yang tebal dan substantif.
-2. **Rekonsiliasi Daftar Isi (TOC Coverage Match)**:
-   - Membandingkan daftar bab buku asli dengan isi seluruh modul untuk menjamin **100% materi terwadahi** tanpa ada satu sub-bab pun yang tertinggal.
-
-bikin ke md yah jadi beberapa gitu yah jadi zip apakah bisa
-
-# Informasi tambahan yang tersirat dalam teks (OPSIONAL, pisahkan dari hasil utama, dan WAJIB tetap berbasis kutipan jika digunakan)
+- **Teks Paragraf Lengkap (Penulisan Ulang Utuh)**: Tulis ulang seluruh isi pembicaraan pembicara dari awal sampai akhir pada bagian tersebut menjadi paragraf-paragraf narasi yang utuh, mengalir, dan lengkap (tanpa batasan jumlah kalimat).
+- **Poin-Poin Penting**: Ikuti urutan teks secara kronologis dan jabarkan setiap poin penting secara **sangat lengkap, mendalam, dan terstruktur** menggunakan sub-poin yang jelas (misalnya: _Definisi, Mekanisme, Alasan/Konteks, Studi Kasus Lengkap, Analogi, Aturan/Kondisi, Dampak/Degradasi Efektivitas_, dll.) tanpa batasan jumlah baris dan tanpa mengurangi rincian sedikit pun.
+- **Prosedur/Langkah**: Jika ada langkah-langkah atau tahapan praktis, tulis bernomor secara lengkap beserta penjelasan dan contoh di tiap langkahnya.
+- **Catatan**: Bagian ambigu/janggal/salah dengar transkripsi di sumber beserta konteksnya.
 
 Teks:
-
 """
-
-Teks disini
-
+[tempel seluruh teks dari awal sampai akhir]
 """
 
 </aside>
