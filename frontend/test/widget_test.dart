@@ -1445,20 +1445,43 @@ void main() {
           expect(find.byKey(const Key('search_creator_card_UC_ferry')), findsOneWidget);
           expect(find.text('Subscribed'), findsOneWidget);
 
-          // 3. Open 3-dot Creator Menu -> Reload & Custom Date Range
+          // 3. Open 3-dot Creator Menu -> Custom Date Range, Unsubscribe, Hide (no Reload Data Channel)
           await tester.tap(find.byKey(const Key('creator_menu_btn_UC_ferry')));
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 300));
-          expect(find.text('Reload Data Channel'), findsOneWidget);
+          expect(find.text('Reload Data Channel'), findsNothing);
           expect(find.text('Atur Tanggal & Batas Video'), findsOneWidget);
           expect(find.text('Unsubscribe "Ferry Irwandi"'), findsOneWidget);
           expect(find.text('Hide "Ferry Irwandi"'), findsOneWidget);
 
-          // 4. Open Custom Date Range modal -> submit Reload (100 video)
+          // 4. Open Custom Date Range modal -> check years (1, 5, 10, X Tahun) & limits (10..10000)
           await tester.tap(find.text('Atur Tanggal & Batas Video'));
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 300));
           expect(find.byKey(const Key('creator_range_picker_btn_UC_ferry')), findsOneWidget);
+          expect(find.text('1 Bulan Ini'), findsNothing);
+          expect(find.text('6 Bulan'), findsNothing);
+          expect(find.text('1 Tahun'), findsOneWidget);
+          expect(find.text('5 Tahun'), findsOneWidget);
+          expect(find.text('10 Tahun'), findsOneWidget);
+          expect(find.byKey(const Key('tahun_lalu_box')), findsOneWidget);
+
+          // Test custom X year box
+          await tester.enterText(find.byKey(const Key('tahun_lalu_input')), '3');
+          await tester.pump();
+          final expectedStartYear = '${DateTime.now().year - 3}-';
+          expect(find.textContaining(expectedStartYear), findsOneWidget);
+
+          // Check video caps: 10, 500, 1000, 5000, 10000
+          expect(find.text('10 video'), findsOneWidget);
+          expect(find.text('500 video'), findsOneWidget);
+          expect(find.text('1000 video'), findsOneWidget);
+          expect(find.text('5000 video'), findsOneWidget);
+          expect(find.text('10000 video'), findsOneWidget);
+          await tester.tap(find.text('5000 video'));
+          await tester.pump();
+          expect(find.text('Reload (5000 video)'), findsOneWidget);
+
           await tester.tap(find.byKey(const Key('creator_range_submit_btn_UC_ferry')));
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 300));

@@ -377,7 +377,7 @@ def sync_channel_videos(
     if not uploads_pid:
         return 0
 
-    max_videos = max(1, min(int(max_videos or 100), 500))
+    max_videos = max(1, min(int(max_videos or 100), 10000))
     start_dt = _parse_sync_bound(start_date, is_end=False)
     end_dt = _parse_sync_bound(end_date, is_end=True)
     if start_dt and end_dt and start_dt > end_dt:
@@ -387,7 +387,7 @@ def sync_channel_videos(
     video_ids: list[str] = []
     page_token = None
     pages_scanned = 0
-    max_pages = 80 if (start_dt is not None or end_dt is not None) else 20
+    max_pages = 250 if (start_dt is not None or end_dt is not None or max_videos > 1000) else 25
     with db.get_conn() as conn:
         existing_live_ids = {
             r["video_id"]

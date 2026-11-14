@@ -2165,9 +2165,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       endDt = tmp;
     }
 
-    final effMax = maxVideos.clamp(1, 500);
+    final effMax = maxVideos.clamp(1, 10000);
     final hasRange = startDt != null || endDt != null;
-    final maxPages = hasRange ? 60 : ((effMax / 50).ceil()).clamp(1, 10);
+    final maxPages = hasRange
+        ? 250
+        : ((effMax / 50).ceil()).clamp(1, 200);
 
     final videoIds = <String>[];
     String? pageToken;
@@ -2322,7 +2324,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                 'max_videos': maxVideos,
               }),
             )
-            .timeout(const Duration(seconds: 60));
+            .timeout(const Duration(minutes: 5));
         if (res.statusCode != 200) {
           final err = jsonDecode(res.body);
           throw Exception(err['detail'] ?? 'Gagal memuat ulang data channel');
@@ -2370,151 +2372,268 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     if (cid.isEmpty) return;
 
     final now = DateTime.now();
-    DateTime pickedStart = DateTime(now.year, now.month, now.day).subtract(
-      const Duration(days: 30),
-    );
-    DateTime pickedEnd = DateTime(now.year, now.month, now.day);
-    int selectedMax = 100;
+    final today = DateTime(now.year, now.month, now.day);
+    DateTime yearsAgoDate(int years) {
+      final y = (today.year - years).clamp(1995, today.year);
+      final maxD = DateTime(y, today.month + 1, 0).day;
+      return DateTime(y, today.month, today.day > maxD ? maxD : today.day);
+    }
+
+    DateTime pickedStart = yearsAgoDate(1);
+    DateTime pickedEnd = today;
+    int? selectedYearsPreset = 1;
+    bool isCustomYear = false;
+    int selectedMax = 500;
+    final yearCtrl = TextEditingController();
+    final yearFocus = FocusNode();
 
     String fmtYmd(DateTime d) =>
         '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (dlgCtx) => StatefulBuilder(
-        builder: (ctx, setDlgState) {
-          return AlertDialog(
-            backgroundColor: const Color(0xFF1F1F1F),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(14),
-            ),
-            title: Text(
-              'Atur Tanggal & Batas — $title',
-              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
-            ),
-            content: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Rentang Tanggal Upload (Hari / Bulan / Tahun):',
-                    style: TextStyle(fontSize: 12.5, color: Colors.white70),
-                  ),
-                  const SizedBox(height: 8),
-                  OutlinedButton.icon(
-                    key: Key('creator_range_picker_btn_$cid'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.white,
-                      side: const BorderSide(color: Color(0xFF3EA6FF)),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 10,
-                      ),
-                    ),
-                    icon: const Icon(Icons.date_range, size: 18),
-                    label: Text('${fmtYmd(pickedStart)}  s/d  ${fmtYmd(pickedEnd)}'),
-                    onPressed: () async {
-                      final res = await showDialog<(DateTime, DateTime?)>(
-                        context: ctx,
-                        builder: (_) => _CustomCalendarDialog(
-                          isRange: true,
-                          initialRangeStart: pickedStart,
-                          initialRangeEnd: pickedEnd,
-                        ),
-                      );
-                      if (res != null && res.$2 != null) {
-                        setDlgState(() {
-                          pickedStart = res.$1;
-                          pickedEnd = res.$2!;
-                        });
-                      }
-                    },
-                  ),
-                  const SizedBox(height: 8),
-                  Wrap(
-                    spacing: 6,
-                    runSpacing: 6,
-                    children: [
-                      ActionChip(
-                        label: const Text('1 Bulan Ini'),
-                        onPressed: () {
-                          final t = DateTime(now.year, now.month, now.day);
-                          setDlgState(() {
-                            pickedStart = t.subtract(const Duration(days: 30));
-                            pickedEnd = t;
-                          });
-                        },
-                      ),
-                      ActionChip(
-                        label: const Text('6 Bulan'),
-                        onPressed: () {
-                          final t = DateTime(now.year, now.month, now.day);
-                          setDlgState(() {
-                            pickedStart = t.subtract(const Duration(days: 180));
-                            pickedEnd = t;
-                          });
-                        },
-                      ),
-                      ActionChip(
-                        label: const Text('1 Tahun'),
-                        onPressed: () {
-                          final t = DateTime(now.year, now.month, now.day);
-                          setDlgState(() {
-                            pickedStart = t.subtract(const Duration(days: 365));
-                            pickedEnd = t;
-                          });
-                        },
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 14),
-                  const Text(
-                    'Maksimal Video Diambil:',
-                    style: TextStyle(fontSize: 12.5, color: Colors.white70),
-                  ),
-                  const SizedBox(height: 6),
-                  Wrap(
-                    spacing: 8,
-                    children: [25, 50, 100, 200]
-                        .map(
-                          (cap) => ChoiceChip(
-                            label: Text('$cap video'),
-                            selected: selectedMax == cap,
-                            selectedColor: const Color(0xFFFF0033),
-                            onSelected: (_) => setDlgState(() {
-                              selectedMax = cap;
-                            }),
-                          ),
-                        )
-                        .toList(),
-                  ),
-                  const SizedBox(height: 12),
-                  const Text(
-                    'Video lama yang sudah tersimpan tidak akan dihapus (kecuali jika channel di-Unsubscribe).',
-                    style: TextStyle(fontSize: 11.5, color: Color(0xFF81C784)),
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(dlgCtx).pop(false),
-                child: const Text('Batal'),
-              ),
-              ElevatedButton.icon(
-                key: Key('creator_range_submit_btn_$cid'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFFFF0033),
-                  foregroundColor: Colors.white,
-                ),
-                icon: const Icon(Icons.download_rounded, size: 18),
-                label: Text('Reload ($selectedMax video)'),
-                onPressed: () => Navigator.of(dlgCtx).pop(true),
-              ),
-            ],
-          );
+      builder: (dlgCtx) => _DisposeOnUnmount(
+        onDispose: () {
+          yearCtrl.dispose();
+          yearFocus.dispose();
         },
+        child: StatefulBuilder(
+          builder: (ctx, setDlgState) {
+            return AlertDialog(
+              backgroundColor: const Color(0xFF1F1F1F),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+              ),
+              title: Text(
+                'Atur Tanggal & Batas — $title',
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Rentang Tanggal Upload (Hari / Bulan / Tahun):',
+                      style: TextStyle(fontSize: 12.5, color: Colors.white70),
+                    ),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      key: Key('creator_range_picker_btn_$cid'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.white,
+                        side: const BorderSide(color: Color(0xFF3EA6FF)),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                      ),
+                      icon: const Icon(Icons.date_range, size: 18),
+                      label: Text(
+                        '${fmtYmd(pickedStart)}  s/d  ${fmtYmd(pickedEnd)}',
+                      ),
+                      onPressed: () async {
+                        yearFocus.unfocus();
+                        final res = await showDialog<(DateTime, DateTime?)>(
+                          context: ctx,
+                          builder: (_) => _CustomCalendarDialog(
+                            isRange: true,
+                            initialRangeStart: pickedStart,
+                            initialRangeEnd: pickedEnd,
+                          ),
+                        );
+                        if (res != null && res.$2 != null) {
+                          setDlgState(() {
+                            pickedStart = res.$1;
+                            pickedEnd = res.$2!;
+                            selectedYearsPreset = null;
+                            isCustomYear = false;
+                            yearCtrl.clear();
+                          });
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        for (final yr in [1, 5, 10])
+                          ChoiceChip(
+                            label: Text('$yr Tahun'),
+                            selected:
+                                !isCustomYear && selectedYearsPreset == yr,
+                            selectedColor: Colors.white,
+                            labelStyle: TextStyle(
+                              color:
+                                  (!isCustomYear && selectedYearsPreset == yr)
+                                  ? Colors.black
+                                  : Colors.white,
+                              fontWeight: FontWeight.w600,
+                            ),
+                            onSelected: (_) {
+                              yearFocus.unfocus();
+                              setDlgState(() {
+                                selectedYearsPreset = yr;
+                                isCustomYear = false;
+                                yearCtrl.clear();
+                                pickedStart = yearsAgoDate(yr);
+                                pickedEnd = today;
+                              });
+                            },
+                          ),
+                        GestureDetector(
+                          onTap: () => yearFocus.requestFocus(),
+                          child: Container(
+                            key: const Key('tahun_lalu_box'),
+                            height: 36,
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                            decoration: BoxDecoration(
+                              color: isCustomYear
+                                  ? Colors.white
+                                  : const Color(0xFF2C2C2C),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: isCustomYear
+                                    ? Colors.white
+                                    : const Color(0xFF444444),
+                                width: 1.0,
+                              ),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.center,
+                              children: [
+                                SizedBox(
+                                  width: isCustomYear ? 19 : 0,
+                                  child: isCustomYear
+                                      ? const Padding(
+                                          padding: EdgeInsets.only(right: 3),
+                                          child: Icon(
+                                            Icons.check,
+                                            size: 15,
+                                            color: Colors.black,
+                                          ),
+                                        )
+                                      : null,
+                                ),
+                                SizedBox(
+                                  width: 40,
+                                  child: TextField(
+                                    key: const Key('tahun_lalu_input'),
+                                    controller: yearCtrl,
+                                    focusNode: yearFocus,
+                                    keyboardType: TextInputType.number,
+                                    textInputAction: TextInputAction.done,
+                                    autocorrect: false,
+                                    enableSuggestions: false,
+                                    inputFormatters: [
+                                      FilteringTextInputFormatter.digitsOnly,
+                                    ],
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      fontSize: 12.5,
+                                      fontWeight: FontWeight.bold,
+                                      color: isCustomYear
+                                          ? Colors.black
+                                          : Colors.white,
+                                    ),
+                                    decoration: InputDecoration(
+                                      hintText: 'X',
+                                      hintStyle: TextStyle(
+                                        fontSize: 12,
+                                        color: isCustomYear
+                                            ? Colors.black45
+                                            : Colors.white54,
+                                      ),
+                                      isDense: true,
+                                      contentPadding: EdgeInsets.zero,
+                                      border: InputBorder.none,
+                                    ),
+                                    onChanged: (val) {
+                                      final parsed = int.tryParse(val.trim());
+                                      if (parsed != null && parsed >= 1) {
+                                        setDlgState(() {
+                                          selectedYearsPreset = null;
+                                          isCustomYear = true;
+                                          pickedStart = yearsAgoDate(parsed);
+                                          pickedEnd = today;
+                                        });
+                                      }
+                                    },
+                                  ),
+                                ),
+                                Text(
+                                  'Tahun',
+                                  style: TextStyle(
+                                    fontSize: 12.5,
+                                    fontWeight: isCustomYear
+                                        ? FontWeight.bold
+                                        : FontWeight.w500,
+                                    color: isCustomYear
+                                        ? Colors.black
+                                        : Colors.white,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    const Text(
+                      'Maksimal Video Diambil:',
+                      style: TextStyle(fontSize: 12.5, color: Colors.white70),
+                    ),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 6,
+                      children: [10, 500, 1000, 5000, 10000]
+                          .map(
+                            (cap) => ChoiceChip(
+                              label: Text('$cap video'),
+                              selected: selectedMax == cap,
+                              selectedColor: const Color(0xFFFF0033),
+                              onSelected: (_) => setDlgState(() {
+                                selectedMax = cap;
+                              }),
+                            ),
+                          )
+                          .toList(),
+                    ),
+                    const SizedBox(height: 12),
+                    const Text(
+                      'Video lama yang sudah tersimpan tidak akan dihapus (kecuali jika channel di-Unsubscribe).',
+                      style: TextStyle(fontSize: 11.5, color: Color(0xFF81C784)),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dlgCtx).pop(false),
+                  child: const Text('Batal'),
+                ),
+                ElevatedButton.icon(
+                  key: Key('creator_range_submit_btn_$cid'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFFF0033),
+                    foregroundColor: Colors.white,
+                  ),
+                  icon: const Icon(Icons.download_rounded, size: 18),
+                  label: Text('Reload ($selectedMax video)'),
+                  onPressed: () => Navigator.of(dlgCtx).pop(true),
+                ),
+              ],
+            );
+          },
+        ),
       ),
     );
     if (confirmed == true && mounted) {
@@ -7869,39 +7988,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       color: const Color(0xFF282828),
       tooltip: 'Opsi Creator',
       onSelected: (value) {
-        if (value == 'reload') {
-          _reloadSingleCreator(ch, maxVideos: 100);
-        } else if (value == 'custom_range') {
+        if (value == 'custom_range') {
           _showCreatorRangeReloadDialog(ch);
         }
       },
       itemBuilder: (popupCtx) => [
-        const PopupMenuItem<String>(
-          value: 'reload',
-          child: Row(
-            children: [
-              Icon(Icons.refresh, color: Color(0xFF81C784), size: 18),
-              SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      'Reload Data Channel',
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontWeight: FontWeight.w600),
-                    ),
-                    Text(
-                      'Tarik hingga 100 video terbaru',
-                      style: TextStyle(fontSize: 11, color: Colors.white54),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
         const PopupMenuItem<String>(
           value: 'custom_range',
           child: Row(

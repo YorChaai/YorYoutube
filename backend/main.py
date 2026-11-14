@@ -407,7 +407,7 @@ def _run_background_refresh(
 
         if channel_id:
             target_chs = [c for c in all_chs if c["channel_id"] == channel_id]
-            eff_cap = max(1, min(int(max_videos or 100), 500))
+            eff_cap = max(1, min(int(max_videos or 100), 10000))
             with _STATE_LOCK:
                 REFRESH_STATE["total_channels"] = len(target_chs)
                 REFRESH_STATE["done_channels"] = 0
@@ -563,7 +563,7 @@ def reload_single_channel(channel_id: str, payload: ChannelReloadPayload | None 
 
     start_date = (payload.start_date if payload else "").strip()
     end_date = (payload.end_date if payload else "").strip()
-    max_videos = max(1, min(int((payload.max_videos if payload else 100) or 100), 500))
+    max_videos = max(1, min(int((payload.max_videos if payload else 100) or 100), 10000))
 
     try:
         synced = youtube_sync.sync_channel_videos(
