@@ -104,6 +104,8 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   List<Map<String, dynamic>> channels = [];
   List<Map<String, dynamic>> liveStreams = [];
   List<Map<String, dynamic>> videos = [];
+  bool _sidebarLiveExpanded = false;
+  bool _mainLiveExpanded = false;
   bool _didInitialAutoRefresh = false;
   bool hasApiKey = false;
   String apiKeyPreview = '';
@@ -4995,7 +4997,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           : 50;
       currentPage = 1;
     });
-    if (isMobileScreen && Navigator.of(context).canPop()) {
+    if (isMobileScreen && (_scaffoldKey.currentState?.isDrawerOpen ?? false)) {
       Navigator.of(context).pop();
     }
     _fetchVideos();
@@ -6899,34 +6901,51 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                  color: liveList.isNotEmpty
-                      ? const Color(0xFFFF0033)
-                      : Colors.white38,
-                  shape: BoxShape.circle,
-                ),
-              ),
-              const SizedBox(width: 7),
-              Expanded(
-                child: Text(
-                  'Live Streaming (${liveList.length})',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 12.5,
-                    fontWeight: FontWeight.w700,
-                    color: Colors.white,
+          InkWell(
+            key: const Key('sidebar_live_toggle'),
+            borderRadius: BorderRadius.circular(6),
+            onTap: () => setState(
+              () => _sidebarLiveExpanded = !_sidebarLiveExpanded,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Row(
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: liveList.isNotEmpty
+                          ? const Color(0xFFFF0033)
+                          : Colors.white38,
+                      shape: BoxShape.circle,
+                    ),
                   ),
-                ),
+                  const SizedBox(width: 7),
+                  Expanded(
+                    child: Text(
+                      'Live Streaming (${liveList.length})',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                  Icon(
+                    _sidebarLiveExpanded
+                        ? Icons.keyboard_arrow_down
+                        : Icons.keyboard_arrow_right,
+                    size: 18,
+                    color: Colors.white70,
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
-          if (liveList.isEmpty)
+          if (_sidebarLiveExpanded && liveList.isEmpty)
             const Padding(
               padding: EdgeInsets.only(top: 4),
               child: Text(
@@ -6934,7 +6953,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                 style: TextStyle(fontSize: 11.5, color: Colors.white54),
               ),
             )
-          else ...[
+          else if (_sidebarLiveExpanded) ...[
             const SizedBox(height: 6),
             for (final item in liveList)
               Builder(
@@ -7034,7 +7053,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       margin: const EdgeInsets.fromLTRB(16, 4, 16, 8),
       padding: EdgeInsets.symmetric(
         horizontal: 12,
-        vertical: liveList.isEmpty ? 8 : 10,
+        vertical: (!_mainLiveExpanded || liveList.isEmpty) ? 8 : 10,
       ),
       decoration: BoxDecoration(
         color: const Color(0xFF171717),
@@ -7048,45 +7067,60 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Container(
-                width: 9,
-                height: 9,
-                decoration: BoxDecoration(
-                  color: liveList.isNotEmpty
-                      ? const Color(0xFFFF0033)
-                      : Colors.white38,
-                  shape: BoxShape.circle,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Flexible(
-                child: Text(
-                  'Live Streaming (${liveList.length})',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 13.5,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
+          InkWell(
+            key: const Key('main_live_toggle'),
+            borderRadius: BorderRadius.circular(6),
+            onTap: () =>
+                setState(() => _mainLiveExpanded = !_mainLiveExpanded),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Row(
+                children: [
+                  Container(
+                    width: 9,
+                    height: 9,
+                    decoration: BoxDecoration(
+                      color: liveList.isNotEmpty
+                          ? const Color(0xFFFF0033)
+                          : Colors.white38,
+                      shape: BoxShape.circle,
+                    ),
                   ),
-                ),
-              ),
-              if (liveList.isEmpty) ...[
-                const SizedBox(width: 10),
-                const Expanded(
-                  child: Text(
-                    'Belum ada yang sedang live',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: 12, color: Colors.white54),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Live Streaming (${liveList.length})',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                      ),
+                    ),
                   ),
-                ),
-              ],
-            ],
+                  Icon(
+                    _mainLiveExpanded
+                        ? Icons.keyboard_arrow_down
+                        : Icons.keyboard_arrow_right,
+                    size: 20,
+                    color: Colors.white70,
+                  ),
+                ],
+              ),
+            ),
           ),
-          if (liveList.isNotEmpty) ...[
+          if (_mainLiveExpanded && liveList.isEmpty)
+            const Padding(
+              padding: EdgeInsets.only(top: 6),
+              child: Text(
+                'Belum ada yang sedang live',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 12, color: Colors.white54),
+              ),
+            ),
+          if (_mainLiveExpanded && liveList.isNotEmpty) ...[
             const SizedBox(height: 10),
             SizedBox(
               height: 76,
@@ -7635,7 +7669,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                   ],
                 ),
               ),
-              // Titik 3 (⋮) di pojok kanan bawah kartu video: Unsubscribe, Tonton di YouTube, Transkrip, Unhide/Hide
+              // Titik 3 (⋮) di pojok kanan bawah kartu video: Unsubscribe, Lihat Channel, Transkrip, Unhide/Hide
               PopupMenuButton<String>(
                 icon: const Icon(
                   Icons.more_vert,
@@ -7645,8 +7679,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                 color: const Color(0xFF282828),
                 tooltip: 'Opsi Creator',
                 onSelected: (value) {
-                  if (value == 'open_yt') {
-                    _openYouTubeVideo(v);
+                  if (value == 'open_channel' && channelId.isNotEmpty) {
+                    _searchCtrl.clear();
+                    searchQuery = '';
+                    _showMobileSearch = false;
+                    _selectChannelTab(channelId);
                   } else if (value == 'transcript') {
                     _showTranscriptPromptDialog(v);
                   }
@@ -7676,19 +7713,19 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                       },
                     ),
                   ),
-                  const PopupMenuItem(
-                    value: 'open_yt',
+                  PopupMenuItem<String>(
+                    value: 'open_channel',
                     child: Row(
                       children: [
-                        Icon(
-                          Icons.open_in_new,
+                        const Icon(
+                          Icons.account_circle_outlined,
                           color: Colors.white70,
                           size: 18,
                         ),
-                        SizedBox(width: 10),
+                        const SizedBox(width: 10),
                         Expanded(
                           child: Text(
-                            'Tonton di YouTube',
+                            'Lihat Channel "$channelTitle"',
                             overflow: TextOverflow.ellipsis,
                           ),
                         ),

@@ -177,14 +177,24 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('Tab 2 (26–36)'), findsWidgets);
 
-      // 8. Buka menu titik 3 kartu video -> cek hanya ada 4 menu (Unsubscribe, Tonton di YouTube, Transkrip, Hide/Unhide) + popup transkrip
+      // 8. Buka menu titik 3 kartu video -> cek hanya ada 4 menu (Unsubscribe, Lihat Channel, Transkrip, Hide/Unhide) + popup transkrip
       await tester.tap(find.byIcon(Icons.more_vert).first);
       await tester.pumpAndSettle();
       expect(find.textContaining('Unsubscribe "'), findsOneWidget);
-      expect(find.text('Tonton di YouTube'), findsOneWidget);
+      expect(find.textContaining('Lihat Channel "'), findsOneWidget);
+      expect(find.text('Tonton di YouTube'), findsNothing);
       expect(find.text('Transkrip'), findsOneWidget);
       expect(find.textContaining('Hide "'), findsOneWidget);
       expect(find.textContaining('Lihat Semua Video'), findsNothing);
+
+      // Uji tap 'Lihat Channel "..."' -> membuka halaman channel tsb di dalam app & kembali ke Semua Follower
+      await tester.tap(find.textContaining('Lihat Channel "'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Total: 6 video'), findsOneWidget);
+      await tester.tap(find.textContaining('Semua Follower ('));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byIcon(Icons.more_vert).first);
+      await tester.pumpAndSettle();
 
       await tester.tap(find.text('Transkrip'));
       await tester.pumpAndSettle();
@@ -1016,13 +1026,30 @@ void main() {
           await tester.pump(const Duration(milliseconds: 700));
           await tester.pumpAndSettle();
 
-          // Auto-refresh saat membuka aplikasi terpanggil 1x & memunculkan channel live
+          // Auto-refresh saat membuka aplikasi terpanggil 1x & header Live Streaming (1) default collapse (>)
           expect(refreshCalls, 1);
           expect(find.byKey(const Key('sidebar_live_section')), findsOneWidget);
           expect(find.byKey(const Key('main_live_section')), findsOneWidget);
           expect(find.text('Live Streaming (1)'), findsNWidgets(2));
+          expect(find.byIcon(Icons.keyboard_arrow_right), findsNWidgets(2));
+          expect(find.byKey(const Key('sidebar_live_item_UC_demo_fajrul')), findsNothing);
+          expect(find.byKey(const Key('main_live_item_UC_demo_fajrul')), findsNothing);
+
+          // Tekan toggle '>' menjadi 'v' untuk menampilkan daftar live streaming (dan tap lagi untuk tutup)
+          await tester.tap(find.byKey(const Key('sidebar_live_toggle')));
+          await tester.tap(find.byKey(const Key('main_live_toggle')));
+          await tester.pumpAndSettle();
+          expect(find.byIcon(Icons.keyboard_arrow_down), findsNWidgets(2));
           expect(find.byKey(const Key('sidebar_live_item_UC_demo_fajrul')), findsOneWidget);
           expect(find.byKey(const Key('main_live_item_UC_demo_fajrul')), findsOneWidget);
+
+          // Tekan lagi toggle main -> kembali collapse '>'
+          await tester.tap(find.byKey(const Key('main_live_toggle')));
+          await tester.pumpAndSettle();
+          expect(find.byKey(const Key('main_live_item_UC_demo_fajrul')), findsNothing);
+          // Expand kembali main agar bisa mengecek item di langkah selanjutnya
+          await tester.tap(find.byKey(const Key('main_live_toggle')));
+          await tester.pumpAndSettle();
 
           // Verifikasi posisi Sidebar: Subscriptions -> Live Streaming -> Daftar Follower
           final subsRect = tester.getRect(find.text('Subscriptions ›'));
