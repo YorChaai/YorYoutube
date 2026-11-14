@@ -1732,6 +1732,36 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     }
   }
 
+  String _youtubeLongformPlaylistId(String cid, [String fallback = '']) {
+    if (cid.startsWith('UC') && cid.length > 2) {
+      return 'UULF${cid.substring(2)}';
+    }
+    return fallback;
+  }
+
+  /// Membedakan Shorts vs video reguler lewat endpoint resmi /shorts/{id}:
+  /// - Shorts -> HTTP 200 di /shorts/{id} (walau durasi > 60 detik)
+  /// - Video reguler -> HTTP 303 redirect ke /watch?v={id} (walau durasi < 60 detik)
+  Future<bool> _isYoutubeShort(http.Client client, String videoId) async {
+    if (kIsWeb || videoId.isEmpty) return false;
+    try {
+      final req = http.Request(
+        'HEAD',
+        Uri.parse('https://www.youtube.com/shorts/$videoId'),
+      )..followRedirects = false;
+      final streamed = await client.send(req).timeout(
+        const Duration(seconds: 5),
+      );
+      await streamed.stream.drain<void>().catchError((_) {});
+      if (streamed.statusCode >= 300 && streamed.statusCode < 400) {
+        return false;
+      }
+      return streamed.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _standaloneFastRefreshChannels(
     List<Map<String, dynamic>> targetChs,
   ) async {
@@ -1835,15 +1865,30 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               'channel_title': (ch['title'] ?? '').toString(),
               'channel_thumbnail': (ch['thumbnail_url'] ?? '').toString(),
             };
-            final mainXml = await fetchRss(
-              Uri.parse(
-                'https://www.youtube.com/feeds/videos.xml?channel_id=$cid',
-              ),
-            );
+            final uulfPid = _youtubeLongformPlaylistId(cid);
+            var usedChannelFallback = false;
+            var mainXml = uulfPid.isNotEmpty
+                ? await fetchRss(
+                    Uri.parse(
+                      'https://www.youtube.com/feeds/videos.xml?playlist_id=$uulfPid',
+                    ),
+                  )
+                : null;
+            if (mainXml == null) {
+              usedChannelFallback = true;
+              mainXml = await fetchRss(
+                Uri.parse(
+                  'https://www.youtube.com/feeds/videos.xml?channel_id=$cid',
+                ),
+              );
+            }
             if (mainXml != null) {
               for (final m in vidRegex.allMatches(mainXml)) {
                 final vid = (m.group(1) ?? '').trim();
                 if (vid.isNotEmpty && !knownOldVidIds.contains(vid)) {
+                  if (usedChannelFallback && await _isYoutubeShort(client, vid)) {
+                    continue;
+                  }
                   newVidMeta[vid] = meta;
                 }
               }
@@ -2172,58 +2217,95 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         : ((effMax / 50).ceil()).clamp(1, 200);
 
     final videoIds = <String>[];
+    final longformPid = _youtubeLongformPlaylistId(cid, uploadsPid);
+    var targetPid = longformPid;
+    var usingFallbackUploads = targetPid == uploadsPid;
     String? pageToken;
-    for (var page = 0; page < maxPages && videoIds.length < effMax; page++) {
-      final plParams = <String, String>{
-        'part': 'contentDetails,snippet',
-        'playlistId': uploadsPid,
-        'maxResults': '50',
-        'key': localApiKey,
-      };
-      if (pageToken != null && pageToken.isNotEmpty) {
-        plParams['pageToken'] = pageToken;
-      }
-      final plUri = Uri.https(
-        'www.googleapis.com',
-        '/youtube/v3/playlistItems',
-        plParams,
-      );
-      final plRes = await http.get(plUri).timeout(const Duration(seconds: 12));
-      if (plRes.statusCode != 200) {
-        if (videoIds.isEmpty) {
-          throw Exception('Gagal mengambil playlist video (${plRes.statusCode}).');
+    final syncClient = http.Client();
+    try {
+      for (var page = 0; page < maxPages && videoIds.length < effMax; page++) {
+        final plParams = <String, String>{
+          'part': 'contentDetails,snippet',
+          'playlistId': targetPid,
+          'maxResults': '50',
+          'key': localApiKey,
+        };
+        if (pageToken != null && pageToken.isNotEmpty) {
+          plParams['pageToken'] = pageToken;
         }
-        break;
-      }
-      final plJson = jsonDecode(plRes.body);
-      final plItems = (plJson['items'] as List?) ?? [];
-      if (plItems.isEmpty) break;
-
-      var reachedStartCutoff = false;
-      for (final e in plItems) {
-        if (videoIds.length >= effMax) break;
-        final vid = (e['contentDetails']?['videoId'] ?? '').toString();
-        if (vid.isEmpty) continue;
-        final pubStr =
-            (e['contentDetails']?['videoPublishedAt'] ??
-                    e['snippet']?['publishedAt'] ??
-                    '')
-                .toString();
-        final pubDt = pubStr.isNotEmpty ? DateTime.tryParse(pubStr)?.toUtc() : null;
-        if (endDt != null && pubDt != null && pubDt.isAfter(endDt)) {
-          continue;
+        final plUri = Uri.https(
+          'www.googleapis.com',
+          '/youtube/v3/playlistItems',
+          plParams,
+        );
+        final plRes = await syncClient.get(plUri).timeout(const Duration(seconds: 12));
+        if (page == 0 && plRes.statusCode == 404 && !usingFallbackUploads) {
+          final uushPid = (cid.startsWith('UC') && cid.length > 2)
+              ? 'UUSH${cid.substring(2)}'
+              : '';
+          if (uushPid.isNotEmpty) {
+            try {
+              final uushRes = await syncClient
+                  .get(
+                    Uri.parse(
+                      'https://www.youtube.com/feeds/videos.xml?playlist_id=$uushPid',
+                    ),
+                  )
+                  .timeout(const Duration(seconds: 6));
+              if (uushRes.statusCode == 200 &&
+                  uushRes.body.contains('<yt:videoId>')) {
+                return 0;
+              }
+            } catch (_) {}
+          }
+          if (uploadsPid.isNotEmpty) {
+            targetPid = uploadsPid;
+            usingFallbackUploads = true;
+            page--;
+            continue;
+          }
         }
-        if (startDt != null && pubDt != null && pubDt.isBefore(startDt)) {
-          reachedStartCutoff = true;
+        if (plRes.statusCode != 200) {
+          if (videoIds.isEmpty) {
+            throw Exception('Gagal mengambil playlist video (${plRes.statusCode}).');
+          }
           break;
         }
-        videoIds.add(vid);
-      }
+        final plJson = jsonDecode(plRes.body);
+        final plItems = (plJson['items'] as List?) ?? [];
+        if (plItems.isEmpty) break;
 
-      pageToken = plJson['nextPageToken']?.toString();
-      if (reachedStartCutoff || pageToken == null || pageToken.isEmpty) {
-        break;
+        var reachedStartCutoff = false;
+        for (final e in plItems) {
+          if (videoIds.length >= effMax) break;
+          final vid = (e['contentDetails']?['videoId'] ?? '').toString();
+          if (vid.isEmpty) continue;
+          final pubStr =
+              (e['contentDetails']?['videoPublishedAt'] ??
+                      e['snippet']?['publishedAt'] ??
+                      '')
+                  .toString();
+          final pubDt = pubStr.isNotEmpty ? DateTime.tryParse(pubStr)?.toUtc() : null;
+          if (endDt != null && pubDt != null && pubDt.isAfter(endDt)) {
+            continue;
+          }
+          if (startDt != null && pubDt != null && pubDt.isBefore(startDt)) {
+            reachedStartCutoff = true;
+            break;
+          }
+          if (usingFallbackUploads && await _isYoutubeShort(syncClient, vid)) {
+            continue;
+          }
+          videoIds.add(vid);
+        }
+
+        pageToken = plJson['nextPageToken']?.toString();
+        if (reachedStartCutoff || pageToken == null || pageToken.isEmpty) {
+          break;
+        }
       }
+    } finally {
+      syncClient.close();
     }
 
     var savedCount = 0;

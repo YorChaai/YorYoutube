@@ -337,6 +337,65 @@ def refresh_all_channel_statistics(api_key: str = "", oauth_token: str = "") -> 
     return updated
 
 
+def _youtube_longform_playlist_id(cid: str, uploads_pid: str = "") -> str:
+    """Playlist resmi YouTube berisi video reguler saja (UULF...), mengecualikan Shorts dan Live."""
+    if cid.startswith("UC") and len(cid) > 2:
+        return "UULF" + cid[2:]
+    return uploads_pid
+
+
+def _youtube_shorts_playlist_id(cid: str) -> str:
+    if cid.startswith("UC") and len(cid) > 2:
+        return "UUSH" + cid[2:]
+    return ""
+
+
+def _is_youtube_short(video_id: str, client: httpx.Client | None = None) -> bool:
+    """
+    Membedakan YouTube Shorts vs video reguler berdasarkan format URL (/shorts/{id}):
+    - Shorts -> HTTP 200 di /shorts/{id} (walaupun durasi > 60 detik)
+    - Video reguler -> HTTP 303 redirect ke /watch?v={id} (walaupun durasi < 60 detik)
+    """
+    if not video_id:
+        return False
+    try:
+        if client is not None:
+            head_fn = getattr(client, "head", None)
+            if not callable(head_fn):
+                return False
+            try:
+                resp = head_fn(
+                    f"https://www.youtube.com/shorts/{video_id}",
+                    follow_redirects=False,
+                )
+            except TypeError:
+                resp = head_fn(f"https://www.youtube.com/shorts/{video_id}")
+        else:
+            with httpx.Client(timeout=6.0, follow_redirects=False) as hc:
+                resp = hc.head(f"https://www.youtube.com/shorts/{video_id}")
+        code = getattr(resp, "status_code", 0)
+        if code in (301, 302, 303, 307, 308):
+            return False
+        if code == 200:
+            final_url = str(getattr(resp, "url", "") or "")
+            if final_url and "/watch" in final_url:
+                return False
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _rss_playlist_has_entries(client: httpx.Client, playlist_id: str) -> bool:
+    if not playlist_id:
+        return False
+    try:
+        resp = client.get(f"https://www.youtube.com/feeds/videos.xml?playlist_id={playlist_id}")
+        return getattr(resp, "status_code", 0) == 200 and "<yt:videoId>" in (getattr(resp, "text", "") or "")
+    except Exception:
+        return False
+
+
 def _parse_sync_bound(date_str: str, is_end: bool = False) -> datetime | None:
     raw = (date_str or "").strip()
     if not raw:
@@ -374,8 +433,10 @@ def sync_channel_videos(
         return 0
 
     uploads_pid = channel.get("uploads_playlist_id") or ("UU" + cid[2:] if cid.startswith("UC") else "")
-    if not uploads_pid:
+    target_pid = _youtube_longform_playlist_id(cid, uploads_pid)
+    if not target_pid:
         return 0
+    using_fallback_uploads = target_pid == uploads_pid
 
     max_videos = max(1, min(int(max_videos or 100), 10000))
     start_dt = _parse_sync_bound(start_date, is_end=False)
@@ -397,12 +458,12 @@ def sync_channel_videos(
             ).fetchall()
         }
 
-    with httpx.Client(timeout=25.0) as client:
+    with httpx.Client(timeout=25.0, follow_redirects=False) as client:
         while len(video_ids) < max_videos and pages_scanned < max_pages:
             req_params = {
                 **params,
                 "part": "contentDetails,snippet",
-                "playlistId": uploads_pid,
+                "playlistId": target_pid,
                 "maxResults": 50,
             }
             if page_token:
@@ -410,6 +471,15 @@ def sync_channel_videos(
 
             resp = client.get(f"{YT_API_BASE}/playlistItems", params=req_params, headers=headers)
             data = _safe_json(resp)
+            if pages_scanned == 0 and resp.status_code == 404 and not using_fallback_uploads:
+                # UULF tidak ada (mis. channel khusus Shorts saja -> UUSH ada -> 0 video reguler, atau channel khusus tanpa UULF)
+                uush_pid = _youtube_shorts_playlist_id(cid)
+                if uush_pid and _rss_playlist_has_entries(client, uush_pid):
+                    break
+                if uploads_pid:
+                    target_pid = uploads_pid
+                    using_fallback_uploads = True
+                    continue
             if resp.status_code != 200 or "error" in data:
                 err_msg = data.get("error", {}).get("message", f"YouTube playlist API error ({resp.status_code})")
                 if not video_ids:
@@ -443,6 +513,8 @@ def sync_channel_videos(
                     break
 
                 if vid:
+                    if using_fallback_uploads and _is_youtube_short(vid, client):
+                        continue
                     video_ids.append(vid)
 
             page_token = data.get("nextPageToken")
@@ -587,11 +659,18 @@ def refresh_all_channels_comprehensive(
             cid = ch["channel_id"]
             found: list[tuple[str, str]] = []
             seen_local: set[str] = set()
-            xml_main = _fetch_rss(f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}")
+            uulf_pid = _youtube_longform_playlist_id(cid)
+            xml_main = _fetch_rss(f"https://www.youtube.com/feeds/videos.xml?playlist_id={uulf_pid}") if uulf_pid else ""
+            used_channel_fallback = False
+            if not xml_main:
+                xml_main = _fetch_rss(f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}")
+                used_channel_fallback = True
             if xml_main:
                 for v in vid_tag_re.findall(xml_main):
                     v = v.strip()
                     if v and v not in known_old_vids and v not in seen_local:
+                        if used_channel_fallback and _is_youtube_short(v, rss_client):
+                            continue
                         seen_local.add(v)
                         found.append((v, cid))
             if cid.startswith("UC") and len(cid) > 2:
@@ -754,6 +833,11 @@ def search_and_cache_subscribed_videos(
                 except Exception:
                     return 0
 
+            vid_to_cid = {
+                vid: cid
+                for vid, cid in vid_to_cid.items()
+                if not _is_youtube_short(vid, client)
+            }
             if not vid_to_cid:
                 return 0
 

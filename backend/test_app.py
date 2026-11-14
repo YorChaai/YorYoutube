@@ -702,4 +702,169 @@ def test_sync_channel_videos_custom_range_cap_100_and_preserves_old(isolated_cli
     assert len([x for x in all_ids if x.startswith("vid_2025_")]) == 100
 
 
+def test_shorts_excluded_by_format_and_under_60s_regular_kept(isolated_client, monkeypatch):
+    """Shorts (>60s atau <60s) wajib dikecualikan lewat UULF & HEAD /shorts, sedangkan video reguler <60s tetap disimpan."""
+    import youtube_sync
+
+    db.set_setting("api_key", "FAKE_KEY")
+    db.upsert_channel(
+        channel_id="UC_mixed_fmt",
+        title="Mixed Channel",
+        uploads_playlist_id="UU_mixed_fmt",
+    )
+    db.upsert_channel(
+        channel_id="UC_shorts_only",
+        title="Shorts Only",
+        uploads_playlist_id="UU_shorts_only",
+    )
+    db.upsert_channel(
+        channel_id="UC_fallback_fmt",
+        title="Fallback Format",
+        uploads_playlist_id="UU_fallback_fmt",
+    )
+
+    class _Resp:
+        def __init__(self, status_code, payload=None, text="", url=""):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = text
+            self.url = url
+
+        def json(self):
+            return self._payload
+
+    requested_playlists: list[str] = []
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def head(self, url, follow_redirects=False):
+            # vid_short_over60 adalah Short > 1 menit -> 200; vid_reg_shortdur adalah reguler 15 detik -> 303 redirect
+            if url.endswith("/shorts/vid_short_over60") or url.endswith("/shorts/vid_short_search"):
+                return _Resp(200, url=url)
+            return _Resp(303, url="https://www.youtube.com/watch?v=regular")
+
+        def get(self, url, params=None, headers=None):
+            params = params or {}
+            if str(url).endswith("/playlistItems"):
+                pid = params.get("playlistId", "")
+                requested_playlists.append(pid)
+                if pid == "UULF_mixed_fmt":
+                    return _Resp(
+                        200,
+                        {
+                            "items": [
+                                {"contentDetails": {"videoId": "vid_reg_25s", "videoPublishedAt": "2026-11-14T10:00:00Z"}},
+                                {"contentDetails": {"videoId": "vid_reg_long", "videoPublishedAt": "2026-11-13T10:00:00Z"}},
+                            ]
+                        },
+                    )
+                if pid == "UULF_shorts_only":
+                    return _Resp(404, {"error": {"message": "Not found"}})
+                if pid == "UULF_fallback_fmt":
+                    return _Resp(404, {"error": {"message": "Not found"}})
+                if pid == "UU_fallback_fmt":
+                    return _Resp(
+                        200,
+                        {
+                            "items": [
+                                {"contentDetails": {"videoId": "vid_short_over60", "videoPublishedAt": "2026-11-14T12:00:00Z"}},
+                                {"contentDetails": {"videoId": "vid_reg_shortdur", "videoPublishedAt": "2026-11-14T11:00:00Z"}},
+                            ]
+                        },
+                    )
+                return _Resp(404)
+
+            if "feeds/videos.xml?playlist_id=UUSH_shorts_only" in str(url):
+                return _Resp(200, text="<feed><yt:videoId>vid_only_short_1</yt:videoId></feed>")
+            if "feeds/videos.xml?playlist_id=UULF_mixed_fmt" in str(url):
+                return _Resp(200, text="<feed><yt:videoId>vid_rss_reg_12s</yt:videoId></feed>")
+            if "feeds/videos.xml?playlist_id=UULF" in str(url) or "feeds/videos.xml?playlist_id=UUSH" in str(url):
+                return _Resp(404)
+            if "feeds/videos.xml" in str(url):
+                return _Resp(200, text="<feed></feed>")
+
+            if str(url).endswith("/search"):
+                return _Resp(
+                    200,
+                    {
+                        "items": [
+                            {"id": {"videoId": "vid_short_search"}, "snippet": {"channelId": "UC_mixed_fmt"}},
+                            {"id": {"videoId": "vid_reg_search_10s"}, "snippet": {"channelId": "UC_mixed_fmt"}},
+                        ]
+                    },
+                )
+
+            if str(url).endswith("/videos"):
+                ids = [x for x in str(params.get("id", "")).split(",") if x]
+                durations = {
+                    "vid_reg_25s": "PT25S",
+                    "vid_reg_long": "PT15M",
+                    "vid_short_over60": "PT1M10S",
+                    "vid_reg_shortdur": "PT15S",
+                    "vid_rss_reg_12s": "PT12S",
+                    "vid_reg_search_10s": "PT10S",
+                }
+                return _Resp(
+                    200,
+                    {
+                        "items": [
+                            {
+                                "id": vid,
+                                "snippet": {
+                                    "channelId": "UC_fallback_fmt" if vid == "vid_reg_shortdur" else "UC_mixed_fmt",
+                                    "channelTitle": "Test Creator",
+                                    "title": f"Title {vid}",
+                                    "publishedAt": "2026-11-14T10:00:00Z",
+                                    "liveBroadcastContent": "none",
+                                    "thumbnails": {},
+                                },
+                                "statistics": {"viewCount": "50", "likeCount": "5"},
+                                "contentDetails": {"duration": durations.get(vid, "PT1M")},
+                            }
+                            for vid in ids
+                        ]
+                    },
+                )
+            return _Resp(404)
+
+    monkeypatch.setattr(youtube_sync.httpx, "Client", _FakeClient)
+
+    # 1. Mixed channel -> uses UULF_mixed_fmt, keeps 25s regular video
+    chs = {c["channel_id"]: c for c in db.list_channels()}
+    assert youtube_sync.sync_channel_videos(chs["UC_mixed_fmt"], api_key="FAKE_KEY", max_videos=100) == 2
+    assert "UULF_mixed_fmt" in requested_playlists
+
+    # 2. Shorts-only channel -> UULF 404 + UUSH exists -> 0 videos saved & no UU burn
+    assert youtube_sync.sync_channel_videos(chs["UC_shorts_only"], api_key="FAKE_KEY", max_videos=100) == 0
+    assert "UU_shorts_only" not in requested_playlists
+
+    # 3. Fallback UU channel -> filters out Short >60s (200), keeps regular 15s (303)
+    assert youtube_sync.sync_channel_videos(chs["UC_fallback_fmt"], api_key="FAKE_KEY", max_videos=100) == 1
+    saved_ids = {v["video_id"] for v in db.query_videos(limit=100)["items"]}
+    assert "vid_reg_25s" in saved_ids
+    assert "vid_reg_long" in saved_ids
+    assert "vid_reg_shortdur" in saved_ids
+    assert "vid_short_over60" not in saved_ids
+
+    # 4. Fast Refresh RSS prefers UULF and keeps 12s regular video
+    assert youtube_sync.refresh_all_channels_comprehensive([chs["UC_mixed_fmt"]], api_key="FAKE_KEY") == 1
+    saved_ids = {v["video_id"] for v in db.query_videos(limit=100)["items"]}
+    assert "vid_rss_reg_12s" in saved_ids
+
+    # 5. Search cache drops Shorts (200) and keeps 10s regular video (303)
+    assert youtube_sync.search_and_cache_subscribed_videos("test", api_key="FAKE_KEY") == 1
+    saved_ids = {v["video_id"] for v in db.query_videos(limit=100)["items"]}
+    assert "vid_reg_search_10s" in saved_ids
+    assert "vid_short_search" not in saved_ids
+
+
+
 
