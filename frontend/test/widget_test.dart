@@ -1275,6 +1275,192 @@ void main() {
       );
     },
   );
+
+  testWidgets(
+    'Sidebar Subscriptions minimize toggle, main search creator card, and creator 3-dot Reload & Custom Range modal work',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      var reloadHits = 0;
+      Map<String, dynamic> handleBackend(String method, Uri uri) {
+        final path = uri.path;
+        if (path == '/api/state') {
+          return {
+            'status': 'ok',
+            'has_api_key': false,
+            'api_key_preview': '',
+            'default_limit': 50,
+            'tab_limits': {},
+            'live_streams': const [],
+            'channels': [
+              {
+                'channel_id': 'UC_ferry',
+                'title': 'Ferry Irwandi',
+                'handle': '@ferryirwandi',
+                'thumbnail_url': '',
+                'watched_count': 4,
+                'views_hp': 2,
+                'views_laptop': 2,
+                'views_total': 4,
+                'synced_video_count': 2,
+                'yt_video_count': 450,
+                'yt_subscriber_count': 2440000,
+                'is_hidden': 0,
+              },
+              {
+                'channel_id': 'UC_pew',
+                'title': 'PewDiePie',
+                'handle': '@PewDiePie',
+                'thumbnail_url': '',
+                'watched_count': 2,
+                'views_hp': 1,
+                'views_laptop': 1,
+                'views_total': 2,
+                'synced_video_count': 1,
+                'yt_video_count': 4700,
+                'yt_subscriber_count': 111000000,
+                'is_hidden': 0,
+              },
+            ],
+            'ui_state': {'sort_by': 'time', 'period': 'all', 'limit': 50},
+          };
+        }
+        if (path == '/api/videos') {
+          final q = (uri.queryParameters['q'] ?? '').toLowerCase();
+          final allItems = [
+            {
+              'video_id': 'vid_ferry_1',
+              'channel_id': 'UC_ferry',
+              'channel_title': 'Ferry Irwandi',
+              'channel_thumbnail': '',
+              'title': 'Membahas Ekonomi Indonesia',
+              'thumbnail_url': '',
+              'published_at': '2026-11-10T10:00:00Z',
+              'view_count': 395000,
+              'like_count': 25000,
+              'duration': '31:10',
+              'duration_seconds': 1870,
+              'views_hp': 1,
+              'views_laptop': 1,
+              'views_total': 2,
+              'watched_count': 4,
+              'is_hidden': 0,
+              'is_live': 0,
+            },
+            {
+              'video_id': 'vid_pew_1',
+              'channel_id': 'UC_pew',
+              'channel_title': 'PewDiePie',
+              'channel_thumbnail': '',
+              'title': 'Minecraft Episode 1',
+              'thumbnail_url': '',
+              'published_at': '2026-11-09T10:00:00Z',
+              'view_count': 2000000,
+              'like_count': 150000,
+              'duration': '20:00',
+              'duration_seconds': 1200,
+              'views_hp': 0,
+              'views_laptop': 0,
+              'views_total': 0,
+              'watched_count': 2,
+              'is_hidden': 0,
+              'is_live': 0,
+            },
+          ];
+          final filtered = q.isEmpty
+              ? allItems
+              : allItems
+                    .where(
+                      (v) =>
+                          v['title'].toString().toLowerCase().contains(q) ||
+                          v['channel_title'].toString().toLowerCase().contains(q),
+                    )
+                    .toList();
+          return {
+            'status': 'ok',
+            'total': filtered.length,
+            'page': 1,
+            'limit': 50,
+            'total_pages': 1,
+            'items': filtered,
+            'live_streams': const [],
+          };
+        }
+        if (path == '/api/channels/UC_ferry/reload' && method == 'POST') {
+          reloadHits += 1;
+          return {
+            'status': 'ok',
+            'channel_id': 'UC_ferry',
+            'videos_synced': 100,
+            'total_channel_videos': 102,
+          };
+        }
+        if (path == '/api/refresh-youtube/status') {
+          return {
+            'running': false,
+            'progress': 0,
+            'done_ready': false,
+            'new_videos': 0,
+            'error': '',
+          };
+        }
+        if (path == '/api/refresh-youtube') {
+          return {'status': 'started', 'running': false, 'progress': 0};
+        }
+        return {'status': 'ok'};
+      }
+
+      await HttpOverrides.runZoned(
+        () async {
+          await tester.pumpWidget(const PersonalYouTubeApp());
+          await tester.pumpAndSettle();
+
+          // 1. Sidebar collapse/expand Subscriptions
+          expect(find.byKey(const Key('sidebar_subscriptions_toggle')), findsOneWidget);
+          expect(find.text('PewDiePie'), findsWidgets);
+          await tester.tap(find.byKey(const Key('sidebar_subscriptions_toggle')));
+          await tester.pumpAndSettle();
+          // Expand again and confirm it works cleanly
+          await tester.tap(find.byKey(const Key('sidebar_subscriptions_toggle')));
+          await tester.pumpAndSettle();
+
+          // 2. Type 'ferry' in main search -> shows matching Creator Card at top
+          final searchField = find.byType(TextField).first;
+          await tester.enterText(searchField, 'ferry');
+          await tester.testTextInput.receiveAction(TextInputAction.done);
+          FocusManager.instance.primaryFocus?.unfocus();
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+
+          expect(find.byKey(const Key('search_creator_card_UC_ferry')), findsOneWidget);
+          expect(find.text('Subscribed'), findsOneWidget);
+
+          // 3. Open 3-dot Creator Menu -> Reload & Custom Date Range
+          await tester.tap(find.byKey(const Key('creator_menu_btn_UC_ferry')));
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+          expect(find.text('Reload Data Channel'), findsOneWidget);
+          expect(find.text('Atur Tanggal & Batas Video'), findsOneWidget);
+          expect(find.text('Unsubscribe "Ferry Irwandi"'), findsOneWidget);
+          expect(find.text('Hide "Ferry Irwandi"'), findsOneWidget);
+
+          // 4. Open Custom Date Range modal -> submit Reload (100 video)
+          await tester.tap(find.text('Atur Tanggal & Batas Video'));
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+          expect(find.byKey(const Key('creator_range_picker_btn_UC_ferry')), findsOneWidget);
+          await tester.tap(find.byKey(const Key('creator_range_submit_btn_UC_ferry')));
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+
+          expect(reloadHits, equals(1));
+          expect(tester.takeException(), isNull);
+        },
+        createHttpClient: (_) => _TestBackendHttpClient(handleBackend),
+      );
+    },
+  );
 }
 
 class _TestBackendHttpClient implements HttpClient {

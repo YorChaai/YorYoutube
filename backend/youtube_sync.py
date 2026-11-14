@@ -285,10 +285,10 @@ def sync_public_subscriptions_by_channel(my_channel_id: str, api_key: str = "") 
             if not page_token:
                 break
 
-    # Langsung tarik video untuk setiap channel baru yang baru saja di-subscribe di YouTube!
+    # Langsung tarik video untuk setiap channel baru yang baru saja di-subscribe di YouTube (maks 100)!
     for new_ch in newly_added_channels:
         try:
-            sync_channel_videos(new_ch, api_key=api_key, max_videos=50)
+            sync_channel_videos(new_ch, api_key=api_key, max_videos=100)
         except Exception:
             pass
 
@@ -337,12 +337,33 @@ def refresh_all_channel_statistics(api_key: str = "", oauth_token: str = "") -> 
     return updated
 
 
+def _parse_sync_bound(date_str: str, is_end: bool = False) -> datetime | None:
+    raw = (date_str or "").strip()
+    if not raw:
+        return None
+    if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+        try:
+            dt = datetime.fromisoformat(raw + ("T23:59:59+00:00" if is_end else "T00:00:00+00:00"))
+            return dt
+        except ValueError:
+            return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
 def sync_channel_videos(
     channel: dict,
     api_key: str = "",
     oauth_token: str = "",
     years_back: int = 10,
-    max_videos: int = 250,
+    max_videos: int = 100,
+    start_date: str = "",
+    end_date: str = "",
 ) -> int:
     cid = channel["channel_id"]
     if cid.startswith("UC_demo_"):
@@ -356,9 +377,17 @@ def sync_channel_videos(
     if not uploads_pid:
         return 0
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=365 * years_back + 30)
+    max_videos = max(1, min(int(max_videos or 100), 500))
+    start_dt = _parse_sync_bound(start_date, is_end=False)
+    end_dt = _parse_sync_bound(end_date, is_end=True)
+    if start_dt and end_dt and start_dt > end_dt:
+        start_dt, end_dt = end_dt, start_dt
+
+    cutoff = start_dt if start_dt is not None else (datetime.now(timezone.utc) - timedelta(days=365 * years_back + 30))
     video_ids: list[str] = []
     page_token = None
+    pages_scanned = 0
+    max_pages = 80 if (start_dt is not None or end_dt is not None) else 20
     with db.get_conn() as conn:
         existing_live_ids = {
             r["video_id"]
@@ -369,7 +398,7 @@ def sync_channel_videos(
         }
 
     with httpx.Client(timeout=25.0) as client:
-        while len(video_ids) < max_videos:
+        while len(video_ids) < max_videos and pages_scanned < max_pages:
             req_params = {
                 **params,
                 "part": "contentDetails,snippet",
@@ -386,6 +415,7 @@ def sync_channel_videos(
                 if not video_ids:
                     raise RuntimeError(err_msg)
                 break
+            pages_scanned += 1
             items = data.get("items", [])
             if not items:
                 break
@@ -396,16 +426,22 @@ def sync_channel_videos(
                     break
                 vid = it.get("contentDetails", {}).get("videoId")
                 pub_str = it.get("contentDetails", {}).get("videoPublishedAt") or it.get("snippet", {}).get("publishedAt", "")
-                if pub_str and len(video_ids) >= 50:
+                pub_dt: datetime | None = None
+                if pub_str:
                     try:
                         pub_dt = datetime.fromisoformat(pub_str.replace("Z", "+00:00"))
                         if pub_dt.tzinfo is None:
                             pub_dt = pub_dt.replace(tzinfo=timezone.utc)
-                        if pub_dt < cutoff:
-                            reached_cutoff = True
-                            break
                     except (ValueError, TypeError):
-                        pass
+                        pub_dt = None
+
+                if end_dt is not None and pub_dt is not None and pub_dt > end_dt:
+                    continue
+
+                if pub_dt is not None and pub_dt < cutoff and (start_dt is not None or len(video_ids) >= 50):
+                    reached_cutoff = True
+                    break
+
                 if vid:
                     video_ids.append(vid)
 

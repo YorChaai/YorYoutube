@@ -580,4 +580,126 @@ def test_live_uulv_xml_parses_real_updated_tag_and_zero_duration_transition(isol
     assert st["live_streams"][0]["title"] == "Live 24/7 Now"
 
 
+def test_sync_channel_videos_custom_range_cap_100_and_preserves_old(isolated_client, monkeypatch):
+    import youtube_sync
+
+    db.set_setting("api_key", "FAKE_KEY")
+    db.upsert_channel(
+        channel_id="UC_eno_test",
+        title="Eno Bening",
+        handle="@enobening",
+        uploads_playlist_id="UU_eno_test",
+    )
+    # Seed 1 very old saved video from 2022 that must NEVER be deleted unless Unsubscribed
+    db.upsert_videos(
+        [
+            {
+                "video_id": "vid_old_2022",
+                "channel_id": "UC_eno_test",
+                "channel_title": "Eno Bening",
+                "channel_thumbnail": "",
+                "title": "Video Lama 2022",
+                "thumbnail_url": "https://i.ytimg.com/vi/vid_old_2022/hqdefault.jpg",
+                "published_at": "2022-03-10T10:00:00Z",
+                "view_count": 5000,
+                "like_count": 300,
+                "duration": "12:00",
+                "duration_seconds": 720,
+                "is_demo": 0,
+                "is_live": 0,
+            }
+        ]
+    )
+
+    # Mock 140 videos across pages: 10 newest in 2026-11, 120 inside 2025-05, 10 older in 2024-01
+    all_playlist_items = []
+    video_meta = {}
+    for i in range(10):
+        vid = f"vid_2026_{i}"
+        pub = f"2026-11-{10 - i:02d}T12:00:00Z"
+        all_playlist_items.append({"contentDetails": {"videoId": vid, "videoPublishedAt": pub}})
+        video_meta[vid] = pub
+    for i in range(120):
+        vid = f"vid_2025_{i}"
+        day = 28 - (i // 5)
+        hr = 20 - (i % 5)
+        pub = f"2025-05-{day:02d}T{hr:02d}:00:00Z"
+        all_playlist_items.append({"contentDetails": {"videoId": vid, "videoPublishedAt": pub}})
+        video_meta[vid] = pub
+    for i in range(10):
+        vid = f"vid_2024_{i}"
+        pub = f"2024-01-{10 - i:02d}T12:00:00Z"
+        all_playlist_items.append({"contentDetails": {"videoId": vid, "videoPublishedAt": pub}})
+        video_meta[vid] = pub
+
+    class _FakeResp:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, params=None, headers=None):
+            params = params or {}
+            if str(url).endswith("/playlistItems"):
+                offset = int(params.get("pageToken", "0") or "0")
+                chunk = all_playlist_items[offset : offset + 50]
+                next_tok = str(offset + 50) if offset + 50 < len(all_playlist_items) else None
+                payload = {"items": chunk}
+                if next_tok:
+                    payload["nextPageToken"] = next_tok
+                return _FakeResp(200, payload)
+            if str(url).endswith("/videos"):
+                ids = [x for x in str(params.get("id", "")).split(",") if x]
+                items = [
+                    {
+                        "id": vid,
+                        "snippet": {
+                            "channelId": "UC_eno_test",
+                            "channelTitle": "Eno Bening",
+                            "title": f"Video {vid}",
+                            "publishedAt": video_meta.get(vid, "2025-05-01T00:00:00Z"),
+                            "liveBroadcastContent": "none",
+                            "thumbnails": {},
+                        },
+                        "statistics": {"viewCount": "100", "likeCount": "10"},
+                        "contentDetails": {"duration": "PT10M"},
+                    }
+                    for vid in ids
+                ]
+                return _FakeResp(200, {"items": items})
+            return _FakeResp(404)
+
+    monkeypatch.setattr(youtube_sync.httpx, "Client", _FakeClient)
+
+    res = isolated_client.post(
+        "/api/channels/UC_eno_test/reload",
+        json={"start_date": "2025-05-01", "end_date": "2025-05-31", "max_videos": 100},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["videos_synced"] == 100
+    assert body["total_channel_videos"] == 101  # 100 from 2025-05 + 1 preserved 2022 video
+
+    vids = isolated_client.get("/api/videos?channel_id=UC_eno_test&limit=100&page=1").json()
+    all_ids = {v["video_id"] for v in vids["items"]}
+    vids_p2 = isolated_client.get("/api/videos?channel_id=UC_eno_test&limit=100&page=2").json()
+    all_ids |= {v["video_id"] for v in vids_p2["items"]}
+    assert "vid_old_2022" in all_ids
+    assert "vid_2026_0" not in all_ids
+    assert "vid_2024_0" not in all_ids
+    assert len([x for x in all_ids if x.startswith("vid_2025_")]) == 100
+
+
 

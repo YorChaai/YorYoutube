@@ -1,125 +1,133 @@
 # Graph Report - youtube  (2026-11-14)
 
 ## Corpus Check
-- 46 files · ~111,228 words
+- 49 files · ~121,782 words
 - Verdict: corpus is large enough that graph structure adds value.
+- Unclassified: 29 file(s) not represented in the graph (top: .xml 7, (none) 6, .bat 6)
 
 ## Summary
-- 486 nodes · 766 edges · 22 communities (11 shown, 11 thin omitted)
+- 613 nodes · 919 edges · 25 communities (12 shown, 13 thin omitted)
 - Extraction: 98% EXTRACTED · 2% INFERRED · 0% AMBIGUOUS · INFERRED: 18 edges (avg confidence: 0.85)
 - Token cost: 0 input · 0 output
 
 ## Community Hubs (Navigation)
-- Flutter App UI Core
-- FastAPI Backend Endpoints
-- SQLite DB & Sync Logic
-- Windows Native Runner Entry
-- Win32 Window Management
-- Flutter Windows Host View
-- Flutter Widget Tests
-- PWA Web Manifest
-- Win32 Window Lifecycle
-- Custom Dialogs & Hold Menus
-- Windows DPI & Msg Dispatch
-- Win32 Geometry Primitives
-- Flutter Plugin Registrant
-- Project Documentation
-- Android MainActivity Host
-- Frontend Docs Stub
-- Flutter Root Widget
+- Cluster 0
+- Cluster 1
+- Cluster 2
+- Cluster 3
+- Cluster 4
+- Cluster 5
+- Cluster 6
+- Cluster 7
+- Cluster 8
+- Cluster 9
+- Cluster 10
+- Cluster 11
+- Cluster 12
+- Cluster 13
+- Cluster 14
+- Cluster 15
+- Cluster 16
+- Cluster 17
+- Cluster 18
+- Cluster 19
 
 ## God Nodes (most connected - your core abstractions)
-1. `get_conn()` - 23 edges
+1. `get_conn()` - 27 edges
 2. `Win32Window` - 21 edges
-3. `sync_public_subscriptions_by_channel()` - 13 edges
-4. `_run_background_refresh()` - 12 edges
-5. `sync_channel_videos()` - 12 edges
-6. `get_setting()` - 11 edges
-7. `list_channels()` - 11 edges
-8. `refresh_all_channels_comprehensive()` - 11 edges
-9. `search_and_cache_subscribed_videos()` - 11 edges
-10. `FlutterWindow` - 10 edges
+3. `list_channels()` - 15 edges
+4. `get_setting()` - 13 edges
+5. `test_init_db_drops_legacy_region_and_refresh_scans_hidden_channels()` - 12 edges
+6. `refresh_all_channels_comprehensive()` - 12 edges
+7. `upsert_channel()` - 11 edges
+8. `sync_channel_videos()` - 11 edges
+9. `upsert_videos()` - 10 edges
+10. `query_videos()` - 10 edges
 
 ## Surprising Connections (you probably didn't know these)
+- `test_default_state_limit_and_hide_filter()` --calls--> `get_conn()`  [EXTRACTED]
+  backend/test_app.py → backend/db.py
 - `wWinMain()` --calls--> `CreateAndAttachConsole()`  [INFERRED]
   frontend/windows/runner/main.cpp → frontend/windows/runner/utils.cpp
-- `get_settings()` --calls--> `get_setting()`  [EXTRACTED]
-  backend/main.py → backend/db.py
-- `import_channels_csv()` --calls--> `get_setting()`  [EXTRACTED]
-  backend/main.py → backend/db.py
-- `refresh_youtube()` --calls--> `get_setting()`  [EXTRACTED]
-  backend/main.py → backend/db.py
+- `sync_public_subscriptions_by_channel()` --calls--> `get_setting()`  [EXTRACTED]
+  backend/youtube_sync.py → backend/db.py
+- `test_sync_channel_videos_custom_range_cap_100_and_preserves_old()` --calls--> `set_setting()`  [EXTRACTED]
+  backend/test_app.py → backend/db.py
 - `import_channels_csv()` --calls--> `upsert_channel()`  [EXTRACTED]
   backend/main.py → backend/db.py
 
 ## Import Cycles
 - None detected.
 
-## Communities (22 total, 11 thin omitted)
+## Communities (25 total, 13 thin omitted)
 
-### Community 0 - "Flutter App UI Core"
+### Community 0 - "Cluster 0"
 Cohesion: 0.01
-Nodes (185): accentColor, activeBgColor, _activeDurationThumb, apiKeyPreview, _applyLocalFilterAndPagination, _applyPeriodChoice, _applySyncDataString, baseUrl (+177 more)
+Nodes (229): accentColor, activeBgColor, _activeDayFocusListener, _activeDurationThumb, apiKeyPreview, _applyLocalFilterAndPagination, _applyPeriodChoice, _applySyncDataString (+221 more)
 
-### Community 1 - "FastAPI Backend Endpoints"
+### Community 1 - "Cluster 1"
 Cohesion: 0.05
-Nodes (46): clear_demo_data(), increment_channel_watched(), record_watch(), set_channel_hidden(), set_setting(), AddChannelPayload, DeviceSyncPayload, disable_frontend_cache() (+38 more)
+Nodes (51): _apply_hide_filter_clause(), get_setting(), increment_channel_watched(), list_channels(), list_live_videos(), record_watch(), set_channel_hidden(), set_setting() (+43 more)
 
-### Community 2 - "SQLite DB & Sync Logic"
-Cohesion: 0.09
-Nodes (38): _apply_hide_filter_clause(), classify_region(), delete_channel(), duration_to_seconds(), get_conn(), get_setting(), init_db(), _is_newer_or_equal_ts() (+30 more)
+### Community 2 - "Cluster 2"
+Cohesion: 0.07
+Nodes (38): clear_demo_data(), delete_channel(), duration_to_seconds(), get_conn(), init_db(), _is_newer_or_equal_ts(), list_channels_for_refresh(), mark_videos_not_live() (+30 more)
 
-### Community 3 - "Windows Native Runner Entry"
-Cohesion: 0.14
+### Community 3 - "Cluster 3"
+Cohesion: 0.04
+Nodes (26): add, addStream, bufferOutput, _bytes, close, compressionState, contentLength, encoding (+18 more)
+
+### Community 4 - "Cluster 4"
+Cohesion: 0.07
+Nodes (5): isolated_client(), test_default_state_limit_and_hide_filter(), test_live_streaming_detection_and_refresh_cleanup(), test_live_uulv_xml_parses_real_updated_tag_and_zero_duration_transition(), test_sync_channel_videos_custom_range_cap_100_and_preserves_old()
+
+### Community 5 - "Cluster 5"
+Cohesion: 0.13
 Nodes (4): wWinMain(), CreateAndAttachConsole(), GetCommandLineArguments(), Utf8FromUtf16()
 
-### Community 4 - "Win32 Window Management"
+### Community 6 - "Cluster 6"
 Cohesion: 0.18
 Nodes (5): Scale(), Win32Window::Win32Window(), WindowClassRegistrar, class_registered_, instance_
 
-### Community 5 - "Flutter Windows Host View"
+### Community 7 - "Cluster 7"
 Cohesion: 0.12
 Nodes (4): FlutterWindow, flutter_controller_, FlutterWindow::FlutterWindow(), project_
 
-### Community 7 - "PWA Web Manifest"
+### Community 8 - "Cluster 8"
+Cohesion: 0.20
+Nodes (12): _CustomCalendarDialog, _CustomCalendarDialogState, _DisposeOnUnmount, _DisposeOnUnmountState, _HoldToActionMenuItem, _HoldToActionMenuItemState, _HomeScrollWithBar, _HomeScrollWithBarState (+4 more)
+
+### Community 9 - "Cluster 9"
 Cohesion: 0.18
 Nodes (10): background_color, description, display, icons, name, orientation, prefer_related_applications, short_name (+2 more)
 
-### Community 8 - "Win32 Window Lifecycle"
+### Community 10 - "Cluster 10"
 Cohesion: 0.24
 Nodes (4): Win32Window, child_content_, quit_on_close_, window_handle_
 
-### Community 9 - "Custom Dialogs & Hold Menus"
-Cohesion: 0.27
-Nodes (8): _CustomCalendarDialog, _CustomCalendarDialogState, _HoldToActionMenuItem, _HoldToActionMenuItemState, TabPickerDialog, _TabPickerDialogState, YouTubeHomeScreen, _YouTubeHomeScreenState
-
-### Community 11 - "Win32 Geometry Primitives"
+### Community 12 - "Cluster 12"
 Cohesion: 0.21
 Nodes (6): Point, x, y, Size, height, width
 
-### Community 13 - "Project Documentation"
-Cohesion: 0.50
-Nodes (3): Cara Menjalankan, Fitur Utama, Yorpersonal YouTube Subscriptions Hub
-
 ## Knowledge Gaps
-- **197 isolated node(s):** `baseUrl`, `sidebarMode`, `filterMinimized`, `loading`, `refreshingYouTube` (+192 more)
-  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 305 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
-- **11 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **266 isolated node(s):** `baseUrl`, `sidebarMode`, `filterMinimized`, `loading`, `refreshingYouTube` (+261 more)
+  These have ≤1 connection - possible missing edges. (Counts symbols only; 406 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+- **13 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `Win32Window` connect `Win32 Window Lifecycle` to `Windows Native Runner Entry`, `Win32 Window Management`, `Flutter Windows Host View`, `Windows DPI & Msg Dispatch`, `Win32 Geometry Primitives`?**
-  _High betweenness centrality (0.041) - this node is a cross-community bridge._
+- **Why does `Win32Window` connect `Cluster 10` to `Cluster 5`, `Cluster 6`, `Cluster 7`, `Cluster 11`, `Cluster 12`?**
+  _High betweenness centrality (0.016) - this node is a cross-community bridge._
 - **What connects `baseUrl`, `sidebarMode`, `filterMinimized` to the rest of the system?**
-  _197 weakly-connected nodes found - possible documentation gaps or missing edges._
-- **Should `Flutter App UI Core` be split into smaller, more focused modules?**
-  _Cohesion score 0.009478672985781991 - nodes in this community are weakly interconnected._
-- **Why does `FlutterWindow` connect `Flutter Windows Host View` to `Win32 Window Lifecycle`, `Windows Native Runner Entry`?**
-  _High betweenness centrality (0.022) - this node is a cross-community bridge._
-- **Should `FastAPI Backend Endpoints` be split into smaller, more focused modules?**
-  _Cohesion score 0.053830227743271224 - nodes in this community are weakly interconnected._
-- **Should `SQLite DB & Sync Logic` be split into smaller, more focused modules?**
-  _Cohesion score 0.08672659968270756 - nodes in this community are weakly interconnected._
-- **Should `Windows Native Runner Entry` be split into smaller, more focused modules?**
-  _Cohesion score 0.14285714285714285 - nodes in this community are weakly interconnected._
+  _266 weakly-connected nodes found - possible documentation gaps or missing edges._
+- **Should `Cluster 0` be split into smaller, more focused modules?**
+  _Cohesion score 0.00784313725490196 - nodes in this community are weakly interconnected._
+- **Why does `list_channels()` connect `Cluster 1` to `Cluster 2`, `Cluster 4`?**
+  _High betweenness centrality (0.013) - this node is a cross-community bridge._
+- **Should `Cluster 1` be split into smaller, more focused modules?**
+  _Cohesion score 0.054385964912280704 - nodes in this community are weakly interconnected._
+- **Why does `FlutterWindow` connect `Cluster 7` to `Cluster 10`, `Cluster 5`?**
+  _High betweenness centrality (0.009) - this node is a cross-community bridge._
+- **Should `Cluster 2` be split into smaller, more focused modules?**
+  _Cohesion score 0.06946386946386947 - nodes in this community are weakly interconnected._

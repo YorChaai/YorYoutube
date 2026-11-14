@@ -142,6 +142,15 @@ class SyncPayload(BaseModel):
 
 class RefreshYouTubePayload(BaseModel):
     channel_id: str = ""
+    start_date: str = ""
+    end_date: str = ""
+    max_videos: int = 100
+
+
+class ChannelReloadPayload(BaseModel):
+    start_date: str = ""
+    end_date: str = ""
+    max_videos: int = 100
 
 
 class UiStatePayload(BaseModel):
@@ -352,7 +361,33 @@ def get_videos(
     return res
 
 
-def _run_background_refresh(channel_id: str, api_key: str, oauth_token: str) -> None:
+def _sync_live_snapshot_in_place() -> None:
+    """Perbarui file snapshot aplikasi secara in-place tanpa menyimpan file cadangan lama."""
+    try:
+        live_db_path = (Path(__file__).resolve().parent / "youtube_personal.db").resolve()
+        if Path(db.DB_PATH).resolve() != live_db_path:
+            return
+        snapshot_path = (Path(__file__).resolve().parent.parent / "frontend" / "assets" / "initial_data.json").resolve()
+        if not snapshot_path.parent.exists():
+            return
+        bundle = db.sync_device_data({"device": "bundle", "videos": [], "channels": []})
+        bundle["api_key"] = db.get_setting("api_key", "")
+        bundle["my_channel_id"] = db.get_setting("my_channel_id", "")
+        tmp_path = snapshot_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(bundle, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(snapshot_path)
+    except Exception:
+        pass
+
+
+def _run_background_refresh(
+    channel_id: str,
+    api_key: str,
+    oauth_token: str,
+    start_date: str = "",
+    end_date: str = "",
+    max_videos: int = 100,
+) -> None:
     try:
         before_total = db.query_videos(limit=25, page=1)["total"]
         # 1. Tarik daftar channel Subscriptions terbaru secara PERMANEN via Channel ID user + API Key (aktif selamanya!)
@@ -372,12 +407,20 @@ def _run_background_refresh(channel_id: str, api_key: str, oauth_token: str) -> 
 
         if channel_id:
             target_chs = [c for c in all_chs if c["channel_id"] == channel_id]
+            eff_cap = max(1, min(int(max_videos or 100), 500))
             with _STATE_LOCK:
                 REFRESH_STATE["total_channels"] = len(target_chs)
                 REFRESH_STATE["done_channels"] = 0
                 REFRESH_STATE["progress"] = 10
             for idx, ch in enumerate(target_chs):
-                youtube_sync.sync_channel_videos(ch, api_key=api_key, oauth_token=oauth_token, max_videos=250)
+                youtube_sync.sync_channel_videos(
+                    ch,
+                    api_key=api_key,
+                    oauth_token=oauth_token,
+                    max_videos=eff_cap,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
                 with _STATE_LOCK:
                     REFRESH_STATE["done_channels"] = idx + 1
                     REFRESH_STATE["progress"] = min(99, int((idx + 1) * 100 / max(1, len(target_chs))))
@@ -400,6 +443,7 @@ def _run_background_refresh(channel_id: str, api_key: str, oauth_token: str) -> 
                 on_progress=_on_prog,
             )
 
+        _sync_live_snapshot_in_place()
         after_total = db.query_videos(limit=25, page=1)["total"]
         with _STATE_LOCK:
             REFRESH_STATE["new_videos"] = max(0, after_total - before_total) if channel_id else max(added_new, after_total - before_total)
@@ -437,7 +481,7 @@ def refresh_youtube(payload: RefreshYouTubePayload) -> dict:
 
     t = threading.Thread(
         target=_run_background_refresh,
-        args=(payload.channel_id, api_key, oauth_token),
+        args=(payload.channel_id, api_key, oauth_token, payload.start_date, payload.end_date, payload.max_videos),
         daemon=True,
     )
     t.start()
@@ -500,6 +544,46 @@ def add_channel(payload: AddChannelPayload) -> dict:
         return {"status": "ok", "channel": ch, "videos_synced": synced}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except (httpx.HTTPError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=502, detail=f"Gagal menghubungi YouTube: {e}")
+
+
+@app.post("/api/channels/{channel_id}/reload")
+def reload_single_channel(channel_id: str, payload: ChannelReloadPayload | None = None) -> dict:
+    """Muat ulang / tarik video 1 creator (mendukung Custom Date Range & batas maksimal 100 video tanpa menghapus video lama)."""
+    api_key = db.get_setting("api_key", "")
+    oauth_token = db.get_setting("oauth_token", "")
+    if not api_key and not oauth_token:
+        raise HTTPException(status_code=400, detail="API Key belum terpasang.")
+
+    chs = [c for c in db.list_channels(hide_filter="both") if c["channel_id"] == channel_id]
+    if not chs:
+        raise HTTPException(status_code=404, detail="Channel tidak ditemukan.")
+    ch = chs[0]
+
+    start_date = (payload.start_date if payload else "").strip()
+    end_date = (payload.end_date if payload else "").strip()
+    max_videos = max(1, min(int((payload.max_videos if payload else 100) or 100), 500))
+
+    try:
+        synced = youtube_sync.sync_channel_videos(
+            ch,
+            api_key=api_key,
+            oauth_token=oauth_token,
+            max_videos=max_videos,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        _sync_live_snapshot_in_place()
+        total_now = db.query_videos(channel_id=channel_id, hide_filter="both", limit=25, page=1)["total"]
+        return {
+            "status": "ok",
+            "channel_id": channel_id,
+            "videos_synced": synced,
+            "total_channel_videos": total_now,
+        }
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     except (httpx.HTTPError, json.JSONDecodeError) as e:
         raise HTTPException(status_code=502, detail=f"Gagal menghubungi YouTube: {e}")
 

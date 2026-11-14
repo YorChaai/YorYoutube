@@ -105,6 +105,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   List<Map<String, dynamic>> liveStreams = [];
   List<Map<String, dynamic>> videos = [];
   bool _sidebarLiveExpanded = false;
+  bool _sidebarCreatorsExpanded = true;
   bool _mainLiveExpanded = false;
   bool _didInitialAutoRefresh = false;
   bool hasApiKey = false;
@@ -114,6 +115,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   String localMyChannelId = '';
   bool _bundledDataLoaded = false;
   final Set<String> _localUnsubscribedIds = {};
+  final Set<String> _reloadingChannelIds = {};
 
   // Database lokal mandiri di dalam aplikasi (untuk jalan sendiri di HP tanpa Python backend)
   final List<Map<String, dynamic>> _localChannels = [];
@@ -129,6 +131,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   final FocusNode _mobileSearchFocusNode = FocusNode();
   final ScrollController _videoScrollController = ScrollController();
   final ScrollController _sidebarScrollController = ScrollController();
+  final ScrollController _sidebarLiveScrollController = ScrollController();
   bool _showMobileSearch = false;
   int _fetchVideosSeq = 0;
 
@@ -154,6 +157,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     _mobileSearchFocusNode.dispose();
     _videoScrollController.dispose();
     _sidebarScrollController.dispose();
+    _sidebarLiveScrollController.dispose();
     super.dispose();
   }
 
@@ -666,6 +670,13 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             final cid = (c['channel_id'] ?? '').toString();
             if (cid.isNotEmpty) _localUnsubscribedIds.add(cid);
           }
+        }
+        if (_localUnsubscribedIds.isNotEmpty) {
+          _localVideos.removeWhere(
+            (v) => _localUnsubscribedIds.contains(
+              (v['channel_id'] ?? '').toString(),
+            ),
+          );
         }
         _sortChannelsByWatchedDesc(_localChannels);
         final savedSettings = await db.query('settings');
@@ -1651,6 +1662,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       final existingCids = _localChannels
           .map((c) => (c['channel_id'] ?? '').toString())
           .toSet();
+      final newlyAdded = <Map<String, dynamic>>[];
       String? pageToken;
       for (var page = 0; page < 50; page++) {
         final params = <String, String>{
@@ -1689,7 +1701,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           final title = (snip['title'] ?? cid).toString();
           final thumb = (snip['thumbnails']?['default']?['url'] ?? '')
               .toString();
-          _localChannels.add({
+          final newCh = <String, dynamic>{
             'channel_id': cid,
             'title': title,
             'handle': '',
@@ -1700,13 +1712,20 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             'source': 'subscriptions',
             'video_count': 0,
             'watched_count': 0,
-          });
+          };
+          _localChannels.add(newCh);
+          newlyAdded.add(newCh);
           existingCids.add(cid);
         }
         pageToken = data['nextPageToken']?.toString();
         if (pageToken == null || pageToken.isEmpty) break;
       }
       _sortChannelsByWatchedDesc(_localChannels);
+      for (final newCh in newlyAdded) {
+        try {
+          await _standaloneSyncChannelVideos(newCh, maxVideos: 100);
+        } catch (_) {}
+      }
     } catch (_) {
     } finally {
       client.close();
@@ -2096,84 +2115,416 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       'status': 'subscribed',
     });
 
-    // Ambil 50 video terbaru dari playlist uploads (hemat kuota: 1 poin)
-    final plUri = Uri.https('www.googleapis.com', '/youtube/v3/playlistItems', {
-      'part': 'contentDetails',
-      'playlistId': uploadsPid,
-      'maxResults': '50',
-      'key': localApiKey,
-    });
-    final plRes = await http.get(plUri).timeout(const Duration(seconds: 12));
-    if (plRes.statusCode != 200) {
-      await _saveStandaloneData();
-      return;
-    }
-    final plItems = (jsonDecode(plRes.body)['items'] as List?) ?? [];
-    final videoIds = plItems
-        .map((e) => (e['contentDetails']?['videoId'] ?? '').toString())
-        .where((id) => id.isNotEmpty)
-        .toList();
+    // Tarik hingga 100 video dari playlist uploads (hemat kuota: 1 poin / 50 video)
+    final syncTargetCh = <String, dynamic>{
+      'channel_id': cid,
+      'title': title,
+      'handle': handle,
+      'thumbnail_url': thumbUrl,
+      'uploads_playlist_id': uploadsPid,
+    };
+    await _standaloneSyncChannelVideos(syncTargetCh, maxVideos: 100);
+  }
 
-    if (videoIds.isNotEmpty) {
+  Future<int> _standaloneSyncChannelVideos(
+    Map<String, dynamic> channel, {
+    String startDate = '',
+    String endDate = '',
+    int maxVideos = 100,
+  }) async {
+    final cid = (channel['channel_id'] ?? '').toString();
+    if (cid.isEmpty || cid.startsWith('UC_demo_')) return 0;
+    if (localApiKey.isEmpty) {
+      throw Exception(
+        'Masukkan YouTube API Key dulu di menu Pengaturan API (⚙️).',
+      );
+    }
+    final title = (channel['title'] ?? cid).toString();
+    final thumbUrl = (channel['thumbnail_url'] ?? '').toString();
+    final rawUploads = (channel['uploads_playlist_id'] ?? '').toString();
+    final uploadsPid = rawUploads.isNotEmpty
+        ? rawUploads
+        : (cid.startsWith('UC') ? 'UU${cid.substring(2)}' : cid);
+
+    DateTime? parseBound(String raw, {bool isEnd = false}) {
+      final s = raw.trim();
+      if (s.isEmpty) return null;
+      if (s.length == 10 && s[4] == '-' && s[7] == '-') {
+        return DateTime.tryParse(
+          isEnd ? '${s}T23:59:59Z' : '${s}T00:00:00Z',
+        );
+      }
+      return DateTime.tryParse(s)?.toUtc();
+    }
+
+    var startDt = parseBound(startDate, isEnd: false);
+    var endDt = parseBound(endDate, isEnd: true);
+    if (startDt != null && endDt != null && startDt.isAfter(endDt)) {
+      final tmp = startDt;
+      startDt = endDt;
+      endDt = tmp;
+    }
+
+    final effMax = maxVideos.clamp(1, 500);
+    final hasRange = startDt != null || endDt != null;
+    final maxPages = hasRange ? 60 : ((effMax / 50).ceil()).clamp(1, 10);
+
+    final videoIds = <String>[];
+    String? pageToken;
+    for (var page = 0; page < maxPages && videoIds.length < effMax; page++) {
+      final plParams = <String, String>{
+        'part': 'contentDetails,snippet',
+        'playlistId': uploadsPid,
+        'maxResults': '50',
+        'key': localApiKey,
+      };
+      if (pageToken != null && pageToken.isNotEmpty) {
+        plParams['pageToken'] = pageToken;
+      }
+      final plUri = Uri.https(
+        'www.googleapis.com',
+        '/youtube/v3/playlistItems',
+        plParams,
+      );
+      final plRes = await http.get(plUri).timeout(const Duration(seconds: 12));
+      if (plRes.statusCode != 200) {
+        if (videoIds.isEmpty) {
+          throw Exception('Gagal mengambil playlist video (${plRes.statusCode}).');
+        }
+        break;
+      }
+      final plJson = jsonDecode(plRes.body);
+      final plItems = (plJson['items'] as List?) ?? [];
+      if (plItems.isEmpty) break;
+
+      var reachedStartCutoff = false;
+      for (final e in plItems) {
+        if (videoIds.length >= effMax) break;
+        final vid = (e['contentDetails']?['videoId'] ?? '').toString();
+        if (vid.isEmpty) continue;
+        final pubStr =
+            (e['contentDetails']?['videoPublishedAt'] ??
+                    e['snippet']?['publishedAt'] ??
+                    '')
+                .toString();
+        final pubDt = pubStr.isNotEmpty ? DateTime.tryParse(pubStr)?.toUtc() : null;
+        if (endDt != null && pubDt != null && pubDt.isAfter(endDt)) {
+          continue;
+        }
+        if (startDt != null && pubDt != null && pubDt.isBefore(startDt)) {
+          reachedStartCutoff = true;
+          break;
+        }
+        videoIds.add(vid);
+      }
+
+      pageToken = plJson['nextPageToken']?.toString();
+      if (reachedStartCutoff || pageToken == null || pageToken.isEmpty) {
+        break;
+      }
+    }
+
+    var savedCount = 0;
+    for (var i = 0; i < videoIds.length; i += 50) {
+      final chunk = videoIds.sublist(
+        i,
+        (i + 50 > videoIds.length) ? videoIds.length : i + 50,
+      );
       final vUri = Uri.https('www.googleapis.com', '/youtube/v3/videos', {
         'part': 'snippet,statistics,contentDetails',
-        'id': videoIds.join(','),
+        'id': chunk.join(','),
         'key': localApiKey,
       });
       final vRes = await http.get(vUri).timeout(const Duration(seconds: 12));
-      if (vRes.statusCode == 200) {
-        final vItems = (jsonDecode(vRes.body)['items'] as List?) ?? [];
-        for (final v in vItems) {
-          final vid = v['id'].toString();
-          final vsnip = v['snippet'] ?? {};
-          final vstats = v['statistics'] ?? {};
-          final existingIdx = _localVideos.indexWhere(
-            (old) => old['video_id'] == vid,
-          );
-          final existing = existingIdx >= 0 ? _localVideos[existingIdx] : null;
-          final durStr = _parseIsoDuration(
-            (v['contentDetails']?['duration'] ?? '').toString(),
-          );
-          final nextVideo = <String, dynamic>{
-            'video_id': vid,
-            'channel_id': cid,
-            'channel_title': title,
-            'channel_thumbnail': thumbUrl,
-            'title': (vsnip['title'] ?? 'Untitled').toString(),
-            'thumbnail_url':
-                ((vsnip['thumbnails']?['high'] ??
-                            vsnip['thumbnails']?['medium'])?['url'] ??
-                        'https://i.ytimg.com/vi/$vid/hqdefault.jpg')
-                    .toString(),
-            'published_at':
-                (vsnip['publishedAt'] ??
-                        DateTime.now().toUtc().toIso8601String())
-                    .toString(),
-            'view_count':
-                int.tryParse((vstats['viewCount'] ?? '0').toString()) ?? 0,
-            'like_count':
-                int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0,
-            'duration': durStr,
-            'duration_seconds': _durationToSeconds(durStr),
-            'views_hp': existing?['views_hp'] ?? 0,
-            'views_laptop': existing?['views_laptop'] ?? 0,
-            'views_total': existing?['views_total'] ?? 0,
-            'watched_count':
-                existing?['watched_count'] ?? _getCreatorWatchedCount(cid),
-            'is_demo': 0,
-            'is_live': (vsnip['liveBroadcastContent'] ?? '').toString() == 'live'
-                ? 1
-                : 0,
-          };
-          if (existingIdx >= 0) {
-            _localVideos[existingIdx] = nextVideo;
-          } else {
-            _localVideos.add(nextVideo);
-          }
+      if (vRes.statusCode != 200) continue;
+      final vItems = (jsonDecode(vRes.body)['items'] as List?) ?? [];
+      for (final v in vItems) {
+        final vid = v['id'].toString();
+        final vsnip = v['snippet'] ?? {};
+        final vstats = v['statistics'] ?? {};
+        final existingIdx = _localVideos.indexWhere(
+          (old) => old['video_id'] == vid,
+        );
+        final existing = existingIdx >= 0 ? _localVideos[existingIdx] : null;
+        final durStr = _parseIsoDuration(
+          (v['contentDetails']?['duration'] ?? '').toString(),
+        );
+        final nextVideo = <String, dynamic>{
+          'video_id': vid,
+          'channel_id': cid,
+          'channel_title': title,
+          'channel_thumbnail': thumbUrl,
+          'title': (vsnip['title'] ?? 'Untitled').toString(),
+          'thumbnail_url':
+              ((vsnip['thumbnails']?['high'] ??
+                          vsnip['thumbnails']?['medium'])?['url'] ??
+                      'https://i.ytimg.com/vi/$vid/hqdefault.jpg')
+                  .toString(),
+          'published_at':
+              (vsnip['publishedAt'] ??
+                      DateTime.now().toUtc().toIso8601String())
+                  .toString(),
+          'view_count':
+              int.tryParse((vstats['viewCount'] ?? '0').toString()) ?? 0,
+          'like_count':
+              int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0,
+          'duration': durStr,
+          'duration_seconds': _durationToSeconds(durStr),
+          'views_hp': existing?['views_hp'] ?? 0,
+          'views_laptop': existing?['views_laptop'] ?? 0,
+          'views_total': existing?['views_total'] ?? 0,
+          'watched_count':
+              existing?['watched_count'] ?? _getCreatorWatchedCount(cid),
+          'is_demo': 0,
+          'is_live': (vsnip['liveBroadcastContent'] ?? '').toString() == 'live'
+              ? 1
+              : 0,
+        };
+        if (existingIdx >= 0) {
+          _localVideos[existingIdx] = nextVideo;
+        } else {
+          _localVideos.add(nextVideo);
         }
+        savedCount++;
       }
     }
     await _saveStandaloneData();
+    return savedCount;
+  }
+
+  Future<void> _reloadSingleCreator(
+    Map<String, dynamic> ch, {
+    String startDate = '',
+    String endDate = '',
+    int maxVideos = 100,
+  }) async {
+    final cid = (ch['channel_id'] ?? '').toString();
+    final title = (ch['title'] ?? cid).toString();
+    if (cid.isEmpty || _reloadingChannelIds.contains(cid)) return;
+    setState(() => _reloadingChannelIds.add(cid));
+    try {
+      int syncedCount = 0;
+      if (isStandaloneMode) {
+        syncedCount = await _standaloneSyncChannelVideos(
+          ch,
+          startDate: startDate,
+          endDate: endDate,
+          maxVideos: maxVideos,
+        );
+      } else {
+        final res = await http
+            .post(
+              Uri.parse('$baseUrl/api/channels/${Uri.encodeComponent(cid)}/reload'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({
+                'start_date': startDate,
+                'end_date': endDate,
+                'max_videos': maxVideos,
+              }),
+            )
+            .timeout(const Duration(seconds: 60));
+        if (res.statusCode != 200) {
+          final err = jsonDecode(res.body);
+          throw Exception(err['detail'] ?? 'Gagal memuat ulang data channel');
+        }
+        final body = jsonDecode(res.body);
+        syncedCount =
+            int.tryParse((body['videos_synced'] ?? 0).toString()) ?? 0;
+      }
+      await _fetchVideos();
+      if (!mounted) return;
+      final rangeLabel = (startDate.isNotEmpty || endDate.isNotEmpty)
+          ? ' (${startDate.isEmpty ? '...' : startDate} s/d ${endDate.isEmpty ? 'sekarang' : endDate})'
+          : '';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: const Color(0xFF1B5E20),
+          content: Text(
+            '✅ "$title" diperbarui$rangeLabel: $syncedCount video dimuat (video lama tetap tersimpan).',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: Colors.red.shade800,
+            content: Text(
+              'Gagal memperbarui "$title": ${e.toString().replaceAll("Exception: ", "")}',
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _reloadingChannelIds.remove(cid));
+      } else {
+        _reloadingChannelIds.remove(cid);
+      }
+    }
+  }
+
+  Future<void> _showCreatorRangeReloadDialog(Map<String, dynamic> ch) async {
+    final cid = (ch['channel_id'] ?? '').toString();
+    final title = (ch['title'] ?? cid).toString();
+    if (cid.isEmpty) return;
+
+    final now = DateTime.now();
+    DateTime pickedStart = DateTime(now.year, now.month, now.day).subtract(
+      const Duration(days: 30),
+    );
+    DateTime pickedEnd = DateTime(now.year, now.month, now.day);
+    int selectedMax = 100;
+
+    String fmtYmd(DateTime d) =>
+        '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dlgCtx) => StatefulBuilder(
+        builder: (ctx, setDlgState) {
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1F1F1F),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+            ),
+            title: Text(
+              'Atur Tanggal & Batas — $title',
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            ),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Rentang Tanggal Upload (Hari / Bulan / Tahun):',
+                    style: TextStyle(fontSize: 12.5, color: Colors.white70),
+                  ),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    key: Key('creator_range_picker_btn_$cid'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Color(0xFF3EA6FF)),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                    ),
+                    icon: const Icon(Icons.date_range, size: 18),
+                    label: Text('${fmtYmd(pickedStart)}  s/d  ${fmtYmd(pickedEnd)}'),
+                    onPressed: () async {
+                      final res = await showDialog<(DateTime, DateTime?)>(
+                        context: ctx,
+                        builder: (_) => _CustomCalendarDialog(
+                          isRange: true,
+                          initialRangeStart: pickedStart,
+                          initialRangeEnd: pickedEnd,
+                        ),
+                      );
+                      if (res != null && res.$2 != null) {
+                        setDlgState(() {
+                          pickedStart = res.$1;
+                          pickedEnd = res.$2!;
+                        });
+                      }
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      ActionChip(
+                        label: const Text('1 Bulan Ini'),
+                        onPressed: () {
+                          final t = DateTime(now.year, now.month, now.day);
+                          setDlgState(() {
+                            pickedStart = t.subtract(const Duration(days: 30));
+                            pickedEnd = t;
+                          });
+                        },
+                      ),
+                      ActionChip(
+                        label: const Text('6 Bulan'),
+                        onPressed: () {
+                          final t = DateTime(now.year, now.month, now.day);
+                          setDlgState(() {
+                            pickedStart = t.subtract(const Duration(days: 180));
+                            pickedEnd = t;
+                          });
+                        },
+                      ),
+                      ActionChip(
+                        label: const Text('1 Tahun'),
+                        onPressed: () {
+                          final t = DateTime(now.year, now.month, now.day);
+                          setDlgState(() {
+                            pickedStart = t.subtract(const Duration(days: 365));
+                            pickedEnd = t;
+                          });
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  const Text(
+                    'Maksimal Video Diambil:',
+                    style: TextStyle(fontSize: 12.5, color: Colors.white70),
+                  ),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 8,
+                    children: [25, 50, 100, 200]
+                        .map(
+                          (cap) => ChoiceChip(
+                            label: Text('$cap video'),
+                            selected: selectedMax == cap,
+                            selectedColor: const Color(0xFFFF0033),
+                            onSelected: (_) => setDlgState(() {
+                              selectedMax = cap;
+                            }),
+                          ),
+                        )
+                        .toList(),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'Video lama yang sudah tersimpan tidak akan dihapus (kecuali jika channel di-Unsubscribe).',
+                    style: TextStyle(fontSize: 11.5, color: Color(0xFF81C784)),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dlgCtx).pop(false),
+                child: const Text('Batal'),
+              ),
+              ElevatedButton.icon(
+                key: Key('creator_range_submit_btn_$cid'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFFFF0033),
+                  foregroundColor: Colors.white,
+                ),
+                icon: const Icon(Icons.download_rounded, size: 18),
+                label: Text('Reload ($selectedMax video)'),
+                onPressed: () => Navigator.of(dlgCtx).pop(true),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    if (confirmed == true && mounted) {
+      await _reloadSingleCreator(
+        ch,
+        startDate: fmtYmd(pickedStart),
+        endDate: fmtYmd(pickedEnd),
+        maxVideos: selectedMax,
+      );
+    }
   }
 
   String _parseIsoDuration(String iso) {
@@ -5613,230 +5964,266 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final sidebarChannels = channels
         .where((ch) => _matchesHideFilter(_isHiddenFlag(ch['is_hidden'])))
         .toList();
-    final sidebarContent = Material(
-      color: const Color(0xFF0F0F0F),
-      child: _HomeScrollWithBar(
+
+    Widget buildCreatorListBody({double? fixedHeight}) {
+      final listBlock = _HomeScrollWithBar(
         controller: _sidebarScrollController,
         itemCount: sidebarChannels.length,
         railKey: const Key('sidebar_fast_scrollbar'),
         thumbKey: const Key('sidebar_fast_thumb'),
         itemLabel: 'Channel',
-        trackPadding: const EdgeInsets.only(top: 6, right: 2, bottom: 8),
+        trackPadding: const EdgeInsets.only(top: 4, right: 2, bottom: 6),
         scrollView: ScrollConfiguration(
           behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
-          child: CustomScrollView(
+          child: ListView.builder(
             controller: _sidebarScrollController,
-            slivers: [
-              SliverPadding(
-                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-                sliver: SliverToBoxAdapter(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Expanded(
-                            child: _sidebarTile(
-                              icon: Icons.home_filled,
-                              title:
-                                  'Semua Follower (${sidebarChannels.length})',
-                              selected: selectedChannelId.isEmpty,
-                              onTap: () => _selectChannelTab(''),
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            itemCount: sidebarChannels.length,
+            itemBuilder: (context, index) {
+              final ch = sidebarChannels[index];
+              final cid = (ch['channel_id'] ?? '').toString();
+              final title = (ch['title'] ?? '').toString();
+              final isHidden = _isHiddenFlag(ch['is_hidden']);
+              final cHp = int.tryParse((ch['views_hp'] ?? 0).toString()) ?? 0;
+              final cLap =
+                  int.tryParse((ch['views_laptop'] ?? 0).toString()) ?? 0;
+              final watchedCount =
+                  int.tryParse(
+                    (ch['views_total'] ?? ch['watched_count'] ?? 0).toString(),
+                  ) ??
+                  (cHp + cLap);
+              final isSelected = selectedChannelId == cid;
+              return Tooltip(
+                message:
+                    '$title${isHidden ? ' (Hidden)' : ''}\nTotal: $watchedCount view (📱 HP: $cHp | 💻 Laptop: $cLap)',
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(10),
+                  onTap: () => _selectChannelTab(cid),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: isSelected
+                          ? const Color(0xFF272727)
+                          : Colors.transparent,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Row(
+                      children: [
+                        CircleAvatar(
+                          radius: 14,
+                          backgroundColor: const Color(0xFF383838),
+                          backgroundImage:
+                              (ch['thumbnail_url'] ?? '').toString().isNotEmpty
+                              ? NetworkImage(ch['thumbnail_url'])
+                              : null,
+                          onBackgroundImageError:
+                              (ch['thumbnail_url'] ?? '').toString().isNotEmpty
+                              ? (_, _) {}
+                              : null,
+                          child: Text(
+                            title.isNotEmpty ? title[0] : '?',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: Colors.white70,
                             ),
                           ),
-                          if (forceFull)
-                            IconButton(
-                              tooltip: 'Tutup',
-                              icon: const Icon(
-                                Icons.close,
-                                color: Colors.white70,
-                              ),
-                              onPressed: () => Navigator.of(context).pop(),
-                            )
-                          else
-                            IconButton(
-                              tooltip: 'Sembunyikan Sidebar',
-                              icon: const Icon(
-                                Icons.keyboard_double_arrow_left,
-                                size: 20,
-                                color: Colors.white60,
-                              ),
-                              onPressed: () {
-                                setState(() => sidebarMode = 'hidden');
-                                _saveUiPreferences(newSidebarMode: 'hidden');
-                              },
-                            ),
-                        ],
-                      ),
-                      const Divider(color: Color(0xFF272727), height: 24),
-                      const Padding(
-                        padding: EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 6,
                         ),
-                        child: Text(
-                          'Subscriptions ›',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 15,
-                          ),
-                        ),
-                      ),
-                      _buildSidebarLiveSection(isDrawer: forceFull),
-                    ],
-                  ),
-                ),
-              ),
-              SliverPadding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                sliver: SliverList(
-                  delegate: SliverChildBuilderDelegate((context, index) {
-                    final ch = sidebarChannels[index];
-                    final cid = (ch['channel_id'] ?? '').toString();
-                    final title = (ch['title'] ?? '').toString();
-                    final isHidden = _isHiddenFlag(ch['is_hidden']);
-                    final cHp =
-                        int.tryParse((ch['views_hp'] ?? 0).toString()) ?? 0;
-                    final cLap =
-                        int.tryParse((ch['views_laptop'] ?? 0).toString()) ?? 0;
-                    final watchedCount =
-                        int.tryParse(
-                          (ch['views_total'] ?? ch['watched_count'] ?? 0)
-                              .toString(),
-                        ) ??
-                        (cHp + cLap);
-                    final isSelected = selectedChannelId == cid;
-                    return Tooltip(
-                      message:
-                          '$title${isHidden ? ' (Hidden)' : ''}\nTotal: $watchedCount view (📱 HP: $cHp | 💻 Laptop: $cLap)',
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(10),
-                        onTap: () => _selectChannelTab(cid),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 8,
-                          ),
-                          decoration: BoxDecoration(
-                            color: isSelected
-                                ? const Color(0xFF272727)
-                                : Colors.transparent,
-                            borderRadius: BorderRadius.circular(10),
-                          ),
+                        const SizedBox(width: 12),
+                        Expanded(
                           child: Row(
                             children: [
-                              CircleAvatar(
-                                radius: 14,
-                                backgroundColor: const Color(0xFF383838),
-                                backgroundImage:
-                                    (ch['thumbnail_url'] ?? '')
-                                        .toString()
-                                        .isNotEmpty
-                                    ? NetworkImage(ch['thumbnail_url'])
-                                    : null,
-                                onBackgroundImageError:
-                                    (ch['thumbnail_url'] ?? '')
-                                        .toString()
-                                        .isNotEmpty
-                                    ? (_, _) {}
-                                    : null,
+                              Flexible(
                                 child: Text(
-                                  title.isNotEmpty ? title[0] : '?',
-                                  style: const TextStyle(
-                                    fontSize: 11,
-                                    color: Colors.white70,
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Row(
-                                  children: [
-                                    Flexible(
-                                      child: Text(
-                                        title,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontSize: 13.5,
-                                          fontWeight: isSelected
-                                              ? FontWeight.bold
-                                              : FontWeight.normal,
-                                        ),
-                                      ),
-                                    ),
-                                    if (isHidden) ...[
-                                      const SizedBox(width: 6),
-                                      _buildHiddenBadge(
-                                        key: Key('sidebar_hidden_$cid'),
-                                      ),
-                                    ],
-                                  ],
-                                ),
-                              ),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 6,
-                                  vertical: 2,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: watchedCount > 0
-                                      ? const Color(0xFF1E3A2F)
-                                      : Colors.transparent,
-                                  borderRadius: BorderRadius.circular(6),
-                                ),
-                                child: Text(
-                                  '$watchedCount',
+                                  title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                   style: TextStyle(
-                                    fontSize: 11.5,
-                                    fontWeight: watchedCount > 0
+                                    fontSize: 13.5,
+                                    fontWeight: isSelected
                                         ? FontWeight.bold
                                         : FontWeight.normal,
-                                    color: watchedCount > 0
-                                        ? const Color(0xFF81C784)
-                                        : Colors.white54,
                                   ),
                                 ),
                               ),
+                              if (isHidden) ...[
+                                const SizedBox(width: 6),
+                                _buildHiddenBadge(
+                                  key: Key('sidebar_hidden_$cid'),
+                                ),
+                              ],
                             ],
                           ),
                         ),
-                      ),
-                    );
-                  }, childCount: sidebarChannels.length),
-                ),
-              ),
-              SliverPadding(
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                sliver: SliverToBoxAdapter(
-                  child: Column(
-                    children: [
-                      const Divider(color: Color(0xFF272727), height: 28),
-                      _sidebarTile(
-                        icon: Icons.usb,
-                        title: 'Sync USB (HP ⇄ Laptop)',
-                        selected: false,
-                        onTap: _showUsbSyncDialog,
-                      ),
-                      _sidebarTile(
-                        icon: Icons.download_for_offline_outlined,
-                        title: 'Export Excel/CSV',
-                        selected: false,
-                        onTap: _exportExcelCsv,
-                      ),
-                      _sidebarTile(
-                        icon: Icons.sync,
-                        title: 'Sync & API Key',
-                        selected: false,
-                        onTap: _showApiSettingsModal,
-                      ),
-                    ],
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: watchedCount > 0
+                                ? const Color(0xFF1E3A2F)
+                                : Colors.transparent,
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: Text(
+                            '$watchedCount',
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: watchedCount > 0
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                              color: watchedCount > 0
+                                  ? const Color(0xFF81C784)
+                                  : Colors.white54,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
-              ),
-            ],
+              );
+            },
           ),
         ),
+      );
+      if (fixedHeight != null) {
+        return SizedBox(height: fixedHeight, child: listBlock);
+      }
+      return Expanded(child: listBlock);
+    }
+
+    final topSection = Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: _sidebarTile(
+                  icon: Icons.home_filled,
+                  title: 'Semua Follower (${sidebarChannels.length})',
+                  selected: selectedChannelId.isEmpty,
+                  onTap: () => _selectChannelTab(''),
+                ),
+              ),
+              if (forceFull)
+                IconButton(
+                  tooltip: 'Tutup',
+                  icon: const Icon(Icons.close, color: Colors.white70),
+                  onPressed: () => Navigator.of(context).pop(),
+                )
+              else
+                IconButton(
+                  tooltip: 'Sembunyikan Sidebar',
+                  icon: const Icon(
+                    Icons.keyboard_double_arrow_left,
+                    size: 20,
+                    color: Colors.white60,
+                  ),
+                  onPressed: () {
+                    setState(() => sidebarMode = 'hidden');
+                    _saveUiPreferences(newSidebarMode: 'hidden');
+                  },
+                ),
+            ],
+          ),
+          const Divider(color: Color(0xFF272727), height: 18),
+          InkWell(
+            key: const Key('sidebar_subscriptions_toggle'),
+            borderRadius: BorderRadius.circular(8),
+            onTap: () => setState(
+              () => _sidebarCreatorsExpanded = !_sidebarCreatorsExpanded,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              child: Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Subscriptions ›',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 15,
+                      ),
+                    ),
+                  ),
+                  Icon(
+                    _sidebarCreatorsExpanded
+                        ? Icons.expand_more
+                        : Icons.chevron_right,
+                    size: 20,
+                    color: Colors.white70,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          _buildSidebarLiveSection(isDrawer: forceFull),
+        ],
+      ),
+    );
+
+    final bottomSection = Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      child: Column(
+        children: [
+          const Divider(color: Color(0xFF272727), height: 18),
+          _sidebarTile(
+            icon: Icons.usb,
+            title: 'Sync USB (HP ⇄ Laptop)',
+            selected: false,
+            onTap: _showUsbSyncDialog,
+          ),
+          _sidebarTile(
+            icon: Icons.download_for_offline_outlined,
+            title: 'Export Excel/CSV',
+            selected: false,
+            onTap: _exportExcelCsv,
+          ),
+          _sidebarTile(
+            icon: Icons.sync,
+            title: 'Sync & API Key',
+            selected: false,
+            onTap: _showApiSettingsModal,
+          ),
+        ],
+      ),
+    );
+
+    final sidebarContent = Material(
+      color: const Color(0xFF0F0F0F),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          if (constraints.maxHeight < 420) {
+            return SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  topSection,
+                  if (_sidebarCreatorsExpanded)
+                    buildCreatorListBody(fixedHeight: 85),
+                  bottomSection,
+                ],
+              ),
+            );
+          }
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              topSection,
+              if (_sidebarCreatorsExpanded)
+                buildCreatorListBody()
+              else
+                const Spacer(),
+              bottomSection,
+            ],
+          );
+        },
       ),
     );
     if (forceFull) {
@@ -6955,91 +7342,111 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             )
           else if (_sidebarLiveExpanded) ...[
             const SizedBox(height: 6),
-            for (final item in liveList)
-              Builder(
-                builder: (ctx) {
-                  final cid = (item['channel_id'] ?? '').toString();
-                  final chTitle = (item['channel_title'] ?? '').toString();
-                  final chThumb = (item['channel_thumbnail'] ?? '').toString();
-                  return InkWell(
-                    key: Key('sidebar_live_item_$cid'),
-                    borderRadius: BorderRadius.circular(8),
-                    onTap: () {
-                      if (isDrawer && Navigator.of(context).canPop()) {
-                        Navigator.of(context).pop();
-                      }
-                      _openYouTubeVideo(item);
-                    },
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        vertical: 5,
-                        horizontal: 4,
-                      ),
-                      child: Row(
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.all(1.5),
-                            decoration: const BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: Color(0xFFFF0033),
-                            ),
-                            child: CircleAvatar(
-                              radius: 12,
-                              backgroundColor: const Color(0xFF383838),
-                              backgroundImage: chThumb.isNotEmpty
-                                  ? NetworkImage(chThumb)
-                                  : null,
-                              onBackgroundImageError: chThumb.isNotEmpty
-                                  ? (_, _) {}
-                                  : null,
-                              child: Text(
-                                chTitle.isNotEmpty ? chTitle[0] : '?',
-                                style: const TextStyle(
-                                  fontSize: 10,
-                                  color: Colors.white70,
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 200),
+              child: Scrollbar(
+                controller: _sidebarLiveScrollController,
+                thumbVisibility: true,
+                child: SingleChildScrollView(
+                  controller: _sidebarLiveScrollController,
+                  child: Column(
+                    children: [
+                      for (final item in liveList)
+                        Builder(
+                          builder: (ctx) {
+                            final cid = (item['channel_id'] ?? '').toString();
+                            final chTitle =
+                                (item['channel_title'] ?? '').toString();
+                            final chThumb =
+                                (item['channel_thumbnail'] ?? '').toString();
+                            return InkWell(
+                              key: Key('sidebar_live_item_$cid'),
+                              borderRadius: BorderRadius.circular(8),
+                              onTap: () {
+                                if (isDrawer &&
+                                    Navigator.of(context).canPop()) {
+                                  Navigator.of(context).pop();
+                                }
+                                _openYouTubeVideo(item);
+                              },
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 5,
+                                  horizontal: 4,
+                                ),
+                                child: Row(
+                                  children: [
+                                    Container(
+                                      padding: const EdgeInsets.all(1.5),
+                                      decoration: const BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        color: Color(0xFFFF0033),
+                                      ),
+                                      child: CircleAvatar(
+                                        radius: 12,
+                                        backgroundColor: const Color(
+                                          0xFF383838,
+                                        ),
+                                        backgroundImage: chThumb.isNotEmpty
+                                            ? NetworkImage(chThumb)
+                                            : null,
+                                        onBackgroundImageError:
+                                            chThumb.isNotEmpty
+                                            ? (_, _) {}
+                                            : null,
+                                        child: Text(
+                                          chTitle.isNotEmpty ? chTitle[0] : '?',
+                                          style: const TextStyle(
+                                            fontSize: 10,
+                                            color: Colors.white70,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: Text(
+                                        chTitle,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          fontSize: 12.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 6,
+                                        vertical: 2,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFFFF0033),
+                                        borderRadius: BorderRadius.circular(4),
+                                      ),
+                                      child: const Text(
+                                        'LIVE',
+                                        style: TextStyle(
+                                          fontSize: 9.5,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.white,
+                                          letterSpacing: 0.4,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
                                 ),
                               ),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              chTitle,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 12.5,
-                                fontWeight: FontWeight.w600,
-                                color: Colors.white,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 6),
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 6,
-                              vertical: 2,
-                            ),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFFFF0033),
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                            child: const Text(
-                              'LIVE',
-                              style: TextStyle(
-                                fontSize: 9.5,
-                                fontWeight: FontWeight.bold,
-                                color: Colors.white,
-                                letterSpacing: 0.4,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  );
-                },
+                            );
+                          },
+                        ),
+                    ],
+                  ),
+                ),
               ),
+            ),
           ],
         ],
       ),
@@ -7360,6 +7767,341 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     );
   }
 
+  List<Map<String, dynamic>> _matchingSearchChannels() {
+    final raw = searchQuery.trim().toLowerCase();
+    if (raw.isEmpty) return const [];
+    final q = raw.startsWith('@') ? raw.substring(1) : raw;
+    if (q.isEmpty) return const [];
+
+    final matches = <(int, Map<String, dynamic>)>[];
+    for (final ch in channels) {
+      if (!_matchesHideFilter(_isHiddenFlag(ch['is_hidden']))) continue;
+      final title = (ch['title'] ?? '').toString().toLowerCase();
+      final handle = (ch['handle'] ?? '').toString().toLowerCase();
+      final cleanHandle = handle.startsWith('@') ? handle.substring(1) : handle;
+      var score = -1;
+      if (title == q || cleanHandle == q) {
+        score = 0;
+      } else if (title.startsWith(q) || cleanHandle.startsWith(q)) {
+        score = 1;
+      } else if (title.contains(q) || handle.contains(raw)) {
+        score = 2;
+      }
+      if (score >= 0) {
+        matches.add((score, ch));
+      }
+    }
+    matches.sort((a, b) {
+      final cmp = a.$1.compareTo(b.$1);
+      if (cmp != 0) return cmp;
+      final aw = int.tryParse((a.$2['views_total'] ?? a.$2['watched_count'] ?? 0).toString()) ?? 0;
+      final bw = int.tryParse((b.$2['views_total'] ?? b.$2['watched_count'] ?? 0).toString()) ?? 0;
+      return bw.compareTo(aw);
+    });
+    return matches.take(5).map((e) => e.$2).toList();
+  }
+
+  Widget _buildCreatorMenuButton(Map<String, dynamic> ch) {
+    final cid = (ch['channel_id'] ?? '').toString();
+    final title = (ch['title'] ?? cid).toString();
+    final isHidden = _isHiddenFlag(ch['is_hidden']);
+    final isReloading = _reloadingChannelIds.contains(cid);
+
+    if (isReloading) {
+      return const Padding(
+        padding: EdgeInsets.all(10),
+        child: SizedBox(
+          width: 18,
+          height: 18,
+          child: CircularProgressIndicator(
+            strokeWidth: 2,
+            color: Color(0xFFFF0033),
+          ),
+        ),
+      );
+    }
+
+    return PopupMenuButton<String>(
+      key: Key('creator_menu_btn_$cid'),
+      icon: const Icon(
+        Icons.more_vert,
+        size: 20,
+        color: Colors.white70,
+      ),
+      color: const Color(0xFF282828),
+      tooltip: 'Opsi Creator',
+      onSelected: (value) {
+        if (value == 'reload') {
+          _reloadSingleCreator(ch, maxVideos: 100);
+        } else if (value == 'custom_range') {
+          _showCreatorRangeReloadDialog(ch);
+        }
+      },
+      itemBuilder: (popupCtx) => [
+        const PopupMenuItem<String>(
+          value: 'reload',
+          child: Row(
+            children: [
+              Icon(Icons.refresh, color: Color(0xFF81C784), size: 18),
+              SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'Reload Data Channel',
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    Text(
+                      'Tarik hingga 100 video terbaru',
+                      style: TextStyle(fontSize: 11, color: Colors.white54),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        const PopupMenuItem<String>(
+          value: 'custom_range',
+          child: Row(
+            children: [
+              Icon(Icons.date_range, color: Color(0xFF3EA6FF), size: 18),
+              SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'Atur Tanggal & Batas Video',
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    Text(
+                      'Custom Date Range (hari/bulan/tahun)',
+                      style: TextStyle(fontSize: 11, color: Colors.white54),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        PopupMenuItem<String>(
+          enabled: false,
+          padding: EdgeInsets.zero,
+          child: _HoldToActionMenuItem(
+            label: 'Unsubscribe "$title"',
+            idleSubtitle:
+                (skipUnsubscribeConfirmUntil != null &&
+                    DateTime.now().isBefore(skipUnsubscribeConfirmUntil!))
+                ? '⚡ Tahan 1 detik untuk langsung Unsubscribe'
+                : '👆 Tahan 1 detik untuk Unsubscribe',
+            icon: Icons.person_remove,
+            accentColor: const Color(0xFFFF4E4E),
+            labelColor: const Color(0xFFFF6B6B),
+            activeBgColor: const Color(0xFF4A1818),
+            progressBarColor: const Color(0xFFFF0033),
+            onHoldCompleted: () {
+              Navigator.of(popupCtx).pop();
+              _confirmOrUnsubscribeChannel(cid, title);
+            },
+          ),
+        ),
+        PopupMenuItem<String>(
+          enabled: false,
+          padding: EdgeInsets.zero,
+          child: _HoldToActionMenuItem(
+            label: isHidden ? 'Unhide "$title"' : 'Hide "$title"',
+            idleSubtitle: isHidden
+                ? '👆 Tahan 1 detik untuk Unhide'
+                : '👆 Tahan 1 detik untuk Hide',
+            icon: isHidden ? Icons.visibility : Icons.visibility_off,
+            accentColor: const Color(0xFFFFD600),
+            labelColor: const Color(0xFFFFE57F),
+            activeBgColor: const Color(0xFF42360A),
+            progressBarColor: const Color(0xFFFFD600),
+            onHoldCompleted: () {
+              Navigator.of(popupCtx).pop();
+              _toggleChannelHidden(cid, title, hide: !isHidden);
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCreatorHeaderCard(
+    Map<String, dynamic> ch, {
+    required bool isSearchMatch,
+  }) {
+    final cid = (ch['channel_id'] ?? '').toString();
+    final title = (ch['title'] ?? cid).toString();
+    final handle = (ch['handle'] ?? '').toString();
+    final thumbUrl = (ch['thumbnail_url'] ?? '').toString();
+    final isHidden = _isHiddenFlag(ch['is_hidden']);
+    final ytSubs =
+        int.tryParse((ch['yt_subscriber_count'] ?? 0).toString()) ?? 0;
+    final ytVids = int.tryParse((ch['yt_video_count'] ?? 0).toString()) ?? 0;
+    final syncedCount = isStandaloneMode
+        ? _localVideos
+              .where((v) => (v['channel_id'] ?? '').toString() == cid)
+              .length
+        : (int.tryParse((ch['synced_video_count'] ?? 0).toString()) ?? 0);
+
+    final metaParts = <String>[
+      if (handle.isNotEmpty) handle,
+      if (ytSubs > 0) '${_formatCompactNumber(ytSubs)} subscribers',
+      if (syncedCount > 0) '$syncedCount video tersimpan',
+      if (ytVids > syncedCount) '${_formatCompactNumber(ytVids)} di YouTube',
+    ];
+
+    return Container(
+      key: Key(
+        isSearchMatch ? 'search_creator_card_$cid' : 'active_creator_card_$cid',
+      ),
+      margin: const EdgeInsets.fromLTRB(16, 6, 16, 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFF181818),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: isSearchMatch
+              ? const Color(0xFF2D2D2D)
+              : const Color(0x44FF0033),
+        ),
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: isSearchMatch
+            ? () {
+                _searchCtrl.clear();
+                searchQuery = '';
+                _showMobileSearch = false;
+                _selectChannelTab(cid);
+              }
+            : null,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Row(
+            children: [
+              CircleAvatar(
+                radius: 24,
+                backgroundColor: const Color(0xFF383838),
+                backgroundImage: thumbUrl.isNotEmpty
+                    ? NetworkImage(thumbUrl)
+                    : null,
+                onBackgroundImageError: thumbUrl.isNotEmpty ? (_, _) {} : null,
+                child: Text(
+                  title.isNotEmpty ? title[0].toUpperCase() : '?',
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white70,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 15.5,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                        if (isHidden) ...[
+                          const SizedBox(width: 6),
+                          _buildHiddenBadge(),
+                        ],
+                      ],
+                    ),
+                    if (metaParts.isNotEmpty) ...[
+                      const SizedBox(height: 3),
+                      Text(
+                        metaParts.join(' • '),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.white60,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF272727),
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.notifications_none,
+                      size: 16,
+                      color: Colors.white,
+                    ),
+                    SizedBox(width: 4),
+                    Text(
+                      'Subscribed',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 4),
+              _buildCreatorMenuButton(ch),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCreatorSection() {
+    if (selectedChannelId.isNotEmpty) {
+      final activeCh = channels.cast<Map<String, dynamic>?>().firstWhere(
+        (c) => (c?['channel_id'] ?? '').toString() == selectedChannelId,
+        orElse: () => null,
+      );
+      if (activeCh == null) return const SizedBox.shrink();
+      return _buildCreatorHeaderCard(activeCh, isSearchMatch: false);
+    }
+
+    final matches = _matchingSearchChannels();
+    if (matches.isEmpty) return const SizedBox.shrink();
+
+    return Column(
+      key: const Key('search_creators_section'),
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (final ch in matches)
+          _buildCreatorHeaderCard(ch, isSearchMatch: true),
+      ],
+    );
+  }
+
   Widget _buildVideoGridWithPagination(double screenWidth) {
     final isMobile = MediaQuery.of(context).size.width < 750;
     if (videos.isEmpty) {
@@ -7367,6 +8109,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         children: [
           if (isMobile && _showMobileSearch) _buildMobileSearchRow(),
           _buildFilterSummaryStrip(isMobile),
+          _buildCreatorSection(),
           _buildMainLiveSection(),
           const Expanded(
             child: Center(
@@ -7395,6 +8138,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           if (isMobile && _showMobileSearch)
             SliverToBoxAdapter(child: _buildMobileSearchRow()),
           SliverToBoxAdapter(child: _buildFilterSummaryStrip(isMobile)),
+          SliverToBoxAdapter(child: _buildCreatorSection()),
           SliverToBoxAdapter(child: _buildPaginationTabsBar()),
           SliverToBoxAdapter(child: _buildMainLiveSection()),
           SliverPadding(
