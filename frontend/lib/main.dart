@@ -116,6 +116,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   bool _bundledDataLoaded = false;
   bool _exitDialogOpen = false;
   bool _purgingShorts = false;
+  int _purgingShortsChecked = 0;
+  int _purgingShortsTotal = 0;
+  int _purgingShortsDeleted = 0;
   final Set<String> _localUnsubscribedIds = {};
   final Set<String> _reloadingChannelIds = {};
   final Map<String, int> _reloadingChannelProgress = {};
@@ -1137,6 +1140,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         baseUrl,
         'http://127.0.0.1:8000',
         'http://172.18.164.232:8000',
+        'http://192.168.68.52:8000',
         'http://192.168.68.54:8000',
       };
       for (final candidate in candidates) {
@@ -1218,20 +1222,20 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           final doneRows = await db.query(
             'settings',
             where: 'key = ?',
-            whereArgs: const ['shorts_reverify_v23_done'],
+            whereArgs: const ['shorts_reverify_v24_done'],
           );
           if (doneRows.isEmpty) {
             for (final v in _localVideos) {
-              final dsec =
+              final rawDsec =
                   int.tryParse((v['duration_seconds'] ?? 0).toString()) ?? 0;
+              final dsec = rawDsec > 0
+                  ? rawDsec
+                  : _durationToSeconds((v['duration'] ?? '').toString());
               if (dsec > 0 && dsec <= 185) {
                 v['format_checked'] = 0;
+                if (rawDsec == 0) v['duration_seconds'] = dsec;
               }
             }
-            await db.insert('settings', {
-              'key': 'shorts_reverify_v23_done',
-              'value': '1',
-            }, conflictAlgorithm: ConflictAlgorithm.replace);
           }
         } catch (_) {}
       }
@@ -4775,6 +4779,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         'http://127.0.0.1:8000',
         'http://10.0.2.2:8000',
         'http://172.18.164.232:8000',
+        'http://192.168.68.52:8000',
         'http://192.168.68.54:8000',
       };
       for (final cand in candidates) {
@@ -5729,14 +5734,48 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   }
 
   List<Map<String, dynamic>> _standaloneShortCandidates() {
-    return _localVideos.where((v) {
+    final list = _localVideos.where((v) {
       if (v['is_demo'] == 1) return false;
       if (_isLiveFlag(v['is_live'])) return false;
       if ((v['format_checked'] ?? 0) == 1) return false;
-      final dsec =
+      final rawDsec =
           int.tryParse((v['duration_seconds'] ?? 0).toString()) ?? 0;
+      final dsec = rawDsec > 0
+          ? rawDsec
+          : _durationToSeconds((v['duration'] ?? '').toString());
       return dsec > 0 && dsec <= 185;
     }).toList();
+    list.sort(
+      (a, b) => (b['published_at'] ?? '').toString().compareTo(
+        (a['published_at'] ?? '').toString(),
+      ),
+    );
+    return list;
+  }
+
+  Future<void> _saveStandalonePurgeBatch(
+    List<String> deleteIds,
+    List<Map<String, dynamic>> checkedRegular,
+  ) async {
+    if (!_isHpDevice || (deleteIds.isEmpty && checkedRegular.isEmpty)) return;
+    try {
+      final db = await _openStandaloneDatabase();
+      await db.transaction((txn) async {
+        final batch = txn.batch();
+        for (final vid in deleteIds) {
+          batch.delete('videos', where: 'id = ?', whereArgs: [vid]);
+        }
+        for (final v in checkedRegular) {
+          final vid = (v['video_id'] ?? '').toString();
+          if (vid.isEmpty) continue;
+          batch.insert('videos', {
+            'id': vid,
+            'data': jsonEncode(v),
+          }, conflictAlgorithm: ConflictAlgorithm.replace);
+        }
+        await batch.commit(noResult: true);
+      });
+    } catch (_) {}
   }
 
   Future<void> _maybeAutoPurgeStandaloneShorts() async {
@@ -5760,14 +5799,32 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       return 0;
     }
 
-    _purgingShorts = true;
+    if (mounted) {
+      setState(() {
+        _purgingShorts = true;
+        _purgingShortsChecked = 0;
+        _purgingShortsTotal = candidates.length;
+        _purgingShortsDeleted = 0;
+      });
+    } else {
+      _purgingShorts = true;
+      _purgingShortsChecked = 0;
+      _purgingShortsTotal = candidates.length;
+      _purgingShortsDeleted = 0;
+    }
     var deletedTotal = 0;
+    var checkedTotal = 0;
+    var completedAll = true;
     final client = http.Client();
     try {
-      const batchSize = 12;
-      final shortIds = <String>{};
+      const batchSize = 40;
+      final pendingDeleteIds = <String>[];
+      final pendingRegular = <Map<String, dynamic>>[];
       for (var i = 0; i < candidates.length; i += batchSize) {
-        if (!mounted) break;
+        if (!mounted) {
+          completedAll = false;
+          break;
+        }
         final slice = candidates.sublist(
           i,
           (i + batchSize > candidates.length) ? candidates.length : i + batchSize,
@@ -5779,34 +5836,52 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             return MapEntry(v, kind);
           }),
         );
+        final sliceShortIds = <String>{};
         for (final entry in results) {
+          checkedTotal++;
           final v = entry.key;
           final vid = (v['video_id'] ?? '').toString();
           if (entry.value == 'short') {
-            if (vid.isNotEmpty) shortIds.add(vid);
+            if (vid.isNotEmpty) {
+              sliceShortIds.add(vid);
+              pendingDeleteIds.add(vid);
+            }
           } else if (entry.value == 'regular') {
             v['format_checked'] = 1;
+            pendingRegular.add(v);
           }
         }
-        if (shortIds.length >= 60) {
+        if (sliceShortIds.isNotEmpty) {
           final beforeLen = _localVideos.length;
           _localVideos.removeWhere(
-            (v) => shortIds.contains((v['video_id'] ?? '').toString()),
+            (v) => sliceShortIds.contains((v['video_id'] ?? '').toString()),
           );
           deletedTotal += (beforeLen - _localVideos.length).clamp(0, 999999);
-          shortIds.clear();
-          await _saveStandaloneData();
-          if (mounted) _applyLocalFilterAndPagination();
+        }
+        _purgingShortsChecked = checkedTotal;
+        _purgingShortsDeleted = deletedTotal;
+
+        final shouldFlushDb =
+            pendingDeleteIds.length + pendingRegular.length >= 160 ||
+            (i + batchSize >= candidates.length);
+        if (shouldFlushDb) {
+          await _saveStandalonePurgeBatch(pendingDeleteIds, pendingRegular);
+          pendingDeleteIds.clear();
+          pendingRegular.clear();
+        }
+        if (mounted && (sliceShortIds.isNotEmpty || shouldFlushDb)) {
+          _applyLocalFilterAndPagination();
         }
       }
-      if (shortIds.isNotEmpty) {
-        final beforeLen = _localVideos.length;
-        _localVideos.removeWhere(
-          (v) => shortIds.contains((v['video_id'] ?? '').toString()),
-        );
-        deletedTotal += (beforeLen - _localVideos.length).clamp(0, 999999);
+      if (completedAll && _isHpDevice) {
+        try {
+          final db = await _openStandaloneDatabase();
+          await db.insert('settings', {
+            'key': 'shorts_reverify_v24_done',
+            'value': '1',
+          }, conflictAlgorithm: ConflictAlgorithm.replace);
+        } catch (_) {}
       }
-      await _saveStandaloneData();
       if (mounted) {
         _applyLocalFilterAndPagination();
         if (showFeedback) {
@@ -5822,7 +5897,19 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       }
       return deletedTotal;
     } finally {
-      _purgingShorts = false;
+      if (mounted) {
+        setState(() {
+          _purgingShorts = false;
+          _purgingShortsChecked = 0;
+          _purgingShortsTotal = 0;
+          _purgingShortsDeleted = 0;
+        });
+      } else {
+        _purgingShorts = false;
+        _purgingShortsChecked = 0;
+        _purgingShortsTotal = 0;
+        _purgingShortsDeleted = 0;
+      }
       client.close();
     }
   }
@@ -7837,6 +7924,8 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       durationLabel,
       '$limit Video/Tab',
       'Total: $totalVideos video',
+      if (_purgingShorts && _purgingShortsTotal > 0)
+        '🧹 Hapus Shorts: $_purgingShortsChecked/$_purgingShortsTotal (-$_purgingShortsDeleted)',
     ];
     final summaryText = parts.join('  •  ');
 

@@ -1,12 +1,12 @@
 # Graph Report - youtube  (2026-11-14)
 
 ## Corpus Check
-- 49 files · ~126,400 words
+- 49 files · ~126,665 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 29 file(s) not represented in the graph (top: .xml 7, (none) 6, .bat 6)
 
 ## Summary
-- 672 nodes · 1040 edges · 34 communities (19 shown, 15 thin omitted)
+- 676 nodes · 1044 edges · 34 communities (19 shown, 15 thin omitted)
 - Extraction: 98% EXTRACTED · 2% INFERRED · 0% AMBIGUOUS · INFERRED: 23 edges (avg confidence: 0.85)
 - Token cost: 0 input · 0 output
 
@@ -72,7 +72,7 @@
 
 ### Community 0 - "Community 0"
 Cohesion: 0.01
-Nodes (241): accentColor, activeBgColor, _activeDayFocusListener, _activeDurationThumb, apiKeyPreview, _applyLocalFilterAndPagination, _applyPeriodChoice, _applySyncDataString (+233 more)
+Nodes (245): accentColor, activeBgColor, _activeDayFocusListener, _activeDurationThumb, apiKeyPreview, _applyLocalFilterAndPagination, _applyPeriodChoice, _applySyncDataString (+237 more)
 
 ### Community 1 - "Community 1"
 Cohesion: 0.06
@@ -147,8 +147,8 @@ Cohesion: 0.50
 Nodes (5): increment_channel_watched(), record_watch(), watch_channel(), watch_video(), WatchPayload
 
 ## Knowledge Gaps
-- **278 isolated node(s):** `baseUrl`, `sidebarMode`, `filterMinimized`, `loading`, `refreshingYouTube` (+273 more)
-  These have ≤1 connection - possible missing edges. (Counts symbols only; 445 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+- **282 isolated node(s):** `baseUrl`, `sidebarMode`, `filterMinimized`, `loading`, `refreshingYouTube` (+277 more)
+  These have ≤1 connection - possible missing edges. (Counts symbols only; 449 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
 - **15 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
@@ -157,14 +157,14 @@ _Questions this graph is uniquely positioned to answer:_
 - **Why does `Win32Window` connect `Community 12` to `Community 4`, `Community 6`, `Community 7`, `Community 14`, `Community 16`?**
   _High betweenness centrality (0.015) - this node is a cross-community bridge._
 - **What connects `baseUrl`, `sidebarMode`, `filterMinimized` to the rest of the system?**
-  _278 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _282 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `Community 0` be split into smaller, more focused modules?**
-  _Cohesion score 0.00749063670411985 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.007380073800738007 - nodes in this community are weakly interconnected._
 - **Why does `upsert_channel()` connect `Community 1` to `Community 3`, `Community 21`?**
-  _High betweenness centrality (0.014) - this node is a cross-community bridge._
+  _High betweenness centrality (0.013) - this node is a cross-community bridge._
 - **Should `Community 1` be split into smaller, more focused modules?**
   _Cohesion score 0.05742296918767507 - nodes in this community are weakly interconnected._
 - **Why does `list_channels()` connect `Community 1` to `Community 3`, `Community 10`, `Community 18`, `Community 21`?**
-  _High betweenness centrality (0.013) - this node is a cross-community bridge._
+  _High betweenness centrality (0.012) - this node is a cross-community bridge._
 - **Should `Community 2` be split into smaller, more focused modules?**
   _Cohesion score 0.0425531914893617 - nodes in this community are weakly interconnected._
