@@ -48,7 +48,8 @@ class YouTubeHomeScreen extends StatefulWidget {
   State<YouTubeHomeScreen> createState() => _YouTubeHomeScreenState();
 }
 
-class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
+class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
+    with WidgetsBindingObserver {
   String baseUrl = Uri.base.port == 8000
       ? Uri.base.origin
       : 'http://127.0.0.1:8000';
@@ -78,7 +79,8 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   DateTime? customRangeStart;
   DateTime? customRangeEnd;
   VoidCallback? _refreshFilterModal;
-  String hideFilter = 'unhide'; // 'unhide' | 'both' | 'hide' (selalu 'unhide' saat buka aplikasi)
+  String hideFilter =
+      'unhide'; // 'unhide' | 'both' | 'hide' (selalu 'unhide' saat buka aplikasi)
   String selectedChannelId = '';
   String searchQuery = '';
   bool get _isHpDevice =>
@@ -101,7 +103,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   skipUnsubscribeConfirmUntil; // Mode 10 menit langsung Unsubscribe tanpa konfirmasi
 
   List<Map<String, dynamic>> channels = [];
+  List<Map<String, dynamic>> liveStreams = [];
   List<Map<String, dynamic>> videos = [];
+  bool _wasBackgrounded = false;
   bool hasApiKey = false;
   String apiKeyPreview = '';
   String localApiKey = '';
@@ -117,28 +121,51 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   final TextEditingController _searchCtrl = TextEditingController();
   final TextEditingController _dayInputCtrl = TextEditingController();
   final FocusNode _dayFocusNode = FocusNode();
-  final GlobalKey _dayBoxKey = GlobalKey();
+  final GlobalKey _dayInputSlotKey = GlobalKey();
+  Timer? _dayInputDebounce;
+  VoidCallback? _activeDayFocusListener;
+  final Map<String, int> _pubEpochCache = {};
   final FocusNode _mobileSearchFocusNode = FocusNode();
   final ScrollController _videoScrollController = ScrollController();
+  final ScrollController _sidebarScrollController = ScrollController();
   bool _showMobileSearch = false;
   int _fetchVideosSeq = 0;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initLocalSeedData();
     _restoreSessionAndFetch();
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      _wasBackgrounded = true;
+    } else if (state == AppLifecycleState.resumed && _wasBackgrounded) {
+      _wasBackgrounded = false;
+      _triggerAutoRefreshYouTube();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _refreshPollTimer?.cancel();
     _usbSyncResetTimer?.cancel();
+    _dayInputDebounce?.cancel();
+    if (_activeDayFocusListener != null) {
+      _dayFocusNode.removeListener(_activeDayFocusListener!);
+      _activeDayFocusListener = null;
+    }
     _searchCtrl.dispose();
     _dayInputCtrl.dispose();
     _dayFocusNode.dispose();
     _mobileSearchFocusNode.dispose();
     _videoScrollController.dispose();
+    _sidebarScrollController.dispose();
     super.dispose();
   }
 
@@ -882,8 +909,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       final days = int.parse(period.substring(0, period.length - 1));
       if (days >= 1) {
         final startDt = todayStart.subtract(Duration(days: days));
-        final endDt = todayStart.subtract(Duration(days: days - 1));
-        return (_formatUtcIso(startDt), _formatUtcIso(endDt));
+        return (_formatUtcIso(startDt), null);
       }
     }
     if (_isCustomYearPeriod(period)) {
@@ -958,6 +984,16 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         )
         .toList();
 
+    int cachedEpochMs(dynamic raw) {
+      final s = (raw ?? '').toString().trim();
+      if (s.isEmpty) return -1;
+      return _pubEpochCache[s] ??=
+          (DateTime.tryParse(s)?.toUtc().millisecondsSinceEpoch ?? -2);
+    }
+
+    final startMs = startDt?.millisecondsSinceEpoch;
+    final endMs = endDt?.millisecondsSinceEpoch;
+
     final qLower = searchQuery.trim().toLowerCase();
     final minSec = durationRange.start.round() * 60;
     final maxSec = durationRange.end.round() * 60;
@@ -987,12 +1023,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         final ct = (v['channel_title'] ?? '').toString().toLowerCase();
         if (!t.contains(qLower) && !ct.contains(qLower)) return false;
       }
-      if (startDt != null || endDt != null) {
-        final pubStr = (v['published_at'] ?? '').toString();
-        final pubDt = DateTime.tryParse(pubStr)?.toUtc();
-        if (pubDt == null) return false;
-        if (startDt != null && pubDt.isBefore(startDt)) return false;
-        if (endDt != null && !pubDt.isBefore(endDt)) return false;
+      if (startMs != null || endMs != null) {
+        final pubMs = cachedEpochMs(v['published_at']);
+        if (pubMs < 0) return false;
+        if (startMs != null && pubMs < startMs) return false;
+        if (endMs != null && pubMs >= endMs) return false;
       }
       return true;
     }).toList();
@@ -1007,16 +1042,18 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           b['like_count'],
         ).compareTo(safeIntVal(a['like_count']));
       } else {
+        final daMs = cachedEpochMs(a['published_at']);
+        final dbMs = cachedEpochMs(b['published_at']);
+        if (daMs == -1 && dbMs == -1) return 0;
+        if (daMs == -1) return 1;
+        if (dbMs == -1) return -1;
+        if (daMs >= 0 && dbMs >= 0) {
+          return sortBy == 'oldest'
+              ? daMs.compareTo(dbMs)
+              : dbMs.compareTo(daMs);
+        }
         final pa = (a['published_at'] ?? '').toString().trim();
         final pb = (b['published_at'] ?? '').toString().trim();
-        if (pa.isEmpty && pb.isEmpty) return 0;
-        if (pa.isEmpty) return 1;
-        if (pb.isEmpty) return -1;
-        final da = DateTime.tryParse(pa)?.toUtc();
-        final db = DateTime.tryParse(pb)?.toUtc();
-        if (da != null && db != null) {
-          return sortBy == 'oldest' ? da.compareTo(db) : db.compareTo(da);
-        }
         return sortBy == 'oldest' ? pa.compareTo(pb) : pb.compareTo(pa);
       }
     });
@@ -1027,9 +1064,40 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final startIdx = (safePage - 1) * limit;
     final endIdx = (startIdx + limit > total) ? total : startIdx + limit;
 
+    final localLive = <Map<String, dynamic>>[];
+    final seenLiveCids = <String>{};
+    for (final v in _localVideos) {
+      final isLive = v['is_live'] == 1 ||
+          v['is_live'] == true ||
+          v['is_live']?.toString() == '1';
+      if (!isLive) continue;
+      final vCid = (v['channel_id'] ?? '').toString();
+      if (vCid.isEmpty || unfollowedCids.contains(vCid)) continue;
+      if (seenLiveCids.contains(vCid)) continue;
+      seenLiveCids.add(vCid);
+      Map<String, dynamic>? chMeta;
+      for (final c in _localChannels) {
+        if ((c['channel_id'] ?? '').toString() == vCid) {
+          chMeta = c;
+          break;
+        }
+      }
+      localLive.add({
+        ...v,
+        'channel_title':
+            (chMeta?['title'] ?? v['channel_title'] ?? '').toString(),
+        'channel_thumbnail':
+            (chMeta?['thumbnail_url'] ?? v['channel_thumbnail'] ?? '')
+                .toString(),
+        'channel_is_hidden':
+            chMeta?['is_hidden'] ?? v['channel_is_hidden'] ?? 0,
+      });
+    }
+
     setState(() {
       isStandaloneMode = true;
       channels = visibleChannels;
+      liveStreams = localLive;
       totalVideos = total;
       totalPages = pages;
       currentPage = safePage;
@@ -1076,6 +1144,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         setState(() {
           isStandaloneMode = false;
           channels = List<Map<String, dynamic>>.from(sData['channels'] ?? []);
+          liveStreams = List<Map<String, dynamic>>.from(
+            sData['live_streams'] ?? [],
+          );
           _sortChannelsByWatchedDesc(channels);
           hasApiKey = sData['has_api_key'] ?? false;
           apiKeyPreview = sData['api_key_preview'] ?? '';
@@ -1118,6 +1189,52 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       }
     } catch (_) {}
     await _fetchVideos();
+    _triggerAutoRefreshYouTube();
+  }
+
+  bool _isLiveFlag(dynamic val) =>
+      val == 1 || val == true || val?.toString() == '1';
+
+  List<Map<String, dynamic>> _visibleLiveStreams({
+    bool ignoreSelectedChannel = false,
+  }) {
+    final hiddenMap = <String, bool>{};
+    final unfollowedSet = <String>{..._localUnsubscribedIds};
+    for (final c in channels) {
+      final cid = (c['channel_id'] ?? '').toString();
+      hiddenMap[cid] = _isHiddenFlag(c['is_hidden']);
+      if ((c['status'] ?? 'subscribed') == 'unfollowed') {
+        unfollowedSet.add(cid);
+      }
+    }
+    final result = <Map<String, dynamic>>[];
+    final seenCids = <String>{};
+    for (final item in liveStreams) {
+      final cid = (item['channel_id'] ?? '').toString();
+      if (cid.isEmpty || unfollowedSet.contains(cid)) continue;
+      final isHidden = hiddenMap.containsKey(cid)
+          ? hiddenMap[cid]!
+          : _isHiddenFlag(item['channel_is_hidden']);
+      if (!_matchesHideFilter(isHidden)) continue;
+      if (!ignoreSelectedChannel &&
+          selectedChannelId.isNotEmpty &&
+          cid != selectedChannelId) {
+        continue;
+      }
+      if (seenCids.contains(cid)) continue;
+      seenCids.add(cid);
+      result.add(item);
+    }
+    return result;
+  }
+
+  void _triggerAutoRefreshYouTube() {
+    if (!mounted || refreshingYouTube || refreshReadyGreen) return;
+    final hasCreds = isStandaloneMode
+        ? localApiKey.trim().isNotEmpty
+        : hasApiKey;
+    if (!hasCreds) return;
+    _manualRefreshYouTube(isAuto: true);
   }
 
   void _startRefreshPolling() {
@@ -1161,7 +1278,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               );
             } else if (ready) {
               try {
-                await http.post(Uri.parse('$baseUrl/api/refresh-youtube/consume'));
+                await http.post(
+                  Uri.parse('$baseUrl/api/refresh-youtube/consume'),
+                );
               } catch (_) {}
               if (!mounted) return;
               setState(() {
@@ -1228,7 +1347,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     }
   }
 
-  Future<void> _manualRefreshYouTube() async {
+  Future<void> _manualRefreshYouTube({bool isAuto = false}) async {
     // 1. Jika tombol sudah HIJAU (Sync 100% selesai), klik tombol hijau langsung menampilkan video baru ke layar!
     if (refreshReadyGreen) {
       if (!isStandaloneMode) {
@@ -1353,14 +1472,16 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           refreshingYouTube = false;
           refreshProgress = 0;
         });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            backgroundColor: Colors.redAccent,
-            content: Text(
-              '⚠️ Gagal Refresh YouTube: ${e.toString().replaceAll("Exception: ", "")}',
+        if (!isAuto) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              backgroundColor: Colors.redAccent,
+              content: Text(
+                '⚠️ Gagal Refresh YouTube: ${e.toString().replaceAll("Exception: ", "")}',
+              ),
             ),
-          ),
-        );
+          );
+        }
       }
     }
   }
@@ -1371,6 +1492,10 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
 
   Future<void> _fetchVideos({bool silent = false}) async {
     final seq = ++_fetchVideosSeq;
+    if (isStandaloneMode) {
+      _applyLocalFilterAndPagination();
+      return;
+    }
     if (!silent) setState(() => loading = true);
     try {
       final stateRes = await http
@@ -1465,6 +1590,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             setState(() {
               isStandaloneMode = false;
               channels = fetchedChannels;
+              liveStreams = List<Map<String, dynamic>>.from(
+                retryData['live_streams'] ?? sData['live_streams'] ?? [],
+              );
               _sortChannelsByWatchedDesc(channels);
               hasApiKey = sData['has_api_key'] ?? false;
               apiKeyPreview = sData['api_key_preview'] ?? '';
@@ -1480,6 +1608,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         setState(() {
           isStandaloneMode = false;
           channels = fetchedChannels;
+          liveStreams = List<Map<String, dynamic>>.from(
+            vData['live_streams'] ?? sData['live_streams'] ?? [],
+          );
           _sortChannelsByWatchedDesc(channels);
           hasApiKey = sData['has_api_key'] ?? false;
           apiKeyPreview = sData['api_key_preview'] ?? '';
@@ -1573,11 +1704,44 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     List<Map<String, dynamic>> targetChs,
   ) async {
     if (targetChs.isEmpty) return;
+    final targetCids = targetChs
+        .map((c) => (c['channel_id'] ?? '').toString())
+        .where((c) => c.isNotEmpty)
+        .toSet();
     final existingVidIds = _localVideos
         .map((v) => (v['video_id'] ?? '').toString())
         .toSet();
+    final existingLiveIds = <String>{};
+    final chMetaMap = <String, Map<String, String>>{};
+    for (final ch in targetChs) {
+      final cid = (ch['channel_id'] ?? '').toString();
+      chMetaMap[cid] = {
+        'channel_id': cid,
+        'channel_title': (ch['title'] ?? '').toString(),
+        'channel_thumbnail': (ch['thumbnail_url'] ?? '').toString(),
+      };
+    }
     final newVidMeta = <String, Map<String, String>>{};
+    for (final v in _localVideos) {
+      final vCid = (v['channel_id'] ?? '').toString();
+      final vid = (v['video_id'] ?? '').toString();
+      if (_isLiveFlag(v['is_live']) &&
+          vid.isNotEmpty &&
+          targetCids.contains(vCid)) {
+        existingLiveIds.add(vid);
+        newVidMeta[vid] = chMetaMap[vCid] ?? {'channel_id': vCid};
+      }
+    }
+
     final vidRegex = RegExp(r'<yt:videoId>([^<]+)</yt:videoId>');
+    final entryRegex = RegExp(
+      r'<entry>.*?<yt:videoId>([^<]+)</yt:videoId>.*?(?:<updated>([^<]+)</updated>)?.*?</entry>',
+      dotAll: true,
+    );
+    final liveRssCutoff = DateTime.now()
+        .toUtc()
+        .subtract(const Duration(days: 14))
+        .toIso8601String();
 
     final client = http.Client();
     try {
@@ -1585,44 +1749,71 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       var doneCount = 0;
       final concurrency = targetChs.length < 25 ? targetChs.length : 25;
 
+      Future<String?> fetchRss(Uri uri) async {
+        for (var attempt = 0; attempt < 2; attempt++) {
+          try {
+            final res = await client
+                .get(uri)
+                .timeout(const Duration(seconds: 4));
+            if (res.statusCode == 200) return res.body;
+            if ((res.statusCode == 429 || res.statusCode >= 500) &&
+                attempt == 0) {
+              await Future.delayed(const Duration(milliseconds: 150));
+              continue;
+            }
+            return null;
+          } catch (_) {
+            if (attempt == 0) {
+              await Future.delayed(const Duration(milliseconds: 150));
+            }
+          }
+        }
+        return null;
+      }
+
       Future<void> worker() async {
         while (true) {
           if (nextIdx >= targetChs.length) return;
           final ch = targetChs[nextIdx++];
           final cid = (ch['channel_id'] ?? '').toString();
           if (cid.startsWith('UC')) {
-            final feedUri = Uri.parse(
-              'https://www.youtube.com/feeds/videos.xml?channel_id=$cid',
+            final meta = {
+              'channel_id': cid,
+              'channel_title': (ch['title'] ?? '').toString(),
+              'channel_thumbnail': (ch['thumbnail_url'] ?? '').toString(),
+            };
+            final mainXml = await fetchRss(
+              Uri.parse(
+                'https://www.youtube.com/feeds/videos.xml?channel_id=$cid',
+              ),
             );
-            for (var attempt = 0; attempt < 2; attempt++) {
-              try {
-                final res = await client
-                    .get(feedUri)
-                    .timeout(const Duration(seconds: 4));
-                if (res.statusCode == 200) {
-                  final matches = vidRegex.allMatches(res.body);
-                  for (final m in matches) {
-                    final vid = (m.group(1) ?? '').trim();
-                    if (vid.isNotEmpty && !existingVidIds.contains(vid)) {
-                      newVidMeta[vid] = {
-                        'channel_id': cid,
-                        'channel_title': (ch['title'] ?? '').toString(),
-                        'channel_thumbnail': (ch['thumbnail_url'] ?? '')
-                            .toString(),
-                      };
+            if (mainXml != null) {
+              for (final m in vidRegex.allMatches(mainXml)) {
+                final vid = (m.group(1) ?? '').trim();
+                if (vid.isNotEmpty && !existingVidIds.contains(vid)) {
+                  newVidMeta[vid] = meta;
+                }
+              }
+            }
+            if (cid.length > 2) {
+              final uulv = 'UULV${cid.substring(2)}';
+              final liveXml = await fetchRss(
+                Uri.parse(
+                  'https://www.youtube.com/feeds/videos.xml?playlist_id=$uulv',
+                ),
+              );
+              if (liveXml != null) {
+                for (final m in entryRegex.allMatches(liveXml)) {
+                  final vid = (m.group(1) ?? '').trim();
+                  final upd = (m.group(2) ?? '').trim();
+                  final recentEnough =
+                      upd.isNotEmpty && upd.compareTo(liveRssCutoff) >= 0;
+                  if (vid.isNotEmpty &&
+                      (recentEnough || !existingVidIds.contains(vid))) {
+                    if (recentEnough || existingLiveIds.contains(vid)) {
+                      newVidMeta[vid] = meta;
                     }
                   }
-                  break;
-                }
-                if ((res.statusCode == 429 || res.statusCode >= 500) &&
-                    attempt == 0) {
-                  await Future.delayed(const Duration(milliseconds: 150));
-                  continue;
-                }
-                break;
-              } catch (_) {
-                if (attempt == 0) {
-                  await Future.delayed(const Duration(milliseconds: 150));
                 }
               }
             }
@@ -1642,14 +1833,12 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
 
       await Future.wait(List.generate(concurrency, (_) => worker()));
 
+      final stillLiveIds = <String>{};
       final newIds = newVidMeta.keys.toList();
       final detailSlices = <List<String>>[];
       for (var i = 0; i < newIds.length; i += 50) {
         detailSlices.add(
-          newIds.sublist(
-            i,
-            (i + 50 > newIds.length) ? newIds.length : i + 50,
-          ),
+          newIds.sublist(i, (i + 50 > newIds.length) ? newIds.length : i + 50),
         );
       }
       if (detailSlices.isNotEmpty) {
@@ -1674,8 +1863,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             final vItems = (vData['items'] as List?) ?? [];
             for (final v in vItems) {
               final vid = (v['id'] ?? '').toString();
-              if (vid.isEmpty || existingVidIds.contains(vid)) continue;
-              existingVidIds.add(vid);
+              if (vid.isEmpty) continue;
               final vsnip = v['snippet'] ?? {};
               final vstats = v['statistics'] ?? {};
               final meta = newVidMeta[vid] ?? {};
@@ -1684,6 +1872,32 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               final durStr = _parseIsoDuration(
                 (v['contentDetails']?['duration'] ?? '').toString(),
               );
+              final isLiveVal =
+                  (vsnip['liveBroadcastContent'] ?? '').toString() == 'live'
+                      ? 1
+                      : 0;
+              if (isLiveVal == 1) {
+                stillLiveIds.add(vid);
+              }
+              final existingIdx = _localVideos.indexWhere(
+                (old) => old['video_id'] == vid,
+              );
+              if (existingIdx >= 0) {
+                _localVideos[existingIdx]['title'] =
+                    (vsnip['title'] ?? _localVideos[existingIdx]['title'] ?? '')
+                        .toString();
+                _localVideos[existingIdx]['view_count'] =
+                    int.tryParse((vstats['viewCount'] ?? '0').toString()) ?? 0;
+                _localVideos[existingIdx]['like_count'] =
+                    int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0;
+                _localVideos[existingIdx]['duration'] = durStr;
+                _localVideos[existingIdx]['duration_seconds'] =
+                    _durationToSeconds(durStr);
+                _localVideos[existingIdx]['is_live'] = isLiveVal;
+                continue;
+              }
+              if (existingVidIds.contains(vid)) continue;
+              existingVidIds.add(vid);
               _localVideos.insert(0, {
                 'video_id': vid,
                 'channel_id': cid,
@@ -1710,10 +1924,19 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                 'duration_seconds': _durationToSeconds(durStr),
                 'watched_count': _getCreatorWatchedCount(cid),
                 'is_demo': 0,
+                'is_live': isLiveVal,
               });
             }
           }),
         );
+      }
+      if (existingLiveIds.isNotEmpty) {
+        for (final v in _localVideos) {
+          final vid = (v['video_id'] ?? '').toString();
+          if (existingLiveIds.contains(vid) && !stillLiveIds.contains(vid)) {
+            v['is_live'] = 0;
+          }
+        }
       }
     } finally {
       client.close();
@@ -1870,6 +2093,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             'watched_count':
                 existing?['watched_count'] ?? _getCreatorWatchedCount(cid),
             'is_demo': 0,
+            'is_live': (vsnip['liveBroadcastContent'] ?? '').toString() == 'live'
+                ? 1
+                : 0,
           };
           if (existingIdx >= 0) {
             _localVideos[existingIdx] = nextVideo;
@@ -4688,6 +4914,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   }
 
   void _selectChannelTab(String cid) {
+    final wasInsideCreator = selectedChannelId.isNotEmpty;
     final tabKey = cid.isEmpty ? 'home' : cid;
     final savedLimit = tabLimits[tabKey] ?? defaultLimit;
     final isMobileScreen = MediaQuery.of(context).size.width < 750;
@@ -4704,7 +4931,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     if (isMobileScreen && Navigator.of(context).canPop()) {
       Navigator.of(context).pop();
     }
-    _fetchVideos();
+    _fetchVideos().then((_) {
+      if (wasInsideCreator && cid.isEmpty) {
+        _triggerAutoRefreshYouTube();
+      }
+    });
   }
 
   void _resetHomeAndClearSearch() {
@@ -4727,7 +4958,8 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final willShow = !_showMobileSearch;
     setState(() => _showMobileSearch = willShow);
     if (willShow) {
-      if (_videoScrollController.hasClients && _videoScrollController.offset > 0) {
+      if (_videoScrollController.hasClients &&
+          _videoScrollController.offset > 0) {
         _videoScrollController.jumpTo(0);
       }
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -5080,12 +5312,13 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                             style: IconButton.styleFrom(
                               backgroundColor:
                                   (_showMobileSearch || searchQuery.isNotEmpty)
-                                      ? const Color(0xFF1565C0)
-                                      : const Color(0xFF222222),
+                                  ? const Color(0xFF1565C0)
+                                  : const Color(0xFF222222),
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(8),
                                 side: BorderSide(
-                                  color: (_showMobileSearch ||
+                                  color:
+                                      (_showMobileSearch ||
                                           searchQuery.isNotEmpty)
                                       ? const Color(0xFF42A5F5)
                                       : const Color(0xFF3A3A3A),
@@ -5093,7 +5326,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                               ),
                             ),
                             icon: Icon(
-                              _showMobileSearch ? Icons.search_off : Icons.search,
+                              _showMobileSearch
+                                  ? Icons.search_off
+                                  : Icons.search,
                               size: 18,
                               color: Colors.white,
                             ),
@@ -5101,10 +5336,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                         ),
                       ),
                       const SizedBox(width: 4),
-                      _buildFilterSortButton(
-                        height: 34,
-                        compact: true,
-                      ),
+                      _buildFilterSortButton(height: 34, compact: true),
                       const SizedBox(width: 4),
                     ],
 
@@ -5118,128 +5350,155 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                     _buildRefreshYouTubeButton(isMobile),
 
                     if (!isMobile) ...[
-                        const SizedBox(width: 6),
-                        Tooltip(
-                          message: 'Export Excel/CSV',
-                          child: SizedBox(
-                            width: 38,
-                            height: 34,
-                            child: OutlinedButton(
-                              onPressed: _exportExcelCsv,
-                              style: OutlinedButton.styleFrom(
-                                side: const BorderSide(
-                                  color: Color(0xFF303030),
-                                ),
-                                backgroundColor: const Color(0xFF222222),
-                                padding: EdgeInsets.zero,
-                                minimumSize: const Size(38, 34),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
+                      const SizedBox(width: 6),
+                      Tooltip(
+                        message: 'Export Excel/CSV',
+                        child: SizedBox(
+                          width: 38,
+                          height: 34,
+                          child: OutlinedButton(
+                            onPressed: _exportExcelCsv,
+                            style: OutlinedButton.styleFrom(
+                              side: const BorderSide(color: Color(0xFF303030)),
+                              backgroundColor: const Color(0xFF222222),
+                              padding: EdgeInsets.zero,
+                              minimumSize: const Size(38, 34),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
                               ),
-                              child: const Icon(
-                                Icons.table_view,
-                                size: 18,
-                                color: Colors.greenAccent,
-                              ),
+                            ),
+                            child: const Icon(
+                              Icons.table_view,
+                              size: 18,
+                              color: Colors.greenAccent,
                             ),
                           ),
                         ),
-                        const SizedBox(width: 6),
-                        Tooltip(
-                          message: 'Tambah Channel',
-                          child: SizedBox(
-                            width: 38,
-                            height: 34,
-                            child: ElevatedButton(
-                              onPressed: _showAddChannelModal,
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: const Color(0xFF272727),
-                                foregroundColor: Colors.white,
-                                padding: EdgeInsets.zero,
-                                minimumSize: const Size(38, 34),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
+                      ),
+                      const SizedBox(width: 6),
+                      Tooltip(
+                        message: 'Tambah Channel',
+                        child: SizedBox(
+                          width: 38,
+                          height: 34,
+                          child: ElevatedButton(
+                            onPressed: _showAddChannelModal,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF272727),
+                              foregroundColor: Colors.white,
+                              padding: EdgeInsets.zero,
+                              minimumSize: const Size(38, 34),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
                               ),
-                              child: const Icon(Icons.add, size: 20),
                             ),
+                            child: const Icon(Icons.add, size: 20),
                           ),
                         ),
-                        IconButton(
-                          tooltip: 'Pengaturan API & Sync',
-                          onPressed: _showApiSettingsModal,
-                          icon: Icon(
-                            Icons.settings,
-                            size: 22,
-                            color: hasApiKey
-                                ? Colors.greenAccent
-                                : Colors.amberAccent,
-                          ),
+                      ),
+                      IconButton(
+                        tooltip: 'Pengaturan API & Sync',
+                        onPressed: _showApiSettingsModal,
+                        icon: Icon(
+                          Icons.settings,
+                          size: 22,
+                          color: hasApiKey
+                              ? Colors.greenAccent
+                              : Colors.amberAccent,
                         ),
-                      ] else ...[
-                        // Pada HP: Menu Popup 3 Titik (Menghilangkan Right Overflow 49px sama sekali!)
-                        PopupMenuButton<String>(
-                          padding: const EdgeInsets.all(4),
-                          icon: const Icon(
-                            Icons.more_vert,
-                            color: Colors.white,
-                            size: 22,
-                          ),
-                          tooltip: 'Menu Lainnya',
-                          color: const Color(0xFF212121),
-                          onSelected: (val) {
-                            if (val == 'usb') _performDirectUsbSync();
-                            if (val == 'add') _showAddChannelModal();
-                            if (val == 'csv') _exportExcelCsv();
-                            if (val == 'export_sync') _exportSyncJson();
-                            if (val == 'import_sync') _importSyncJson();
-                            if (val == 'settings') _showApiSettingsModal();
-                          },
-                          itemBuilder: (ctx) {
-                            final usbTitle = syncingUsb
-                                ? 'Sync USB ($usbSyncProgress%)'
-                                : (usbSyncReadyGreen
-                                      ? '100% Sync Selesai - Tampilkan'
-                                      : (_isHpDevice
-                                            ? 'Sync Laptop (USB)'
-                                            : 'Sync HP (USB)'));
-                            final items = <(String, IconData, Color, String)>[
-                              (
-                                'usb',
-                                usbSyncReadyGreen ? Icons.check_circle : Icons.usb,
-                                usbSyncReadyGreen ? Colors.greenAccent : Colors.cyanAccent,
-                                usbTitle,
-                              ),
-                              ('add', Icons.person_add_alt_1, Colors.white, 'Tambah Channel'),
-                              ('csv', Icons.table_view, Colors.greenAccent, 'Export Excel / CSV'),
-                              ('export_sync', Icons.upload, Colors.cyanAccent, 'Salin JSON Sync'),
-                              ('import_sync', Icons.download, Colors.cyanAccent, 'Tempel JSON Sync'),
-                              ('settings', Icons.settings, Colors.amberAccent, 'Pengaturan API & IP'),
-                            ];
-                            return [
-                              for (final (value, icon, color, label) in items)
-                                PopupMenuItem<String>(
-                                  value: value,
-                                  child: Row(
-                                    children: [
-                                      Icon(icon, size: 18, color: color),
-                                      const SizedBox(width: 10),
-                                      Flexible(
-                                        child: Text(
-                                          label,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(fontSize: 13),
-                                        ),
+                      ),
+                    ] else ...[
+                      // Pada HP: Menu Popup 3 Titik (Menghilangkan Right Overflow 49px sama sekali!)
+                      PopupMenuButton<String>(
+                        padding: const EdgeInsets.all(4),
+                        icon: const Icon(
+                          Icons.more_vert,
+                          color: Colors.white,
+                          size: 22,
+                        ),
+                        tooltip: 'Menu Lainnya',
+                        color: const Color(0xFF212121),
+                        onSelected: (val) {
+                          if (val == 'usb') _performDirectUsbSync();
+                          if (val == 'add') _showAddChannelModal();
+                          if (val == 'csv') _exportExcelCsv();
+                          if (val == 'export_sync') _exportSyncJson();
+                          if (val == 'import_sync') _importSyncJson();
+                          if (val == 'settings') _showApiSettingsModal();
+                        },
+                        itemBuilder: (ctx) {
+                          final usbTitle = syncingUsb
+                              ? 'Sync USB ($usbSyncProgress%)'
+                              : (usbSyncReadyGreen
+                                    ? '100% Sync Selesai - Tampilkan'
+                                    : (_isHpDevice
+                                          ? 'Sync Laptop (USB)'
+                                          : 'Sync HP (USB)'));
+                          final items = <(String, IconData, Color, String)>[
+                            (
+                              'usb',
+                              usbSyncReadyGreen
+                                  ? Icons.check_circle
+                                  : Icons.usb,
+                              usbSyncReadyGreen
+                                  ? Colors.greenAccent
+                                  : Colors.cyanAccent,
+                              usbTitle,
+                            ),
+                            (
+                              'add',
+                              Icons.person_add_alt_1,
+                              Colors.white,
+                              'Tambah Channel',
+                            ),
+                            (
+                              'csv',
+                              Icons.table_view,
+                              Colors.greenAccent,
+                              'Export Excel / CSV',
+                            ),
+                            (
+                              'export_sync',
+                              Icons.upload,
+                              Colors.cyanAccent,
+                              'Salin JSON Sync',
+                            ),
+                            (
+                              'import_sync',
+                              Icons.download,
+                              Colors.cyanAccent,
+                              'Tempel JSON Sync',
+                            ),
+                            (
+                              'settings',
+                              Icons.settings,
+                              Colors.amberAccent,
+                              'Pengaturan API & IP',
+                            ),
+                          ];
+                          return [
+                            for (final (value, icon, color, label) in items)
+                              PopupMenuItem<String>(
+                                value: value,
+                                child: Row(
+                                  children: [
+                                    Icon(icon, size: 18, color: color),
+                                    const SizedBox(width: 10),
+                                    Flexible(
+                                      child: Text(
+                                        label,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(fontSize: 13),
                                       ),
-                                    ],
-                                  ),
+                                    ),
+                                  ],
                                 ),
-                            ];
-                          },
-                        ),
-                      ],
+                              ),
+                          ];
+                        },
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -5291,211 +5550,228 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         .toList();
     final sidebarContent = Material(
       color: const Color(0xFF0F0F0F),
-      child: CustomScrollView(
-        slivers: [
-          SliverPadding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            sliver: SliverToBoxAdapter(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
+      child: _HomeScrollWithBar(
+        controller: _sidebarScrollController,
+        itemCount: sidebarChannels.length,
+        railKey: const Key('sidebar_fast_scrollbar'),
+        thumbKey: const Key('sidebar_fast_thumb'),
+        itemLabel: 'Channel',
+        trackPadding: const EdgeInsets.only(top: 6, right: 2, bottom: 8),
+        scrollView: ScrollConfiguration(
+          behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+          child: CustomScrollView(
+            controller: _sidebarScrollController,
+            slivers: [
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                sliver: SliverToBoxAdapter(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Expanded(
-                        child: _sidebarTile(
-                          icon: Icons.home_filled,
-                          title: 'Semua Follower (${sidebarChannels.length})',
-                          selected: selectedChannelId.isEmpty,
-                          onTap: () => _selectChannelTab(''),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: _sidebarTile(
+                              icon: Icons.home_filled,
+                              title:
+                                  'Semua Follower (${sidebarChannels.length})',
+                              selected: selectedChannelId.isEmpty,
+                              onTap: () => _selectChannelTab(''),
+                            ),
+                          ),
+                          if (forceFull)
+                            IconButton(
+                              tooltip: 'Tutup',
+                              icon: const Icon(
+                                Icons.close,
+                                color: Colors.white70,
+                              ),
+                              onPressed: () => Navigator.of(context).pop(),
+                            )
+                          else
+                            IconButton(
+                              tooltip: 'Sembunyikan Sidebar',
+                              icon: const Icon(
+                                Icons.keyboard_double_arrow_left,
+                                size: 20,
+                                color: Colors.white60,
+                              ),
+                              onPressed: () {
+                                setState(() => sidebarMode = 'hidden');
+                                _saveUiPreferences(newSidebarMode: 'hidden');
+                              },
+                            ),
+                        ],
+                      ),
+                      const Divider(color: Color(0xFF272727), height: 24),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 6,
+                        ),
+                        child: Text(
+                          'Subscriptions ›',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 15,
+                          ),
                         ),
                       ),
-                      if (forceFull)
-                        IconButton(
-                          tooltip: 'Tutup',
-                          icon: const Icon(Icons.close, color: Colors.white70),
-                          onPressed: () => Navigator.of(context).pop(),
-                        )
-                      else
-                        IconButton(
-                          tooltip: 'Sembunyikan Sidebar',
-                          icon: const Icon(
-                            Icons.keyboard_double_arrow_left,
-                            size: 20,
-                            color: Colors.white60,
-                          ),
-                          onPressed: () {
-                            setState(() => sidebarMode = 'hidden');
-                            _saveUiPreferences(newSidebarMode: 'hidden');
-                          },
-                        ),
+                      _buildSidebarLiveSection(isDrawer: forceFull),
                     ],
                   ),
-                  const Divider(color: Color(0xFF272727), height: 24),
-                  const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                    child: Text(
-                      'Subscriptions ›',
-                      style: TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 15,
-                      ),
-                    ),
-                  ),
-                ],
+                ),
               ),
-            ),
-          ),
-          SliverPadding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            sliver: SliverList(
-              delegate: SliverChildBuilderDelegate(
-                (context, index) {
-                  final ch = sidebarChannels[index];
-                  final cid = (ch['channel_id'] ?? '').toString();
-                  final title = (ch['title'] ?? '').toString();
-                  final isHidden = _isHiddenFlag(ch['is_hidden']);
-                  final cHp =
-                      int.tryParse((ch['views_hp'] ?? 0).toString()) ?? 0;
-                  final cLap =
-                      int.tryParse((ch['views_laptop'] ?? 0).toString()) ?? 0;
-                  final watchedCount =
-                      int.tryParse(
-                        (ch['views_total'] ?? ch['watched_count'] ?? 0)
-                            .toString(),
-                      ) ??
-                      (cHp + cLap);
-                  final isSelected = selectedChannelId == cid;
-                  return Tooltip(
-                    message:
-                        '$title${isHidden ? ' (Hidden)' : ''}\nTotal: $watchedCount view (📱 HP: $cHp | 💻 Laptop: $cLap)',
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(10),
-                      onTap: () => _selectChannelTab(cid),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 8,
-                        ),
-                        decoration: BoxDecoration(
-                          color: isSelected
-                              ? const Color(0xFF272727)
-                              : Colors.transparent,
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: Row(
-                          children: [
-                            CircleAvatar(
-                              radius: 14,
-                              backgroundColor: const Color(0xFF383838),
-                              backgroundImage:
-                                  (ch['thumbnail_url'] ?? '')
-                                      .toString()
-                                      .isNotEmpty
-                                  ? NetworkImage(ch['thumbnail_url'])
-                                  : null,
-                              onBackgroundImageError:
-                                  (ch['thumbnail_url'] ?? '')
-                                      .toString()
-                                      .isNotEmpty
-                                  ? (_, _) {}
-                                  : null,
-                              child: Text(
-                                title.isNotEmpty ? title[0] : '?',
-                                style: const TextStyle(
-                                  fontSize: 11,
-                                  color: Colors.white70,
+              SliverPadding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                sliver: SliverList(
+                  delegate: SliverChildBuilderDelegate((context, index) {
+                    final ch = sidebarChannels[index];
+                    final cid = (ch['channel_id'] ?? '').toString();
+                    final title = (ch['title'] ?? '').toString();
+                    final isHidden = _isHiddenFlag(ch['is_hidden']);
+                    final cHp =
+                        int.tryParse((ch['views_hp'] ?? 0).toString()) ?? 0;
+                    final cLap =
+                        int.tryParse((ch['views_laptop'] ?? 0).toString()) ?? 0;
+                    final watchedCount =
+                        int.tryParse(
+                          (ch['views_total'] ?? ch['watched_count'] ?? 0)
+                              .toString(),
+                        ) ??
+                        (cHp + cLap);
+                    final isSelected = selectedChannelId == cid;
+                    return Tooltip(
+                      message:
+                          '$title${isHidden ? ' (Hidden)' : ''}\nTotal: $watchedCount view (📱 HP: $cHp | 💻 Laptop: $cLap)',
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(10),
+                        onTap: () => _selectChannelTab(cid),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: isSelected
+                                ? const Color(0xFF272727)
+                                : Colors.transparent,
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Row(
+                            children: [
+                              CircleAvatar(
+                                radius: 14,
+                                backgroundColor: const Color(0xFF383838),
+                                backgroundImage:
+                                    (ch['thumbnail_url'] ?? '')
+                                        .toString()
+                                        .isNotEmpty
+                                    ? NetworkImage(ch['thumbnail_url'])
+                                    : null,
+                                onBackgroundImageError:
+                                    (ch['thumbnail_url'] ?? '')
+                                        .toString()
+                                        .isNotEmpty
+                                    ? (_, _) {}
+                                    : null,
+                                child: Text(
+                                  title.isNotEmpty ? title[0] : '?',
+                                  style: const TextStyle(
+                                    fontSize: 11,
+                                    color: Colors.white70,
+                                  ),
                                 ),
                               ),
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Row(
-                                children: [
-                                  Flexible(
-                                    child: Text(
-                                      title,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                        fontSize: 13.5,
-                                        fontWeight: isSelected
-                                            ? FontWeight.bold
-                                            : FontWeight.normal,
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Row(
+                                  children: [
+                                    Flexible(
+                                      child: Text(
+                                        title,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: 13.5,
+                                          fontWeight: isSelected
+                                              ? FontWeight.bold
+                                              : FontWeight.normal,
+                                        ),
                                       ),
                                     ),
-                                  ),
-                                  if (isHidden) ...[
-                                    const SizedBox(width: 6),
-                                    _buildHiddenBadge(
-                                      key: Key('sidebar_hidden_$cid'),
-                                    ),
+                                    if (isHidden) ...[
+                                      const SizedBox(width: 6),
+                                      _buildHiddenBadge(
+                                        key: Key('sidebar_hidden_$cid'),
+                                      ),
+                                    ],
                                   ],
-                                ],
-                              ),
-                            ),
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 6,
-                                vertical: 2,
-                              ),
-                              decoration: BoxDecoration(
-                                color: watchedCount > 0
-                                    ? const Color(0xFF1E3A2F)
-                                    : Colors.transparent,
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                              child: Text(
-                                '$watchedCount',
-                                style: TextStyle(
-                                  fontSize: 11.5,
-                                  fontWeight: watchedCount > 0
-                                      ? FontWeight.bold
-                                      : FontWeight.normal,
-                                  color: watchedCount > 0
-                                      ? const Color(0xFF81C784)
-                                      : Colors.white54,
                                 ),
                               ),
-                            ),
-                          ],
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: watchedCount > 0
+                                      ? const Color(0xFF1E3A2F)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: Text(
+                                  '$watchedCount',
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: watchedCount > 0
+                                        ? FontWeight.bold
+                                        : FontWeight.normal,
+                                    color: watchedCount > 0
+                                        ? const Color(0xFF81C784)
+                                        : Colors.white54,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
-                    ),
-                  );
-                },
-                childCount: sidebarChannels.length,
+                    );
+                  }, childCount: sidebarChannels.length),
+                ),
               ),
-            ),
-          ),
-          SliverPadding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-            sliver: SliverToBoxAdapter(
-              child: Column(
-                children: [
-                  const Divider(color: Color(0xFF272727), height: 28),
-                  _sidebarTile(
-                    icon: Icons.usb,
-                    title: 'Sync USB (HP ⇄ Laptop)',
-                    selected: false,
-                    onTap: _showUsbSyncDialog,
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                sliver: SliverToBoxAdapter(
+                  child: Column(
+                    children: [
+                      const Divider(color: Color(0xFF272727), height: 28),
+                      _sidebarTile(
+                        icon: Icons.usb,
+                        title: 'Sync USB (HP ⇄ Laptop)',
+                        selected: false,
+                        onTap: _showUsbSyncDialog,
+                      ),
+                      _sidebarTile(
+                        icon: Icons.download_for_offline_outlined,
+                        title: 'Export Excel/CSV',
+                        selected: false,
+                        onTap: _exportExcelCsv,
+                      ),
+                      _sidebarTile(
+                        icon: Icons.sync,
+                        title: 'Sync & API Key',
+                        selected: false,
+                        onTap: _showApiSettingsModal,
+                      ),
+                    ],
                   ),
-                  _sidebarTile(
-                    icon: Icons.download_for_offline_outlined,
-                    title: 'Export Excel/CSV',
-                    selected: false,
-                    onTap: _exportExcelCsv,
-                  ),
-                  _sidebarTile(
-                    icon: Icons.sync,
-                    title: 'Sync & API Key',
-                    selected: false,
-                    onTap: _showApiSettingsModal,
-                  ),
-                ],
+                ),
               ),
-            ),
+            ],
           ),
-        ],
+        ),
       ),
     );
     if (forceFull) {
@@ -5584,11 +5860,53 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       ),
       builder: (ctx) {
         var pendingOverlap = false;
-        return StatefulBuilder(
-          builder: (ctx, setModalState) {
+        void commitDayInput({
+          bool unfocus = false,
+          StateSetter? setModalState,
+        }) {
+          _dayInputDebounce?.cancel();
+          if (unfocus && _dayFocusNode.hasFocus) {
+            _dayFocusNode.unfocus();
+          }
+          final trimmed = _dayInputCtrl.text.trim();
+          final parsed = int.tryParse(trimmed);
+          final currentlyDay = _isCustomDayPeriod(period);
+          if (parsed != null && parsed >= 1) {
+            final nextPeriod = '${parsed}d';
+            if (period != nextPeriod) {
+              _applyPeriodChoice(nextPeriod);
+              if (ctx.mounted) setModalState?.call(() {});
+              _saveUiPreferences();
+              _fetchVideos();
+            }
+          } else if (currentlyDay &&
+              (trimmed.isEmpty || (parsed != null && parsed <= 0))) {
+            _applyPeriodChoice('all');
+            if (ctx.mounted) setModalState?.call(() {});
+            _saveUiPreferences();
+            _fetchVideos();
+          }
+        }
+
+        final sheetContent = StatefulBuilder(
+          builder: (modalCtx, setModalState) {
             _refreshFilterModal = () {
-              if (ctx.mounted) setModalState(() {});
+              if (modalCtx.mounted) setModalState(() {});
             };
+            if (_activeDayFocusListener != null) {
+              _dayFocusNode.removeListener(_activeDayFocusListener!);
+            }
+            _activeDayFocusListener = () {
+              if (!modalCtx.mounted) return;
+              if (_dayFocusNode.hasFocus) {
+                setModalState(() {});
+              } else {
+                commitDayInput(setModalState: setModalState);
+                if (modalCtx.mounted) setModalState(() {});
+              }
+            };
+            _dayFocusNode.addListener(_activeDayFocusListener!);
+
             final periods = [
               ('all', 'All Time'),
               ('today', 'Today'),
@@ -5639,716 +5957,707 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               );
             }
 
-            void commitDayInput({bool unfocus = false}) {
-              if (unfocus && _dayFocusNode.hasFocus) {
-                _dayFocusNode.unfocus();
-              }
-              final trimmed = _dayInputCtrl.text.trim();
-              final parsed = int.tryParse(trimmed);
-              final currentlyDay = _isCustomDayPeriod(period);
-              if (parsed != null && parsed >= 1) {
-                final nextPeriod = '${parsed}d';
-                if (period != nextPeriod) {
-                  _applyPeriodChoice(nextPeriod);
-                  if (ctx.mounted) setModalState(() {});
-                  _saveUiPreferences();
-                  _fetchVideos();
-                }
-              } else if (currentlyDay &&
-                  (trimmed.isEmpty || (parsed != null && parsed <= 0))) {
-                _applyPeriodChoice('all');
-                if (ctx.mounted) setModalState(() {});
-                _saveUiPreferences();
-                _fetchVideos();
-              }
-            }
-
-            return SafeArea(
-              child: Padding(
-                padding: EdgeInsets.only(
-                  bottom: MediaQuery.viewInsetsOf(ctx).bottom,
-                ),
-                child: SingleChildScrollView(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Center(
-                      child: Container(
-                        width: 42,
-                        height: 4,
-                        margin: const EdgeInsets.only(bottom: 8),
-                        decoration: BoxDecoration(
-                          color: Colors.white24,
-                          borderRadius: BorderRadius.circular(4),
-                        ),
+            return SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Center(
+                    child: Container(
+                      width: 42,
+                      height: 4,
+                      margin: const EdgeInsets.only(bottom: 8),
+                      decoration: BoxDecoration(
+                        color: Colors.white24,
+                        borderRadius: BorderRadius.circular(4),
                       ),
                     ),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Expanded(
-                          child: Text(
-                            'Filter & Urutan Video',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.bold,
-                              color: Colors.white,
-                            ),
+                  ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Filter & Urutan Video',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
                           ),
                         ),
-                        IconButton(
-                          icon: const Icon(Icons.close, color: Colors.white70),
-                          onPressed: () => Navigator.pop(ctx),
-                        ),
-                      ],
-                    ),
-                    const Divider(color: Color(0xFF333333)),
-                    const SizedBox(height: 6),
-                    const Text(
-                      'Urutkan:',
-                      style: TextStyle(
-                        fontSize: 13,
-                        color: Colors.white70,
-                        fontWeight: FontWeight.w600,
                       ),
+                      IconButton(
+                        icon: const Icon(Icons.close, color: Colors.white70),
+                        onPressed: () => Navigator.pop(ctx),
+                      ),
+                    ],
+                  ),
+                  const Divider(color: Color(0xFF333333)),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'Urutkan:',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: Colors.white70,
+                      fontWeight: FontWeight.w600,
                     ),
-                    const SizedBox(height: 6),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: sorts.map((s) {
-                        final active = sortBy == s.$1;
-                        return ChoiceChip(
-                          label: Text(s.$2),
-                          selected: active,
+                  ),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: sorts.map((s) {
+                      final active = sortBy == s.$1;
+                      return ChoiceChip(
+                        label: Text(s.$2),
+                        selected: active,
+                        selectedColor: Colors.white,
+                        backgroundColor: const Color(0xFF2C2C2C),
+                        labelStyle: TextStyle(
+                          color: active ? Colors.black : Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12.5,
+                        ),
+                        onSelected: (_) {
+                          setState(() {
+                            sortBy = s.$1;
+                            currentPage = 1;
+                          });
+                          setModalState(() {});
+                          _saveUiPreferences();
+                          _fetchVideos();
+                        },
+                      );
+                    }).toList(),
+                  ),
+                  const SizedBox(height: 14),
+                  const Text(
+                    'Channel Hide / Normal:',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: Colors.white70,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Column(
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(child: hideChoice('both', 'All')),
+                          const SizedBox(width: 8),
+                          Expanded(child: hideChoice('unhide', 'Unhide')),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(child: hideChoice('hide', 'Hide')),
+                          const SizedBox(width: 8),
+                          const Expanded(child: SizedBox.shrink()),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  const Text(
+                    'Periode Upload:',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: Colors.white70,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      ...periods.map((p) {
+                        final active = period == p.$1;
+                        return SizedBox(
+                          height: 36,
+                          child: ChoiceChip(
+                            materialTapTargetSize:
+                                MaterialTapTargetSize.shrinkWrap,
+                            visualDensity: VisualDensity.compact,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 0,
+                            ),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            side: BorderSide(
+                              color: active
+                                  ? Colors.white
+                                  : const Color(0xFF444444),
+                              width: 1.0,
+                            ),
+                            label: Text(p.$2),
+                            selected: active,
+                            selectedColor: Colors.white,
+                            backgroundColor: const Color(0xFF2C2C2C),
+                            labelStyle: TextStyle(
+                              color: active ? Colors.black : Colors.white,
+                              fontWeight: active
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                              fontSize: 12.5,
+                            ),
+                            onSelected: (_) {
+                              _applyPeriodChoice(p.$1);
+                              setModalState(() {});
+                              _saveUiPreferences();
+                              _fetchVideos();
+                            },
+                          ),
+                        );
+                      }),
+                      SizedBox(
+                        height: 36,
+                        child: ChoiceChip(
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 0,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          side: BorderSide(
+                            color: period == 'custom_date'
+                                ? Colors.white
+                                : const Color(0xFF444444),
+                            width: 1.0,
+                          ),
+                          avatar: Icon(
+                            Icons.event,
+                            size: 15,
+                            color: period == 'custom_date'
+                                ? Colors.black
+                                : Colors.greenAccent,
+                          ),
+                          label: Text(
+                            period == 'custom_date' && customDate != null
+                                ? 'Custom Date (≤ ${_formatDateId(customDate!)})'
+                                : 'Custom Date',
+                          ),
+                          selected: period == 'custom_date',
                           selectedColor: Colors.white,
                           backgroundColor: const Color(0xFF2C2C2C),
                           labelStyle: TextStyle(
-                            color: active ? Colors.black : Colors.white,
-                            fontWeight: FontWeight.bold,
-                            fontSize: 12.5,
-                          ),
-                          onSelected: (_) {
-                            setState(() {
-                              sortBy = s.$1;
-                              currentPage = 1;
-                            });
-                            setModalState(() {});
-                            _saveUiPreferences();
-                            _fetchVideos();
-                          },
-                        );
-                      }).toList(),
-                    ),
-                    const SizedBox(height: 14),
-                    const Text(
-                      'Channel Hide / Normal:',
-                      style: TextStyle(
-                        fontSize: 13,
-                        color: Colors.white70,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Column(
-                      children: [
-                        Row(
-                          children: [
-                            Expanded(child: hideChoice('both', 'All')),
-                            const SizedBox(width: 8),
-                            Expanded(child: hideChoice('unhide', 'Unhide')),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-                        Row(
-                          children: [
-                            Expanded(child: hideChoice('hide', 'Hide')),
-                            const SizedBox(width: 8),
-                            const Expanded(child: SizedBox.shrink()),
-                          ],
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 14),
-                    const Text(
-                      'Periode Upload:',
-                      style: TextStyle(
-                        fontSize: 13,
-                        color: Colors.white70,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      children: [
-                        ...periods.map((p) {
-                          final active = period == p.$1;
-                          return SizedBox(
-                            height: 36,
-                            child: ChoiceChip(
-                              materialTapTargetSize:
-                                  MaterialTapTargetSize.shrinkWrap,
-                              visualDensity: VisualDensity.compact,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                                vertical: 0,
-                              ),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                              side: BorderSide(
-                                color: active
-                                    ? Colors.white
-                                    : const Color(0xFF444444),
-                                width: 1.0,
-                              ),
-                              label: Text(p.$2),
-                              selected: active,
-                              selectedColor: Colors.white,
-                              backgroundColor: const Color(0xFF2C2C2C),
-                              labelStyle: TextStyle(
-                                color: active ? Colors.black : Colors.white,
-                                fontWeight: active
-                                    ? FontWeight.bold
-                                    : FontWeight.normal,
-                                fontSize: 12.5,
-                              ),
-                              onSelected: (_) {
-                                _applyPeriodChoice(p.$1);
-                                setModalState(() {});
-                                _saveUiPreferences();
-                                _fetchVideos();
-                              },
-                            ),
-                          );
-                        }),
-                        SizedBox(
-                          height: 36,
-                          child: ChoiceChip(
-                            materialTapTargetSize:
-                                MaterialTapTargetSize.shrinkWrap,
-                            visualDensity: VisualDensity.compact,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                              vertical: 0,
-                            ),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            side: BorderSide(
-                              color: period == 'custom_date'
-                                  ? Colors.white
-                                  : const Color(0xFF444444),
-                              width: 1.0,
-                            ),
-                            avatar: Icon(
-                              Icons.event,
-                              size: 15,
-                              color: period == 'custom_date'
-                                  ? Colors.black
-                                  : Colors.greenAccent,
-                            ),
-                            label: Text(
-                              period == 'custom_date' && customDate != null
-                                  ? 'Custom Date (≤ ${_formatDateId(customDate!)})'
-                                  : 'Custom Date',
-                            ),
-                            selected: period == 'custom_date',
-                            selectedColor: Colors.white,
-                            backgroundColor: const Color(0xFF2C2C2C),
-                            labelStyle: TextStyle(
-                              color: period == 'custom_date'
-                                  ? Colors.black
-                                  : Colors.white,
-                              fontWeight: period == 'custom_date'
-                                  ? FontWeight.bold
-                                  : FontWeight.normal,
-                              fontSize: 12.5,
-                            ),
-                            onSelected: (_) {
-                              _pickCustomDate(
-                                onApplied: () {
-                                  if (ctx.mounted) setModalState(() {});
-                                },
-                              );
-                            },
-                          ),
-                        ),
-                        SizedBox(
-                          height: 36,
-                          child: ChoiceChip(
-                            materialTapTargetSize:
-                                MaterialTapTargetSize.shrinkWrap,
-                            visualDensity: VisualDensity.compact,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                              vertical: 0,
-                            ),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            side: BorderSide(
-                              color: period == 'custom_range'
-                                  ? Colors.white
-                                  : const Color(0xFF444444),
-                              width: 1.0,
-                            ),
-                            avatar: Icon(
-                              Icons.date_range,
-                              size: 15,
-                              color: period == 'custom_range'
-                                  ? Colors.black
-                                  : Colors.lightBlueAccent,
-                            ),
-                            label: Text(
-                              period == 'custom_range' &&
-                                      customRangeStart != null &&
-                                      customRangeEnd != null
-                                  ? 'Custom Date Range (${_formatDateId(customRangeStart!)} – ${_formatDateId(customRangeEnd!)})'
-                                  : 'Custom Date Range',
-                            ),
-                            selected: period == 'custom_range',
-                            selectedColor: Colors.white,
-                            backgroundColor: const Color(0xFF2C2C2C),
-                            labelStyle: TextStyle(
-                              color: period == 'custom_range'
-                                  ? Colors.black
-                                  : Colors.white,
-                              fontWeight: period == 'custom_range'
-                                  ? FontWeight.bold
-                                  : FontWeight.normal,
-                              fontSize: 12.5,
-                            ),
-                            onSelected: (_) {
-                              _pickCustomDateRange(
-                                onApplied: () {
-                                  if (ctx.mounted) setModalState(() {});
-                                },
-                              );
-                            },
-                          ),
-                        ),
-                        KeyedSubtree(
-                          key: _dayBoxKey,
-                          child: GestureDetector(
-                            onTap: () => _dayFocusNode.requestFocus(),
-                            child: Container(
-                              key: const Key('hari_lalu_box'),
-                              height: 36,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                              ),
-                              decoration: BoxDecoration(
-                                color: isCustomDay
-                                    ? Colors.white
-                                    : const Color(0xFF2C2C2C),
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(
-                                  color: isCustomDay
-                                      ? Colors.white
-                                      : const Color(0xFF444444),
-                                  width: 1.0,
-                                ),
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                crossAxisAlignment: CrossAxisAlignment.center,
-                                children: [
-                                  SizedBox(
-                                    width: isCustomDay ? 19 : 0,
-                                    child: isCustomDay
-                                        ? const Padding(
-                                            padding: EdgeInsets.only(right: 3),
-                                            child: Icon(
-                                              Icons.check,
-                                              size: 15,
-                                              color: Colors.black,
-                                            ),
-                                          )
-                                        : null,
-                                  ),
-                                  SizedBox(
-                                    width: 36,
-                                    child: Focus(
-                                      onFocusChange: (hasFocus) {
-                                        if (hasFocus) {
-                                          Future.delayed(
-                                            const Duration(milliseconds: 280),
-                                            () {
-                                              final boxCtx =
-                                                  _dayBoxKey.currentContext;
-                                              if (boxCtx != null &&
-                                                  boxCtx.mounted) {
-                                                Scrollable.ensureVisible(
-                                                  boxCtx,
-                                                  alignment: 0.4,
-                                                  duration: const Duration(
-                                                    milliseconds: 200,
-                                                  ),
-                                                );
-                                              }
-                                            },
-                                          );
-                                        } else {
-                                          commitDayInput();
-                                        }
-                                      },
-                                      child: TextField(
-                                        key: const Key('hari_lalu_input'),
-                                        controller: _dayInputCtrl,
-                                        focusNode: _dayFocusNode,
-                                        keyboardType: TextInputType.number,
-                                        textInputAction: TextInputAction.done,
-                                        inputFormatters: [
-                                          FilteringTextInputFormatter
-                                              .digitsOnly,
-                                        ],
-                                        textAlign: TextAlign.center,
-                                        style: TextStyle(
-                                          fontSize: 12.5,
-                                          fontWeight: FontWeight.bold,
-                                          color: isCustomDay
-                                              ? Colors.black
-                                              : Colors.white,
-                                        ),
-                                        decoration: InputDecoration(
-                                          hintText: '2, 3..',
-                                          hintStyle: TextStyle(
-                                            fontSize: 12,
-                                            color: isCustomDay
-                                                ? Colors.black45
-                                                : Colors.white54,
-                                          ),
-                                          border: InputBorder.none,
-                                          isDense: true,
-                                          contentPadding:
-                                              const EdgeInsets.symmetric(
-                                                vertical: 5,
-                                              ),
-                                        ),
-                                        onSubmitted: (_) =>
-                                            commitDayInput(unfocus: true),
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    'Day',
-                                    style: TextStyle(
-                                      fontSize: 12.5,
-                                      fontWeight: isCustomDay
-                                          ? FontWeight.bold
-                                          : FontWeight.normal,
-                                      color: isCustomDay
-                                          ? Colors.black
-                                          : Colors.white70,
-                                    ),
-                                  ),
-                                  if (isCustomDay) ...[
-                                    const SizedBox(width: 3),
-                                    InkWell(
-                                      key: const Key('hari_lalu_clear'),
-                                      borderRadius: BorderRadius.circular(10),
-                                      onTap: () {
-                                        _applyPeriodChoice('all');
-                                        setModalState(() {});
-                                        _saveUiPreferences();
-                                        _fetchVideos();
-                                      },
-                                      child: const Padding(
-                                        padding: EdgeInsets.all(2),
-                                        child: Icon(
-                                          Icons.close,
-                                          size: 14,
-                                          color: Colors.black54,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ],
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 14),
-                    const Text(
-                      'Tampil per Tab (Default 50):',
-                      style: TextStyle(
-                        fontSize: 13,
-                        color: Colors.white70,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Wrap(
-                      spacing: 8,
-                      children: [25, 50, 100].map((val) {
-                        final active = limit == val;
-                        return ChoiceChip(
-                          label: Text('$val Video'),
-                          selected: active,
-                          selectedColor: const Color(0xFFFF0033),
-                          backgroundColor: const Color(0xFF2C2C2C),
-                          labelStyle: TextStyle(
-                            color: Colors.white,
-                            fontWeight: active
+                            color: period == 'custom_date'
+                                ? Colors.black
+                                : Colors.white,
+                            fontWeight: period == 'custom_date'
                                 ? FontWeight.bold
                                 : FontWeight.normal,
                             fontSize: 12.5,
                           ),
                           onSelected: (_) {
-                            setState(() {
-                              limit = val;
-                              currentPage = 1;
-                            });
-                            setModalState(() {});
-                            _saveUiPreferences(newLimit: val);
-                            _fetchVideos();
+                            _pickCustomDate(
+                              onApplied: () {
+                                if (ctx.mounted) setModalState(() {});
+                              },
+                            );
                           },
-                        );
-                      }).toList(),
-                    ),
-                    const SizedBox(height: 14),
-                    SizedBox(
-                      width: double.infinity,
-                      child: Wrap(
-                        spacing: 8,
-                        runSpacing: 4,
-                        alignment: WrapAlignment.spaceBetween,
-                        crossAxisAlignment: WrapCrossAlignment.center,
-                        children: [
-                          const Text(
-                            'Filter Durasi Video:',
-                            style: TextStyle(
-                              fontSize: 13,
-                              color: Colors.white70,
-                              fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      SizedBox(
+                        height: 36,
+                        child: ChoiceChip(
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 0,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          side: BorderSide(
+                            color: period == 'custom_range'
+                                ? Colors.white
+                                : const Color(0xFF444444),
+                            width: 1.0,
+                          ),
+                          avatar: Icon(
+                            Icons.date_range,
+                            size: 15,
+                            color: period == 'custom_range'
+                                ? Colors.black
+                                : Colors.lightBlueAccent,
+                          ),
+                          label: Text(
+                            period == 'custom_range' &&
+                                    customRangeStart != null &&
+                                    customRangeEnd != null
+                                ? 'Custom Date Range (${_formatDateId(customRangeStart!)} – ${_formatDateId(customRangeEnd!)})'
+                                : 'Custom Date Range',
+                          ),
+                          selected: period == 'custom_range',
+                          selectedColor: Colors.white,
+                          backgroundColor: const Color(0xFF2C2C2C),
+                          labelStyle: TextStyle(
+                            color: period == 'custom_range'
+                                ? Colors.black
+                                : Colors.white,
+                            fontWeight: period == 'custom_range'
+                                ? FontWeight.bold
+                                : FontWeight.normal,
+                            fontSize: 12.5,
+                          ),
+                          onSelected: (_) {
+                            _pickCustomDateRange(
+                              onApplied: () {
+                                if (ctx.mounted) setModalState(() {});
+                              },
+                            );
+                          },
+                        ),
+                      ),
+                      GestureDetector(
+                        onTap: () => _dayFocusNode.requestFocus(),
+                        child: Container(
+                          key: const Key('hari_lalu_box'),
+                          height: 36,
+                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                          decoration: BoxDecoration(
+                            color: isCustomDay
+                                ? Colors.white
+                                : const Color(0xFF2C2C2C),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: isCustomDay
+                                  ? Colors.white
+                                  : const Color(0xFF444444),
+                              width: 1.0,
                             ),
                           ),
-                          Row(
+                          child: Row(
                             mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.center,
                             children: [
-                              Flexible(
-                                child: Text(
-                                  '${_formatMinutesLabel(durationRange.start.round())} – ${_formatMinutesLabel(durationRange.end.round(), isMax: true)}',
-                                  style: const TextStyle(
+                              SizedBox(
+                                width: isCustomDay ? 19 : 0,
+                                child: isCustomDay
+                                    ? const Padding(
+                                        padding: EdgeInsets.only(right: 3),
+                                        child: Icon(
+                                          Icons.check,
+                                          size: 15,
+                                          color: Colors.black,
+                                        ),
+                                      )
+                                    : null,
+                              ),
+                              SizedBox(
+                                key: _dayInputSlotKey,
+                                width: 44,
+                                child: TextField(
+                                  key: const Key('hari_lalu_input'),
+                                  controller: _dayInputCtrl,
+                                  focusNode: _dayFocusNode,
+                                  keyboardType: TextInputType.number,
+                                  textInputAction: TextInputAction.done,
+                                  autocorrect: false,
+                                  enableSuggestions: false,
+                                  scrollPadding: const EdgeInsets.only(
+                                    bottom: 64,
+                                  ),
+                                  inputFormatters: [
+                                    FilteringTextInputFormatter.digitsOnly,
+                                  ],
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
                                     fontSize: 12.5,
-                                    color: Colors.amberAccent,
                                     fontWeight: FontWeight.bold,
+                                    color: isCustomDay
+                                        ? Colors.black
+                                        : Colors.white,
+                                  ),
+                                  decoration: InputDecoration(
+                                    hintText: '2, 3..',
+                                    hintStyle: TextStyle(
+                                      fontSize: 12,
+                                      color: isCustomDay
+                                          ? Colors.black45
+                                          : Colors.white54,
+                                    ),
+                                    border: InputBorder.none,
+                                    isDense: true,
+                                    contentPadding: const EdgeInsets.symmetric(
+                                      vertical: 5,
+                                    ),
+                                  ),
+                                  onChanged: (val) {
+                                    _dayInputDebounce?.cancel();
+                                    final trimmed = val.trim();
+                                    final parsed = int.tryParse(trimmed);
+                                    if (parsed != null && parsed >= 1) {
+                                      final nextPeriod = '${parsed}d';
+                                      if (period != nextPeriod) {
+                                        _applyPeriodChoice(nextPeriod);
+                                        if (modalCtx.mounted) {
+                                          setModalState(() {});
+                                        }
+                                        _dayInputDebounce = Timer(
+                                          const Duration(milliseconds: 180),
+                                          () {
+                                            if (!mounted) return;
+                                            _saveUiPreferences();
+                                            _fetchVideos();
+                                          },
+                                        );
+                                      }
+                                    } else if (modalCtx.mounted) {
+                                      setModalState(() {});
+                                    }
+                                  },
+                                  onSubmitted: (_) => commitDayInput(
+                                    unfocus: true,
+                                    setModalState: setModalState,
                                   ),
                                 ),
                               ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 20),
-                      child: LayoutBuilder(
-                        builder: (sliderContext, constraints) {
-                          const trackInset = 16.0;
-                          final trackWidth =
-                              (constraints.maxWidth - trackInset * 2)
-                                  .clamp(1.0, double.infinity)
-                                  .toDouble();
-
-                          void finishDurationDrag() {
-                            pendingOverlap = false;
-                            if (_activeDurationThumb == null) return;
-                            setModalState(() => _activeDurationThumb = null);
-                            setState(() => currentPage = 1);
-                            _saveUiPreferences();
-                            _fetchVideos();
-                          }
-
-                          return GestureDetector(
-                            behavior: HitTestBehavior.opaque,
-                            onHorizontalDragStart: (details) {
-                              pendingOverlap = false;
-                              final x = details.localPosition.dx;
-                              final startX =
-                                  trackInset +
-                                  durationRange.start / 120 * trackWidth;
-                              final endX =
-                                  trackInset +
-                                  durationRange.end / 120 * trackWidth;
-                              final startDistance = (x - startX).abs();
-                              final endDistance = (x - endX).abs();
-                              // Make the touch target much larger than the
-                              // visible thumb, which is difficult to grab on
-                              // a phone. Track presses still do not move it.
-                              const thumbHitRadius = 36.0;
-
-                              if (startDistance <= thumbHitRadius ||
-                                  endDistance <= thumbHitRadius) {
-                                if ((durationRange.start - durationRange.end)
-                                        .abs() <
-                                    0.01) {
-                                  pendingOverlap = true;
-                                  setModalState(
-                                    () => _activeDurationThumb = Thumb.end,
-                                  );
-                                } else {
-                                  setModalState(
-                                    () => _activeDurationThumb =
-                                        startDistance <= endDistance
-                                        ? Thumb.start
-                                        : Thumb.end,
-                                  );
-                                }
-                              } else {
-                                setModalState(
-                                  () => _activeDurationThumb = null,
-                                );
-                              }
-                            },
-                            onHorizontalDragUpdate: (details) {
-                              final rawDelta = details.primaryDelta ?? 0;
-                              if (pendingOverlap && rawDelta != 0) {
-                                pendingOverlap = false;
-                                final picked = rawDelta > 0
-                                    ? Thumb.end
-                                    : Thumb.start;
-                                if (_activeDurationThumb != picked) {
-                                  setModalState(
-                                    () => _activeDurationThumb = picked,
-                                  );
-                                }
-                              }
-                              final deltaMinutes = rawDelta / trackWidth * 120;
-                              final thumb = _activeDurationThumb;
-                              if (thumb == Thumb.start) {
-                                final start =
-                                    (durationRange.start + deltaMinutes)
-                                        .clamp(0.0, durationRange.end)
-                                        .toDouble();
-                                setModalState(() {
-                                  durationRange = RangeValues(
-                                    start,
-                                    durationRange.end,
-                                  );
-                                });
-                              } else if (thumb == Thumb.end) {
-                                final end = (durationRange.end + deltaMinutes)
-                                    .clamp(durationRange.start, 120.0)
-                                    .toDouble();
-                                setModalState(() {
-                                  durationRange = RangeValues(
-                                    durationRange.start,
-                                    end,
-                                  );
-                                });
-                              }
-                            },
-                            onHorizontalDragEnd: (_) => finishDurationDrag(),
-                            onHorizontalDragCancel: finishDurationDrag,
-                            child: Stack(
-                              alignment: Alignment.center,
-                              children: [
-                                IgnorePointer(
-                                  child: RangeSlider(
-                                    values: durationRange,
-                                    min: 0,
-                                    max: 120,
-                                    divisions: 120,
-                                    activeColor: const Color(0xFFFF0033),
-                                    inactiveColor: const Color(0xFF444444),
-                                    onChanged: (_) {},
+                              const SizedBox(width: 4),
+                              Text(
+                                'Day',
+                                style: TextStyle(
+                                  fontSize: 12.5,
+                                  fontWeight: isCustomDay
+                                      ? FontWeight.bold
+                                      : FontWeight.normal,
+                                  color: isCustomDay
+                                      ? Colors.black
+                                      : Colors.white70,
+                                ),
+                              ),
+                              if (isCustomDay ||
+                                  _dayInputCtrl.text.isNotEmpty) ...[
+                                const SizedBox(width: 3),
+                                InkWell(
+                                  key: const Key('hari_lalu_clear'),
+                                  canRequestFocus: false,
+                                  borderRadius: BorderRadius.circular(10),
+                                  onTap: () {
+                                    _dayInputDebounce?.cancel();
+                                    if (_dayFocusNode.hasFocus &&
+                                        _dayInputCtrl.text.isNotEmpty) {
+                                      _dayInputCtrl.clear();
+                                      setModalState(() {});
+                                    } else {
+                                      _applyPeriodChoice('all');
+                                      setModalState(() {});
+                                      _saveUiPreferences();
+                                      _fetchVideos();
+                                    }
+                                  },
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(2),
+                                    child: Icon(
+                                      Icons.close,
+                                      size: 14,
+                                      color: isCustomDay
+                                          ? Colors.black54
+                                          : Colors.white70,
+                                    ),
                                   ),
                                 ),
-                                for (final thumb in [Thumb.start, Thumb.end])
-                                  Positioned(
-                                    left:
-                                        trackInset +
-                                        (thumb == Thumb.start
-                                                ? durationRange.start
-                                                : durationRange.end) /
-                                            120 *
-                                            trackWidth -
-                                        11,
-                                    child: IgnorePointer(
-                                      child: AnimatedContainer(
-                                        duration: const Duration(
-                                          milliseconds: 120,
+                              ],
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  const Text(
+                    'Tampil per Tab (Default 50):',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: Colors.white70,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 8,
+                    children: [25, 50, 100].map((val) {
+                      final active = limit == val;
+                      return ChoiceChip(
+                        label: Text('$val Video'),
+                        selected: active,
+                        selectedColor: const Color(0xFFFF0033),
+                        backgroundColor: const Color(0xFF2C2C2C),
+                        labelStyle: TextStyle(
+                          color: Colors.white,
+                          fontWeight: active
+                              ? FontWeight.bold
+                              : FontWeight.normal,
+                          fontSize: 12.5,
+                        ),
+                        onSelected: (_) {
+                          setState(() {
+                            limit = val;
+                            currentPage = 1;
+                          });
+                          setModalState(() {});
+                          _saveUiPreferences(newLimit: val);
+                          _fetchVideos();
+                        },
+                      );
+                    }).toList(),
+                  ),
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    width: double.infinity,
+                    child: Wrap(
+                      spacing: 8,
+                      runSpacing: 4,
+                      alignment: WrapAlignment.spaceBetween,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        const Text(
+                          'Filter Durasi Video:',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: Colors.white70,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: Text(
+                                '${_formatMinutesLabel(durationRange.start.round())} – ${_formatMinutesLabel(durationRange.end.round(), isMax: true)}',
+                                style: const TextStyle(
+                                  fontSize: 12.5,
+                                  color: Colors.amberAccent,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 20),
+                    child: LayoutBuilder(
+                      builder: (sliderContext, constraints) {
+                        const trackInset = 16.0;
+                        final trackWidth =
+                            (constraints.maxWidth - trackInset * 2)
+                                .clamp(1.0, double.infinity)
+                                .toDouble();
+
+                        void finishDurationDrag() {
+                          pendingOverlap = false;
+                          if (_activeDurationThumb == null) return;
+                          setModalState(() => _activeDurationThumb = null);
+                          setState(() => currentPage = 1);
+                          _saveUiPreferences();
+                          _fetchVideos();
+                        }
+
+                        return GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onHorizontalDragStart: (details) {
+                            pendingOverlap = false;
+                            final x = details.localPosition.dx;
+                            final startX =
+                                trackInset +
+                                durationRange.start / 120 * trackWidth;
+                            final endX =
+                                trackInset +
+                                durationRange.end / 120 * trackWidth;
+                            final startDistance = (x - startX).abs();
+                            final endDistance = (x - endX).abs();
+                            // Make the touch target much larger than the
+                            // visible thumb, which is difficult to grab on
+                            // a phone. Track presses still do not move it.
+                            const thumbHitRadius = 36.0;
+
+                            if (startDistance <= thumbHitRadius ||
+                                endDistance <= thumbHitRadius) {
+                              if ((durationRange.start - durationRange.end)
+                                      .abs() <
+                                  0.01) {
+                                pendingOverlap = true;
+                                setModalState(
+                                  () => _activeDurationThumb = Thumb.end,
+                                );
+                              } else {
+                                setModalState(
+                                  () => _activeDurationThumb =
+                                      startDistance <= endDistance
+                                      ? Thumb.start
+                                      : Thumb.end,
+                                );
+                              }
+                            } else {
+                              setModalState(() => _activeDurationThumb = null);
+                            }
+                          },
+                          onHorizontalDragUpdate: (details) {
+                            final rawDelta = details.primaryDelta ?? 0;
+                            if (pendingOverlap && rawDelta != 0) {
+                              pendingOverlap = false;
+                              final picked = rawDelta > 0
+                                  ? Thumb.end
+                                  : Thumb.start;
+                              if (_activeDurationThumb != picked) {
+                                setModalState(
+                                  () => _activeDurationThumb = picked,
+                                );
+                              }
+                            }
+                            final deltaMinutes = rawDelta / trackWidth * 120;
+                            final thumb = _activeDurationThumb;
+                            if (thumb == Thumb.start) {
+                              final start = (durationRange.start + deltaMinutes)
+                                  .clamp(0.0, durationRange.end)
+                                  .toDouble();
+                              setModalState(() {
+                                durationRange = RangeValues(
+                                  start,
+                                  durationRange.end,
+                                );
+                              });
+                            } else if (thumb == Thumb.end) {
+                              final end = (durationRange.end + deltaMinutes)
+                                  .clamp(durationRange.start, 120.0)
+                                  .toDouble();
+                              setModalState(() {
+                                durationRange = RangeValues(
+                                  durationRange.start,
+                                  end,
+                                );
+                              });
+                            }
+                          },
+                          onHorizontalDragEnd: (_) => finishDurationDrag(),
+                          onHorizontalDragCancel: finishDurationDrag,
+                          child: Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              IgnorePointer(
+                                child: RangeSlider(
+                                  values: durationRange,
+                                  min: 0,
+                                  max: 120,
+                                  divisions: 120,
+                                  activeColor: const Color(0xFFFF0033),
+                                  inactiveColor: const Color(0xFF444444),
+                                  onChanged: (_) {},
+                                ),
+                              ),
+                              for (final thumb in [Thumb.start, Thumb.end])
+                                Positioned(
+                                  left:
+                                      trackInset +
+                                      (thumb == Thumb.start
+                                              ? durationRange.start
+                                              : durationRange.end) /
+                                          120 *
+                                          trackWidth -
+                                      11,
+                                  child: IgnorePointer(
+                                    child: AnimatedContainer(
+                                      duration: const Duration(
+                                        milliseconds: 120,
+                                      ),
+                                      width: 22,
+                                      height: 22,
+                                      decoration: BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        color: const Color(0xFFFF0033),
+                                        border: Border.all(
+                                          color: Colors.white,
+                                          width: _activeDurationThumb == thumb
+                                              ? 2.5
+                                              : 1.5,
                                         ),
-                                        width: 22,
-                                        height: 22,
-                                        decoration: BoxDecoration(
-                                          shape: BoxShape.circle,
-                                          color: const Color(0xFFFF0033),
-                                          border: Border.all(
-                                            color: Colors.white,
-                                            width: _activeDurationThumb == thumb
-                                                ? 2.5
-                                                : 1.5,
-                                          ),
-                                          boxShadow: [
-                                            if (_activeDurationThumb == thumb)
-                                              BoxShadow(
-                                                color: const Color(
-                                                  0xFFFF0033,
-                                                ).withValues(alpha: 0.55),
-                                                blurRadius: 14,
-                                                spreadRadius: 4,
-                                              ),
-                                          ],
-                                        ),
+                                        boxShadow: [
+                                          if (_activeDurationThumb == thumb)
+                                            BoxShadow(
+                                              color: const Color(
+                                                0xFFFF0033,
+                                              ).withValues(alpha: 0.55),
+                                              blurRadius: 14,
+                                              spreadRadius: 4,
+                                            ),
+                                        ],
                                       ),
                                     ),
                                   ),
-                              ],
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-                    SizedBox(
-                      width: double.infinity,
-                      height: 44,
-                      child: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFFFF0033),
-                          foregroundColor: Colors.white,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(10),
+                                ),
+                            ],
                           ),
-                        ),
-                        onPressed: () {
-                          commitDayInput(unfocus: true);
-                          Navigator.pop(ctx);
-                        },
-                        child: Text(
-                          'Terapkan (Total $totalVideos Video)',
-                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 44,
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFFFF0033),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
                         ),
                       ),
+                      onPressed: () {
+                        commitDayInput(unfocus: true);
+                        Navigator.pop(ctx);
+                      },
+                      child: Text(
+                        'Terapkan (Total $totalVideos Video)',
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
                     ),
-                  ],
-                ),
+                  ),
+                ],
               ),
-            ),
             );
           },
         );
+        return Builder(
+          builder: (kbCtx) => SafeArea(
+            child: Padding(
+              padding: EdgeInsets.only(
+                bottom: MediaQuery.viewInsetsOf(kbCtx).bottom,
+              ),
+              child: sheetContent,
+            ),
+          ),
+        );
       },
-    ).whenComplete(() => _refreshFilterModal = null);
+    ).whenComplete(() {
+      _refreshFilterModal = null;
+      _dayInputDebounce?.cancel();
+      if (_activeDayFocusListener != null) {
+        _dayFocusNode.removeListener(_activeDayFocusListener!);
+        _activeDayFocusListener = null;
+      }
+    });
   }
 
-  Widget _buildFilterSortButton({
-    double height = 38,
-    bool compact = false,
-  }) {
+  Widget _buildFilterSortButton({double height = 38, bool compact = false}) {
     return Tooltip(
       message: 'Filter & Urutkan',
       child: SizedBox(
@@ -6509,8 +6818,337 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     );
   }
 
+  Widget _buildSidebarLiveSection({bool isDrawer = false}) {
+    final liveList = _visibleLiveStreams(ignoreSelectedChannel: true);
+    return Container(
+      key: const Key('sidebar_live_section'),
+      margin: const EdgeInsets.fromLTRB(4, 2, 4, 8),
+      padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFF181818),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: liveList.isNotEmpty
+              ? const Color(0x55FF0033)
+              : const Color(0xFF282828),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(
+                  color: liveList.isNotEmpty
+                      ? const Color(0xFFFF0033)
+                      : Colors.white38,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 7),
+              Expanded(
+                child: Text(
+                  'Live Streaming (${liveList.length})',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (liveList.isEmpty)
+            const Padding(
+              padding: EdgeInsets.only(top: 4),
+              child: Text(
+                'Belum ada akun yang live',
+                style: TextStyle(fontSize: 11.5, color: Colors.white54),
+              ),
+            )
+          else ...[
+            const SizedBox(height: 6),
+            for (final item in liveList)
+              Builder(
+                builder: (ctx) {
+                  final cid = (item['channel_id'] ?? '').toString();
+                  final chTitle = (item['channel_title'] ?? '').toString();
+                  final chThumb = (item['channel_thumbnail'] ?? '').toString();
+                  return InkWell(
+                    key: Key('sidebar_live_item_$cid'),
+                    borderRadius: BorderRadius.circular(8),
+                    onTap: () {
+                      if (isDrawer && Navigator.of(context).canPop()) {
+                        Navigator.of(context).pop();
+                      }
+                      _openYouTubeVideo(item);
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        vertical: 5,
+                        horizontal: 4,
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(1.5),
+                            decoration: const BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Color(0xFFFF0033),
+                            ),
+                            child: CircleAvatar(
+                              radius: 12,
+                              backgroundColor: const Color(0xFF383838),
+                              backgroundImage: chThumb.isNotEmpty
+                                  ? NetworkImage(chThumb)
+                                  : null,
+                              onBackgroundImageError: chThumb.isNotEmpty
+                                  ? (_, _) {}
+                                  : null,
+                              child: Text(
+                                chTitle.isNotEmpty ? chTitle[0] : '?',
+                                style: const TextStyle(
+                                  fontSize: 10,
+                                  color: Colors.white70,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              chTitle,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFFF0033),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: const Text(
+                              'LIVE',
+                              style: TextStyle(
+                                fontSize: 9.5,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white,
+                                letterSpacing: 0.4,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMainLiveSection() {
+    final liveList = _visibleLiveStreams();
+    return Container(
+      key: const Key('main_live_section'),
+      margin: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+      padding: EdgeInsets.symmetric(
+        horizontal: 12,
+        vertical: liveList.isEmpty ? 8 : 10,
+      ),
+      decoration: BoxDecoration(
+        color: const Color(0xFF171717),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: liveList.isNotEmpty
+              ? const Color(0x66FF0033)
+              : const Color(0xFF282828),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 9,
+                height: 9,
+                decoration: BoxDecoration(
+                  color: liveList.isNotEmpty
+                      ? const Color(0xFFFF0033)
+                      : Colors.white38,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  'Live Streaming (${liveList.length})',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+              if (liveList.isEmpty) ...[
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text(
+                    'Belum ada yang sedang live',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 12, color: Colors.white54),
+                  ),
+                ),
+              ],
+            ],
+          ),
+          if (liveList.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            SizedBox(
+              height: 76,
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                itemCount: liveList.length,
+                separatorBuilder: (_, _) => const SizedBox(width: 10),
+                itemBuilder: (_, idx) {
+                  final item = liveList[idx];
+                  final cid = (item['channel_id'] ?? '').toString();
+                  final chTitle = (item['channel_title'] ?? '').toString();
+                  final streamTitle = (item['title'] ?? '').toString();
+                  final chThumb = (item['channel_thumbnail'] ?? '').toString();
+                  return InkWell(
+                    key: Key('main_live_item_$cid'),
+                    borderRadius: BorderRadius.circular(10),
+                    onTap: () => _openYouTubeVideo(item),
+                    child: Container(
+                      width: 220,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF212121),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: const Color(0x55FF0033)),
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(2),
+                            decoration: const BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Color(0xFFFF0033),
+                            ),
+                            child: CircleAvatar(
+                              radius: 18,
+                              backgroundColor: const Color(0xFF383838),
+                              backgroundImage: chThumb.isNotEmpty
+                                  ? NetworkImage(chThumb)
+                                  : null,
+                              onBackgroundImageError: chThumb.isNotEmpty
+                                  ? (_, _) {}
+                                  : null,
+                              child: Text(
+                                chTitle.isNotEmpty ? chTitle[0] : '?',
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white70,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: Text(
+                                        chTitle,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w700,
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 5,
+                                        vertical: 1.5,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFFFF0033),
+                                        borderRadius: BorderRadius.circular(4),
+                                      ),
+                                      child: const Text(
+                                        'LIVE',
+                                        style: TextStyle(
+                                          fontSize: 9.5,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                if (streamTitle.isNotEmpty) ...[
+                                  const SizedBox(height: 3),
+                                  Text(
+                                    streamTitle,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 11.5,
+                                      color: Colors.white60,
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
   Widget _buildPaginationTabsBar() {
-    if (totalPages <= 1 && totalVideos <= limit) {
+    if (totalVideos <= 0) {
       return const SizedBox.shrink();
     }
     final safeCurrent = currentPage.clamp(1, totalPages);
@@ -6632,6 +7270,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         children: [
           if (isMobile && _showMobileSearch) _buildMobileSearchRow(),
           _buildFilterSummaryStrip(isMobile),
+          _buildMainLiveSection(),
           const Expanded(
             child: Center(
               child: Text(
@@ -6651,31 +7290,41 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       crossAxisCount = 2;
     }
 
-    return CustomScrollView(
-      controller: _videoScrollController,
-      slivers: [
-        if (isMobile && _showMobileSearch)
-          SliverToBoxAdapter(child: _buildMobileSearchRow()),
-        SliverToBoxAdapter(child: _buildFilterSummaryStrip(isMobile)),
-        SliverToBoxAdapter(child: _buildPaginationTabsBar()),
-        SliverPadding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          sliver: SliverGrid(
-            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: crossAxisCount,
-              crossAxisSpacing: 16,
-              mainAxisSpacing: 22,
-              childAspectRatio: 1.12,
+    final scrollView = ScrollConfiguration(
+      behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+      child: CustomScrollView(
+        controller: _videoScrollController,
+        slivers: [
+          if (isMobile && _showMobileSearch)
+            SliverToBoxAdapter(child: _buildMobileSearchRow()),
+          SliverToBoxAdapter(child: _buildFilterSummaryStrip(isMobile)),
+          SliverToBoxAdapter(child: _buildPaginationTabsBar()),
+          SliverToBoxAdapter(child: _buildMainLiveSection()),
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+            sliver: SliverGrid(
+              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: crossAxisCount,
+                crossAxisSpacing: 16,
+                mainAxisSpacing: 22,
+                childAspectRatio: 1.12,
+              ),
+              delegate: SliverChildBuilderDelegate((context, index) {
+                final v = videos[index];
+                return _buildVideoCard(v);
+              }, childCount: videos.length),
             ),
-            delegate: SliverChildBuilderDelegate((context, index) {
-              final v = videos[index];
-              return _buildVideoCard(v);
-            }, childCount: videos.length),
           ),
-        ),
-        SliverToBoxAdapter(child: _buildPaginationTabsBar()),
-        const SliverToBoxAdapter(child: SizedBox(height: 72)),
-      ],
+          SliverToBoxAdapter(child: _buildPaginationTabsBar()),
+          const SliverToBoxAdapter(child: SizedBox(height: 72)),
+        ],
+      ),
+    );
+
+    return _HomeScrollWithBar(
+      controller: _videoScrollController,
+      itemCount: videos.length,
+      scrollView: scrollView,
     );
   }
 
@@ -6724,7 +7373,31 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                     ),
                   ),
                 ),
-                if (duration.isNotEmpty)
+                if (_isLiveFlag(v['is_live']))
+                  Positioned(
+                    right: 8,
+                    bottom: 8,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 7,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFF0033),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: const Text(
+                        'LIVE',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                          letterSpacing: 0.4,
+                        ),
+                      ),
+                    ),
+                  )
+                else if (duration.isNotEmpty)
                   Positioned(
                     right: 8,
                     bottom: 8,
@@ -7898,7 +8571,11 @@ class _TabPickerDialogState extends State<TabPickerDialog> {
                     ),
                   ),
                   IconButton(
-                    icon: const Icon(Icons.close, size: 18, color: Colors.white70),
+                    icon: const Icon(
+                      Icons.close,
+                      size: 18,
+                      color: Colors.white70,
+                    ),
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints.tightFor(
                       width: 30,
@@ -7913,173 +8590,350 @@ class _TabPickerDialogState extends State<TabPickerDialog> {
             Flexible(
               child: SizedBox(
                 height: desiredH,
-              child: LayoutBuilder(
-                builder: (ctx, constraints) {
-                  final trackH = constraints.maxHeight;
-                  final totalContentH = widget.totalPages * _itemExtent;
-                  final canScroll = totalContentH > trackH + 1.0;
-                  final maxExtent = canScroll
-                      ? (_ctrl.hasClients && _ctrl.position.hasContentDimensions
-                            ? _ctrl.position.maxScrollExtent
-                            : totalContentH - trackH)
-                      : 0.0;
-                  final currentOffset =
-                      (_ctrl.hasClients && _ctrl.position.hasContentDimensions)
-                      ? _ctrl.offset.clamp(0.0, maxExtent)
-                      : 0.0;
-                  final thumbH = canScroll
-                      ? (trackH * (trackH / totalContentH)).clamp(36.0, trackH)
-                      : trackH;
-                  final thumbTop = (canScroll && maxExtent > 0)
-                      ? (currentOffset / maxExtent) * (trackH - thumbH)
-                      : 0.0;
-                  final hoverTab =
-                      ((currentOffset / _itemExtent).floor() + 1).clamp(
-                        1,
-                        widget.totalPages,
-                      );
+                child: LayoutBuilder(
+                  builder: (ctx, constraints) {
+                    final trackH = constraints.maxHeight;
+                    final totalContentH = widget.totalPages * _itemExtent;
+                    final canScroll = totalContentH > trackH + 1.0;
+                    final maxExtent = canScroll
+                        ? (_ctrl.hasClients &&
+                                  _ctrl.position.hasContentDimensions
+                              ? _ctrl.position.maxScrollExtent
+                              : totalContentH - trackH)
+                        : 0.0;
+                    final currentOffset =
+                        (_ctrl.hasClients &&
+                            _ctrl.position.hasContentDimensions)
+                        ? _ctrl.offset.clamp(0.0, maxExtent)
+                        : 0.0;
+                    final thumbH = canScroll
+                        ? (trackH * (trackH / totalContentH)).clamp(
+                            36.0,
+                            trackH,
+                          )
+                        : trackH;
+                    final thumbTop = (canScroll && maxExtent > 0)
+                        ? (currentOffset / maxExtent) * (trackH - thumbH)
+                        : 0.0;
+                    final hoverTab = ((currentOffset / _itemExtent).floor() + 1)
+                        .clamp(1, widget.totalPages);
 
-                  return Stack(
-                    children: [
-                      Row(
-                        children: [
-                          Expanded(
-                            child: ListView.builder(
-                              controller: _ctrl,
-                              itemExtent: _itemExtent,
-                              itemCount: widget.totalPages,
-                              itemBuilder: (_, idx) {
-                                final pageNum = idx + 1;
-                                final startItem = idx * widget.limit + 1;
-                                final endItem =
-                                    ((idx + 1) * widget.limit >
-                                        widget.totalVideos)
-                                    ? widget.totalVideos
-                                    : (idx + 1) * widget.limit;
-                                final selected = pageNum == widget.currentPage;
-                                return InkWell(
-                                  onTap: () => Navigator.pop(context, pageNum),
-                                  child: Container(
-                                    color: selected
-                                        ? const Color(0xFF383838)
-                                        : Colors.transparent,
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 16,
-                                    ),
-                                    alignment: Alignment.centerLeft,
-                                    child: Text(
-                                      'Tab $pageNum ($startItem–$endItem)',
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                        color: selected
-                                            ? Colors.white
-                                            : Colors.white70,
-                                        fontSize: 13.5,
-                                        fontWeight: selected
-                                            ? FontWeight.bold
-                                            : FontWeight.w500,
-                                      ),
+                    return Row(
+                      children: [
+                        Expanded(
+                          child: ListView.builder(
+                            controller: _ctrl,
+                            itemExtent: _itemExtent,
+                            itemCount: widget.totalPages,
+                            itemBuilder: (_, idx) {
+                              final pageNum = idx + 1;
+                              final startItem = idx * widget.limit + 1;
+                              final endItem =
+                                  ((idx + 1) * widget.limit >
+                                      widget.totalVideos)
+                                  ? widget.totalVideos
+                                  : (idx + 1) * widget.limit;
+                              final selected = pageNum == widget.currentPage;
+                              return InkWell(
+                                onTap: () => Navigator.pop(context, pageNum),
+                                child: Container(
+                                  color: selected
+                                      ? const Color(0xFF383838)
+                                      : Colors.transparent,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 16,
+                                  ),
+                                  alignment: Alignment.centerLeft,
+                                  child: Text(
+                                    'Tab $pageNum ($startItem–$endItem)',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: selected
+                                          ? Colors.white
+                                          : Colors.white70,
+                                      fontSize: 13.5,
+                                      fontWeight: selected
+                                          ? FontWeight.bold
+                                          : FontWeight.w500,
                                     ),
                                   ),
-                                );
-                              },
-                            ),
-                          ),
-                          if (canScroll)
-                            GestureDetector(
-                              key: const Key('tab_fast_scrollbar'),
-                              behavior: HitTestBehavior.opaque,
-                              onTapDown: (d) => _jumpToTrackY(
-                                d.localPosition.dy,
-                                trackH,
-                                thumbH,
-                              ),
-                              onVerticalDragStart: (d) {
-                                setState(() => _dragging = true);
-                                _jumpToTrackY(
-                                  d.localPosition.dy,
-                                  trackH,
-                                  thumbH,
-                                );
-                              },
-                              onVerticalDragUpdate: (d) => _jumpToTrackY(
-                                d.localPosition.dy,
-                                trackH,
-                                thumbH,
-                              ),
-                              onVerticalDragEnd: (_) =>
-                                  setState(() => _dragging = false),
-                              onVerticalDragCancel: () =>
-                                  setState(() => _dragging = false),
-                              child: SizedBox(
-                                width: 28,
-                                height: trackH,
-                                child: Stack(
-                                  alignment: Alignment.topCenter,
-                                  children: [
-                                    Container(
-                                      width: 6,
-                                      height: trackH,
-                                      decoration: BoxDecoration(
-                                        color: const Color(0xFF333333),
-                                        borderRadius: BorderRadius.circular(3),
-                                      ),
-                                    ),
-                                    Positioned(
-                                      top: thumbTop,
-                                      child: Container(
-                                        key: const Key('tab_fast_thumb'),
-                                        width: _dragging ? 12 : 9,
-                                        height: thumbH,
-                                        decoration: BoxDecoration(
-                                          color: _dragging
-                                              ? const Color(0xFFFF0033)
-                                              : Colors.white70,
-                                          borderRadius: BorderRadius.circular(6),
-                                        ),
-                                      ),
-                                    ),
-                                  ],
                                 ),
-                              ),
-                            ),
-                        ],
-                      ),
-                      if (_dragging && canScroll)
-                        Positioned(
-                          right: 36,
-                          top: (thumbTop + thumbH / 2 - 14).clamp(
-                            4.0,
-                            (trackH - 32).clamp(4.0, trackH),
-                          ),
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                              vertical: 4,
-                            ),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFFFF0033),
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Text(
-                              'Tab $hoverTab',
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 12,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
+                              );
+                            },
                           ),
                         ),
-                    ],
-                  );
-                },
+                        if (canScroll)
+                          _FastScrollbarTrack(
+                            railKey: const Key('tab_fast_scrollbar'),
+                            thumbKey: const Key('tab_fast_thumb'),
+                            width: 28,
+                            trackH: trackH,
+                            thumbH: thumbH,
+                            thumbTop: thumbTop,
+                            dragging: _dragging,
+                            dragLabel: 'Tab $hoverTab',
+                            badgeRight: 36,
+                            onJumpToY: (dy) =>
+                                _jumpToTrackY(dy, trackH, thumbH),
+                            onDragStateChanged: (v) =>
+                                setState(() => _dragging = v),
+                          ),
+                      ],
+                    );
+                  },
+                ),
               ),
-            ),
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _FastScrollbarTrack extends StatelessWidget {
+  final Key railKey;
+  final Key thumbKey;
+  final double width;
+  final double trackH;
+  final double thumbH;
+  final double thumbTop;
+  final bool dragging;
+  final String dragLabel;
+  final double badgeRight;
+  final ValueChanged<double> onJumpToY;
+  final ValueChanged<bool> onDragStateChanged;
+
+  const _FastScrollbarTrack({
+    required this.railKey,
+    required this.thumbKey,
+    required this.width,
+    required this.trackH,
+    required this.thumbH,
+    required this.thumbTop,
+    required this.dragging,
+    required this.dragLabel,
+    required this.badgeRight,
+    required this.onJumpToY,
+    required this.onDragStateChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        GestureDetector(
+          key: railKey,
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (d) => onJumpToY(d.localPosition.dy),
+          onVerticalDragStart: (d) {
+            onDragStateChanged(true);
+            onJumpToY(d.localPosition.dy);
+          },
+          onVerticalDragUpdate: (d) => onJumpToY(d.localPosition.dy),
+          onVerticalDragEnd: (_) => onDragStateChanged(false),
+          onVerticalDragCancel: () => onDragStateChanged(false),
+          child: SizedBox(
+            width: width,
+            height: trackH,
+            child: Stack(
+              alignment: Alignment.topCenter,
+              children: [
+                Container(
+                  width: 6,
+                  height: trackH,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF333333),
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                ),
+                Positioned(
+                  top: thumbTop,
+                  child: Container(
+                    key: thumbKey,
+                    width: dragging ? 12 : 9,
+                    height: thumbH,
+                    decoration: BoxDecoration(
+                      color: dragging
+                          ? const Color(0xFFFF0033)
+                          : Colors.white70,
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (dragging)
+          Positioned(
+            right: badgeRight,
+            top: (thumbTop + thumbH / 2 - 14).clamp(
+              4.0,
+              (trackH - 32).clamp(4.0, trackH),
+            ),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFF0033),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text(
+                dragLabel,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _HomeScrollWithBar extends StatefulWidget {
+  final ScrollController controller;
+  final int itemCount;
+  final Widget scrollView;
+  final Key railKey;
+  final Key thumbKey;
+  final String itemLabel;
+  final EdgeInsets trackPadding;
+
+  const _HomeScrollWithBar({
+    required this.controller,
+    required this.itemCount,
+    required this.scrollView,
+    this.railKey = const Key('home_fast_scrollbar'),
+    this.thumbKey = const Key('home_fast_thumb'),
+    this.itemLabel = 'Video',
+    this.trackPadding = const EdgeInsets.only(top: 6, right: 2, bottom: 64),
+  });
+
+  @override
+  State<_HomeScrollWithBar> createState() => _HomeScrollWithBarState();
+}
+
+class _HomeScrollWithBarState extends State<_HomeScrollWithBar> {
+  bool _dragging = false;
+  double _lastMaxExtent = -1.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _scheduleExtentSync();
+  }
+
+  @override
+  void didUpdateWidget(covariant _HomeScrollWithBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.itemCount != widget.itemCount ||
+        oldWidget.controller != widget.controller) {
+      _scheduleExtentSync();
+    }
+  }
+
+  void _scheduleExtentSync() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || widget.controller.positions.length != 1) return;
+      final pos = widget.controller.position;
+      if (!pos.hasContentDimensions) return;
+      if ((pos.maxScrollExtent - _lastMaxExtent).abs() > 1.0) {
+        _lastMaxExtent = pos.maxScrollExtent;
+        setState(() {});
+      }
+    });
+  }
+
+  void _jumpToTrackY(double dy, double trackH, double thumbH) {
+    if (widget.controller.positions.length != 1) return;
+    final pos = widget.controller.position;
+    if (!pos.hasContentDimensions || pos.maxScrollExtent <= 0) return;
+    final usable = (trackH - thumbH).clamp(1.0, double.infinity);
+    final frac = ((dy - thumbH / 2) / usable).clamp(0.0, 1.0);
+    widget.controller.jumpTo(frac * pos.maxScrollExtent);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return NotificationListener<ScrollMetricsNotification>(
+      onNotification: (notification) {
+        if (notification.depth != 0) return false;
+        if ((notification.metrics.maxScrollExtent - _lastMaxExtent).abs() >
+            1.0) {
+          _scheduleExtentSync();
+        }
+        return false;
+      },
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(child: widget.scrollView),
+          AnimatedBuilder(
+            animation: widget.controller,
+            builder: (ctx, _) {
+              final hasPos =
+                  widget.controller.positions.length == 1 &&
+                  widget.controller.position.hasContentDimensions;
+              final maxExtent = hasPos
+                  ? widget.controller.position.maxScrollExtent
+                  : 0.0;
+              final viewportH = hasPos
+                  ? widget.controller.position.viewportDimension
+                  : 0.0;
+              if (maxExtent <= 1.0 || viewportH <= 0.0) {
+                return const SizedBox.shrink();
+              }
+
+              return Padding(
+                padding: widget.trackPadding,
+                child: LayoutBuilder(
+                  builder: (_, constraints) {
+                    final trackH = constraints.maxHeight;
+                    if (trackH <= 24.0) return const SizedBox.shrink();
+                    final totalContentH = maxExtent + viewportH;
+                    final currentOffset = widget.controller.offset.clamp(
+                      0.0,
+                      maxExtent,
+                    );
+                    final thumbH = (trackH * (viewportH / totalContentH)).clamp(
+                      36.0,
+                      trackH,
+                    );
+                    final thumbTop = maxExtent > 0
+                        ? (currentOffset / maxExtent) * (trackH - thumbH)
+                        : 0.0;
+                    final frac = maxExtent > 0
+                        ? (currentOffset / maxExtent).clamp(0.0, 1.0)
+                        : 0.0;
+                    final hoverItem = widget.itemCount <= 1
+                        ? widget.itemCount
+                        : (frac * (widget.itemCount - 1)).round() + 1;
+
+                    return _FastScrollbarTrack(
+                      railKey: widget.railKey,
+                      thumbKey: widget.thumbKey,
+                      width: 24,
+                      trackH: trackH,
+                      thumbH: thumbH,
+                      thumbTop: thumbTop,
+                      dragging: _dragging,
+                      dragLabel:
+                          '${widget.itemLabel} $hoverItem / ${widget.itemCount}',
+                      badgeRight: 32,
+                      onJumpToY: (dy) => _jumpToTrackY(dy, trackH, thumbH),
+                      onDragStateChanged: (v) => setState(() => _dragging = v),
+                    );
+                  },
+                ),
+              );
+            },
+          ),
+        ],
       ),
     );
   }

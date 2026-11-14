@@ -1,3 +1,7 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -428,36 +432,73 @@ void main() {
         isFalse,
       );
 
-      // Uji Day: ketik multi-digit (8 -> 80) tidak langsung menutup keyboard atau commit sebelum Done/blur
-      await tester.enterText(find.byKey(const Key('hari_lalu_input')), '8');
+      // Uji Day real-time: ketik '3' -> '30' langsung tampil & aktif tanpa perlu menekan Done/centang terlebih dahulu
+      await tester.enterText(find.byKey(const Key('hari_lalu_input')), '3');
       await tester.pump();
-      expect(
-        tester
-            .widget<ChoiceChip>(find.widgetWithText(ChoiceChip, 'This Week'))
-            .selected,
-        isTrue,
-      );
-      expect(find.byKey(const Key('hari_lalu_clear')), findsNothing);
-      await tester.enterText(find.byKey(const Key('hari_lalu_input')), '80');
-      await tester.testTextInput.receiveAction(TextInputAction.done);
-      await tester.pumpAndSettle();
-      expect(find.byKey(const Key('hari_lalu_clear')), findsOneWidget);
-      expect(find.textContaining('80 Day'), findsWidgets);
-
-      // Uji angka 2 -> 2 Day tampil setelah Done
-      await tester.enterText(find.byKey(const Key('hari_lalu_input')), '2');
-      await tester.testTextInput.receiveAction(TextInputAction.done);
-      await tester.pumpAndSettle();
       expect(
         tester
             .widget<ChoiceChip>(find.widgetWithText(ChoiceChip, 'This Week'))
             .selected,
         isFalse,
       );
+      final dayTf = tester.widget<TextField>(
+        find.byKey(const Key('hari_lalu_input')),
+      );
+      expect(dayTf.focusNode!.hasFocus, isTrue);
+      expect(dayTf.controller!.text, '3');
+
+      await tester.enterText(find.byKey(const Key('hari_lalu_input')), '30');
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(dayTf.focusNode!.hasFocus, isTrue);
+      expect(dayTf.controller!.text, '30');
+      expect(find.byKey(const Key('hari_lalu_clear')), findsOneWidget);
+      expect(find.textContaining('30 Day'), findsWidgets);
+
+      // Saat masih fokus mengedit (30 -> 28): tekan X mengosongkan teks tanpa kembali ke All Time & fokus tetap terbuka
+      await tester.tap(find.byKey(const Key('hari_lalu_clear')));
+      await tester.pump();
+      expect(dayTf.controller!.text, isEmpty);
+      expect(dayTf.focusNode!.hasFocus, isTrue);
+      expect(
+        tester
+            .widget<ChoiceChip>(find.widgetWithText(ChoiceChip, 'All Time'))
+            .selected,
+        isFalse,
+      );
+
+      // Langsung ketik 28 real-time -> jadi 28 Day (mencakup hari 0..28 = 12 video)
+      await tester.enterText(find.byKey(const Key('hari_lalu_input')), '28');
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(dayTf.controller!.text, '28');
+      expect(dayTf.focusNode!.hasFocus, isTrue);
+      expect(find.textContaining('28 Day'), findsWidgets);
+      expect(find.text('Terapkan (Total 12 Video)'), findsOneWidget);
+
+      // Selesai centang (Done), lalu tekan tombol X saat tidak fokus -> langsung kembali ke All Time
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pumpAndSettle();
+      expect(dayTf.focusNode!.hasFocus, isFalse);
+      await tester.tap(find.byKey(const Key('hari_lalu_clear')));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<ChoiceChip>(find.widgetWithText(ChoiceChip, 'All Time'))
+            .selected,
+        isTrue,
+      );
+      expect(find.byKey(const Key('hari_lalu_clear')), findsNothing);
+      expect(find.text('Terapkan (Total 36 Video)'), findsOneWidget);
+
+      // Uji angka 2 -> 2 Day mencakup hari 0..2 = 2 video
+      await tester.enterText(find.byKey(const Key('hari_lalu_input')), '2');
+      await tester.pump(const Duration(milliseconds: 250));
       expect(find.byKey(const Key('hari_lalu_clear')), findsOneWidget);
       expect(find.textContaining('2 Day'), findsWidgets);
+      expect(find.text('Terapkan (Total 2 Video)'), findsOneWidget);
 
-      // Klik tombol clear (X) di Day -> kembali ke All Time
+      // Done + klik X lagi -> kembali ke All Time
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('hari_lalu_clear')));
       await tester.pumpAndSettle();
       expect(
@@ -564,6 +605,31 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.textContaining('Cari: "Fajrul"'), findsNothing);
       expect(find.textContaining('Total: 36 video'), findsOneWidget);
+
+      // Uji scrollbar interaktif di Home Page (tekan track langsung loncat + hold-drag geser cepat)
+      final homeRailFinder = find.byKey(const Key('home_fast_scrollbar'));
+      expect(homeRailFinder, findsOneWidget);
+      final homeThumbFinder = find.byKey(const Key('home_fast_thumb'));
+      expect(homeThumbFinder, findsOneWidget);
+      final thumbTopBefore = tester.getTopLeft(homeThumbFinder).dy;
+      final railRect = tester.getRect(homeRailFinder);
+      await tester.tapAt(
+        Offset(railRect.center.dx, railRect.top + railRect.height * 0.7),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        tester.getTopLeft(homeThumbFinder).dy,
+        greaterThan(thumbTopBefore),
+      );
+      final gesture = await tester.startGesture(
+        tester.getCenter(homeThumbFinder),
+      );
+      await tester.pump();
+      await gesture.moveBy(const Offset(0, -180));
+      await tester.pump();
+      expect(find.textContaining('Video '), findsWidgets);
+      await gesture.up();
+      await tester.pumpAndSettle();
 
       // Pastikan pada layar mobile (390px) bottom sheet filter tidak overflow dan tinggi kotak sejajar 36px
       await tester.tap(find.text('Filter'));
@@ -751,4 +817,398 @@ void main() {
       expect(tester.takeException(), isNull);
     },
   );
+
+  testWidgets(
+    'Follower sidebar scrollbar interaktif & Navigasi Tab + scrollbar tampil di 1 creator',
+    (WidgetTester tester) async {
+      // Tinggi viewport 360px membuat daftar channel sidebar overflow -> sidebar_fast_scrollbar aktif
+      tester.view.physicalSize = const Size(1280, 360);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      await tester.pumpWidget(const PersonalYouTubeApp());
+      await tester.pumpAndSettle();
+
+      final sidebarRail = find.byKey(const Key('sidebar_fast_scrollbar'));
+      final sidebarThumb = find.byKey(const Key('sidebar_fast_thumb'));
+      expect(sidebarRail, findsOneWidget);
+      expect(sidebarThumb, findsOneWidget);
+
+      final thumbTopBefore = tester.getTopLeft(sidebarThumb).dy;
+      final railRect = tester.getRect(sidebarRail);
+      await tester.tapAt(
+        Offset(railRect.center.dx, railRect.top + railRect.height * 0.8),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        tester.getTopLeft(sidebarThumb).dy,
+        greaterThan(thumbTopBefore),
+      );
+
+      final gesture = await tester.startGesture(tester.getCenter(sidebarThumb));
+      await tester.pump();
+      await gesture.moveBy(const Offset(0, -100));
+      await tester.pump();
+      expect(find.textContaining('Channel '), findsWidgets);
+      await gesture.up();
+      await tester.pumpAndSettle();
+
+      // Pilih 1 creator ('Fajrul Fx', 6 video < limit 50) di mobile 390x600
+      tester.view.physicalSize = const Size(390, 600);
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byIcon(Icons.menu));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Fajrul Fx').first);
+      await tester.pumpAndSettle();
+
+      // Navigasi Tab tetap muncul penuh meski cuma 1 halaman di dalam 1 creator
+      expect(find.text('Navigasi Tab:'), findsOneWidget);
+      expect(find.text('Sebelumnya'), findsOneWidget);
+      expect(find.text('Tab 1 (1–6)'), findsOneWidget);
+      expect(find.text('Berikutnya'), findsOneWidget);
+      expect(find.text('Halaman 1 dari 1 (6 video)'), findsOneWidget);
+
+      // Scrollbar Home Page juga tetap aktif di dalam tampilan 1 creator saat list overflow
+      expect(find.byKey(const Key('home_fast_scrollbar')), findsOneWidget);
+      expect(find.byKey(const Key('home_fast_thumb')), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'Live Streaming: posisi di bawah Subscriptions & Navigasi Tab, update saat Refresh & auto-refresh saat buka/kembali ke aplikasi/Following',
+    (WidgetTester tester) async {
+      int refreshCalls = 0;
+      bool liveActive = false;
+      bool refreshDoneReady = false;
+
+      final liveVideo = <String, dynamic>{
+        'video_id': 'live_vid_99',
+        'channel_id': 'UC_demo_fajrul',
+        'channel_title': 'Fajrul Fx',
+        'channel_thumbnail': '',
+        'title': 'Live Eksperimen Sains!',
+        'thumbnail_url': 'https://i.ytimg.com/vi/M7lc1UVf-VE/hqdefault.jpg',
+        'published_at': DateTime.now().toUtc().toIso8601String(),
+        'view_count': 123,
+        'like_count': 45,
+        'duration': '0:00',
+        'duration_seconds': 0,
+        'views_hp': 0,
+        'views_laptop': 0,
+        'views_total': 0,
+        'watched_count': 0,
+        'is_demo': 0,
+        'is_live': 1,
+      };
+      final sampleChannels = [
+        {
+          'channel_id': 'UC_demo_fajrul',
+          'title': 'Fajrul Fx',
+          'handle': '@FajrulFx',
+          'thumbnail_url': '',
+          'uploads_playlist_id': 'UU_demo_fajrul',
+          'source': 'demo',
+          'video_count': 6,
+          'watched_count': 0,
+          'views_hp': 0,
+          'views_laptop': 0,
+          'views_total': 0,
+          'is_hidden': 0,
+          'status': 'subscribed',
+        },
+        {
+          'channel_id': 'UC_demo_malaka',
+          'title': 'MALAKA',
+          'handle': '@malaka_project',
+          'thumbnail_url': '',
+          'uploads_playlist_id': 'UU_demo_malaka',
+          'source': 'demo',
+          'video_count': 6,
+          'watched_count': 0,
+          'views_hp': 0,
+          'views_laptop': 0,
+          'views_total': 0,
+          'is_hidden': 0,
+          'status': 'subscribed',
+        },
+      ];
+
+      Map<String, dynamic> handleBackend(String method, Uri uri) {
+        final path = uri.path;
+        if (path == '/api/state') {
+          return {
+            'channels': sampleChannels,
+            'live_streams': liveActive ? [liveVideo] : [],
+            'has_api_key': true,
+            'api_key_preview': 'AIzaSy...test',
+            'has_oauth_token': false,
+            'session_state': {'sort_by': 'time', 'period': 'all'},
+            'default_limit': 50,
+            'tab_limits': {},
+            'active_limit': 50,
+            'refresh_state': {
+              'running': false,
+              'done_ready': false,
+              'progress': 0,
+              'new_videos': 0,
+            },
+          };
+        }
+        if (path == '/api/videos') {
+          final chFilter = uri.queryParameters['channel_id'] ?? '';
+          final vids = liveActive
+              ? [
+                  {...liveVideo, 'title': 'Live Eksperimen Sains!'},
+                  {...liveVideo, 'video_id': 'vod_1', 'title': 'Video Biasa', 'is_live': 0, 'duration': '10:00'},
+                ]
+              : [
+                  {...liveVideo, 'video_id': 'vod_1', 'title': 'Video Biasa', 'is_live': 0, 'duration': '10:00'},
+                ];
+          final filtered = chFilter.isEmpty
+              ? vids
+              : vids.where((v) => v['channel_id'] == chFilter).toList();
+          final liveFiltered = liveActive && (chFilter.isEmpty || chFilter == 'UC_demo_fajrul')
+              ? [liveVideo]
+              : [];
+          return {
+            'items': filtered,
+            'total': filtered.length,
+            'page': 1,
+            'limit': 50,
+            'total_pages': 1,
+            'live_streams': liveFiltered,
+          };
+        }
+        if (path == '/api/refresh-youtube' && method == 'POST') {
+          refreshCalls++;
+          // Refresh #1: turns live ON; Refresh #2+: turns live OFF (ended)
+          liveActive = refreshCalls == 1;
+          refreshDoneReady = true;
+          return {'status': 'started', 'running': true, 'progress': 5};
+        }
+        if (path == '/api/refresh-youtube/status') {
+          return {
+            'running': false,
+            'progress': 100,
+            'done_ready': refreshDoneReady,
+            'new_videos': refreshCalls == 1 ? 1 : 0,
+            'error': '',
+          };
+        }
+        if (path == '/api/refresh-youtube/consume' && method == 'POST') {
+          refreshDoneReady = false;
+          return {'status': 'ok'};
+        }
+        return {'status': 'ok'};
+      }
+
+      await HttpOverrides.runZoned(
+        () async {
+          tester.view.physicalSize = const Size(1280, 900);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          await tester.pumpWidget(const PersonalYouTubeApp());
+          await tester.pumpAndSettle();
+          // Polling timer runs at 600ms
+          await tester.pump(const Duration(milliseconds: 700));
+          await tester.pumpAndSettle();
+
+          // Auto-refresh saat membuka aplikasi terpanggil 1x & memunculkan channel live
+          expect(refreshCalls, 1);
+          expect(find.byKey(const Key('sidebar_live_section')), findsOneWidget);
+          expect(find.byKey(const Key('main_live_section')), findsOneWidget);
+          expect(find.text('Live Streaming (1)'), findsNWidgets(2));
+          expect(find.byKey(const Key('sidebar_live_item_UC_demo_fajrul')), findsOneWidget);
+          expect(find.byKey(const Key('main_live_item_UC_demo_fajrul')), findsOneWidget);
+
+          // Verifikasi posisi Sidebar: Subscriptions -> Live Streaming -> Daftar Follower
+          final subsRect = tester.getRect(find.text('Subscriptions ›'));
+          final sideLiveRect = tester.getRect(
+            find.byKey(const Key('sidebar_live_section')),
+          );
+          final firstFollowerRect = tester.getRect(find.text('MALAKA').first);
+          expect(sideLiveRect.top, greaterThanOrEqualTo(subsRect.bottom - 1));
+          expect(firstFollowerRect.top, greaterThanOrEqualTo(sideLiveRect.bottom - 1));
+
+          // Verifikasi posisi Main Page: Navigasi Tab / Halaman ... -> Live Streaming
+          final halamanRect = tester.getRect(
+            find.textContaining('Halaman 1 dari 1').first,
+          );
+          final mainLiveRect = tester.getRect(
+            find.byKey(const Key('main_live_section')),
+          );
+          expect(mainLiveRect.top, greaterThanOrEqualTo(halamanRect.bottom - 1));
+
+          // Sebelum refresh baru, akun masih tampil live.
+          // Pindah ke 1 creator lalu kembali ke Semua Follower -> auto-refresh berjalan & menghapus status live yang sudah selesai
+          await tester.tap(find.text('MALAKA').first);
+          await tester.pumpAndSettle();
+          expect(find.text('Live Streaming (0)'), findsWidgets);
+
+          // Tunggu lewat cooldown 4 detik lalu kembali ke Semua Follower
+          await tester.pump(const Duration(seconds: 5));
+          await tester.tap(find.textContaining('Semua Follower').first);
+          await tester.pumpAndSettle();
+          await tester.pump(const Duration(milliseconds: 700));
+          await tester.pumpAndSettle();
+
+          expect(refreshCalls, 2);
+          expect(find.byKey(const Key('sidebar_live_item_UC_demo_fajrul')), findsNothing);
+          expect(find.byKey(const Key('main_live_item_UC_demo_fajrul')), findsNothing);
+          expect(find.text('Live Streaming (0)'), findsNWidgets(2));
+
+          // Simulasikan keluar dari aplikasi (inactive->hidden->paused) lalu masuk kembali (hidden->inactive->resumed) -> auto-refresh berjalan lagi
+          tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+          tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+          tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+          tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+          tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+          tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+          await tester.pumpAndSettle();
+          await tester.pump(const Duration(milliseconds: 700));
+          await tester.pumpAndSettle();
+          expect(refreshCalls, 3);
+          expect(tester.takeException(), isNull);
+        },
+        createHttpClient: (_) => _TestBackendHttpClient(handleBackend),
+      );
+    },
+  );
+}
+
+class _TestBackendHttpClient implements HttpClient {
+  final Map<String, dynamic> Function(String method, Uri uri) handler;
+  _TestBackendHttpClient(this.handler);
+
+  @override
+  Future<HttpClientRequest> openUrl(String method, Uri url) async =>
+      _TestHttpRequest(method, url, handler);
+
+  @override
+  Future<HttpClientRequest> getUrl(Uri url) => openUrl('GET', url);
+
+  @override
+  Future<HttpClientRequest> postUrl(Uri url) => openUrl('POST', url);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => null;
+}
+
+class _TestHttpRequest implements HttpClientRequest {
+  @override
+  final String method;
+  @override
+  final Uri uri;
+  final Map<String, dynamic> Function(String method, Uri uri) handler;
+  final HttpHeaders _headers = _TestHttpHeaders();
+
+  _TestHttpRequest(this.method, this.uri, this.handler);
+
+  @override
+  HttpHeaders get headers => _headers;
+
+  @override
+  Encoding encoding = utf8;
+
+  @override
+  bool bufferOutput = true;
+
+  @override
+  bool followRedirects = true;
+
+  @override
+  int maxRedirects = 5;
+
+  @override
+  int contentLength = -1;
+
+  @override
+  void add(List<int> data) {}
+
+  @override
+  Future<void> addStream(Stream<List<int>> stream) => stream.drain();
+
+  @override
+  Future<HttpClientResponse> close() async {
+    if (uri.host != '127.0.0.1' && uri.host != 'localhost') {
+      return _TestHttpResponse(404, '{}');
+    }
+    final body = jsonEncode(handler(method, uri));
+    return _TestHttpResponse(200, body);
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => null;
+}
+
+class _TestHttpResponse extends Stream<List<int>> implements HttpClientResponse {
+  @override
+  final int statusCode;
+  final List<int> _bytes;
+  final HttpHeaders _headers = _TestHttpHeaders();
+
+  _TestHttpResponse(this.statusCode, String body) : _bytes = utf8.encode(body);
+
+  @override
+  int get contentLength => _bytes.length;
+
+  @override
+  String get reasonPhrase => statusCode == 200 ? 'OK' : 'Error';
+
+  @override
+  bool get isRedirect => false;
+
+  @override
+  bool get persistentConnection => true;
+
+  @override
+  List<RedirectInfo> get redirects => const [];
+
+  @override
+  HttpHeaders get headers => _headers;
+
+  @override
+  HttpClientResponseCompressionState get compressionState =>
+      HttpClientResponseCompressionState.notCompressed;
+
+  @override
+  StreamSubscription<List<int>> listen(
+    void Function(List<int> event)? onData, {
+    Function? onError,
+    void Function()? onDone,
+    bool? cancelOnError,
+  }) {
+    return Stream<List<int>>.value(_bytes).listen(
+      onData,
+      onError: onError,
+      onDone: onDone,
+      cancelOnError: cancelOnError,
+    );
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => null;
+}
+
+class _TestHttpHeaders implements HttpHeaders {
+  @override
+  void set(String name, Object value, {bool preserveHeaderCase = false}) {}
+
+  @override
+  void add(String name, Object value, {bool preserveHeaderCase = false}) {}
+
+  @override
+  void forEach(void Function(String name, List<String> values) action) {
+    action('content-type', ['application/json; charset=utf-8']);
+  }
+
+  @override
+  String? value(String name) =>
+      name.toLowerCase() == 'content-type' ? 'application/json; charset=utf-8' : null;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => null;
 }

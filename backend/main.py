@@ -192,6 +192,7 @@ def get_state() -> dict:
     active_limit = tab_limits.get(current_tab_key, default_limit)
     return {
         "channels": channels,
+        "live_streams": db.list_live_videos(hide_filter="both"),
         "has_api_key": bool(api_key),
         "api_key_preview": (api_key[:6] + "..." + api_key[-4:]) if len(api_key) > 10 else ("Terpasang" if api_key else ""),
         "has_oauth_token": bool(oauth_token),
@@ -347,6 +348,7 @@ def get_videos(
                     )
                 except Exception:
                     pass
+    res["live_streams"] = db.list_live_videos(hide_filter=norm_hide, channel_id=channel_id)
     return res
 
 

@@ -96,6 +96,7 @@ def init_db() -> None:
             "ALTER TABLE videos ADD COLUMN views_laptop INTEGER DEFAULT 0",
             "ALTER TABLE videos ADD COLUMN views_total INTEGER GENERATED ALWAYS AS (COALESCE(views_hp, 0) + COALESCE(views_laptop, 0)) VIRTUAL",
             "ALTER TABLE videos ADD COLUMN updated_at TEXT DEFAULT ''",
+            "ALTER TABLE videos ADD COLUMN is_live INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 conn.execute(alter_sql)
@@ -114,6 +115,7 @@ def init_db() -> None:
                 pass
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_duration ON videos(duration_seconds)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_live ON videos(is_live)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_channels_status ON channels(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_channels_hidden ON channels(is_hidden)")
 
@@ -281,6 +283,7 @@ def upsert_videos(videos: list[dict]) -> int:
                 v["duration_seconds"] = duration_to_seconds(v.get("duration", ""))
             if not v.get("updated_at"):
                 v["updated_at"] = now_iso
+            v["is_live"] = 1 if str(v.get("is_live", 0)).lower() in ("1", "true") else 0
             filtered_videos.append(v)
 
         if not filtered_videos:
@@ -292,11 +295,11 @@ def upsert_videos(videos: list[dict]) -> int:
             INSERT INTO videos(
                 video_id, channel_id, channel_title, channel_thumbnail,
                 title, thumbnail_url, published_at, view_count, like_count,
-                duration, duration_seconds, is_demo, updated_at
+                duration, duration_seconds, is_demo, is_live, updated_at
             ) VALUES (
                 :video_id, :channel_id, :channel_title, :channel_thumbnail,
                 :title, :thumbnail_url, :published_at, :view_count, :like_count,
-                :duration, :duration_seconds, :is_demo, :updated_at
+                :duration, :duration_seconds, :is_demo, :is_live, :updated_at
             )
             ON CONFLICT(video_id) DO UPDATE SET
                 title=excluded.title,
@@ -306,11 +309,66 @@ def upsert_videos(videos: list[dict]) -> int:
                 duration=excluded.duration,
                 duration_seconds=excluded.duration_seconds,
                 channel_title=excluded.channel_title,
-                channel_thumbnail=excluded.channel_thumbnail
+                channel_thumbnail=excluded.channel_thumbnail,
+                is_live=excluded.is_live
             """,
             filtered_videos,
         )
     return len(filtered_videos)
+
+
+def mark_videos_not_live(video_ids: list[str]) -> int:
+    clean_ids = [vid for vid in video_ids if vid]
+    if not clean_ids:
+        return 0
+    placeholders = ",".join("?" for _ in clean_ids)
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"UPDATE videos SET is_live = 0 WHERE video_id IN ({placeholders}) AND COALESCE(is_live, 0) = 1",
+            clean_ids,
+        )
+        return cur.rowcount or 0
+
+
+def list_live_videos(hide_filter: str = "both", channel_id: str = "") -> list[dict]:
+    clauses = [
+        "COALESCE(v.is_live, 0) = 1",
+        "COALESCE(c.status, 'subscribed') != 'unfollowed'",
+    ]
+    params: list = []
+    _apply_hide_filter_clause(clauses, "c.is_hidden", hide_filter)
+    if channel_id:
+        clauses.append("v.channel_id = ?")
+        params.append(channel_id)
+    where_sql = " AND ".join(clauses)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT v.video_id, v.channel_id,
+                   COALESCE(c.title, v.channel_title) AS channel_title,
+                   COALESCE(NULLIF(c.thumbnail_url, ''), v.channel_thumbnail, '') AS channel_thumbnail,
+                   v.title, v.thumbnail_url, v.published_at,
+                   COALESCE(v.is_live, 1) AS is_live,
+                   COALESCE(c.is_hidden, 0) AS channel_is_hidden,
+                   COALESCE(c.views_hp, 0) AS channel_views_hp,
+                   COALESCE(c.views_laptop, 0) AS channel_views_laptop,
+                   COALESCE(c.views_total, c.watched_count, 0) AS watched_count
+            FROM videos v
+            JOIN channels c ON c.channel_id = v.channel_id
+            WHERE {where_sql}
+            ORDER BY COALESCE(c.views_total, c.watched_count, 0) DESC, v.published_at DESC
+            """,
+            params,
+        ).fetchall()
+    seen_cids: set[str] = set()
+    result: list[dict] = []
+    for r in rows:
+        cid = r["channel_id"]
+        if cid in seen_cids:
+            continue
+        seen_cids.add(cid)
+        result.append(dict(r))
+    return result
 
 
 def record_watch(channel_id: str, video_id: str = "", device: str = "laptop") -> dict:
@@ -501,11 +559,7 @@ def period_bounds(period: str, now: datetime | None = None) -> tuple[str | None,
         if days >= 1:
             today_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
             start_local = today_local - timedelta(days=days)
-            end_local = today_local - timedelta(days=days - 1)
-            return (
-                start_local.astimezone(timezone.utc).strftime(fmt),
-                end_local.astimezone(timezone.utc).strftime(fmt),
-            )
+            return start_local.astimezone(timezone.utc).strftime(fmt), None
     if period.endswith("y") and period[:-1].isdigit():
         years = int(period[:-1])
         if years >= 1:

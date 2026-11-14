@@ -359,6 +359,14 @@ def sync_channel_videos(
     cutoff = datetime.now(timezone.utc) - timedelta(days=365 * years_back + 30)
     video_ids: list[str] = []
     page_token = None
+    with db.get_conn() as conn:
+        existing_live_ids = {
+            r["video_id"]
+            for r in conn.execute(
+                "SELECT video_id FROM videos WHERE channel_id = ? AND COALESCE(is_live, 0) = 1",
+                (cid,),
+            ).fetchall()
+        }
 
     with httpx.Client(timeout=25.0) as client:
         while len(video_ids) < max_videos:
@@ -405,8 +413,17 @@ def sync_channel_videos(
             if reached_cutoff or not page_token or len(video_ids) >= max_videos:
                 break
 
+        if existing_live_ids:
+            seen_v = set(video_ids)
+            for lvid in existing_live_ids:
+                if lvid not in seen_v:
+                    video_ids.append(lvid)
+                    seen_v.add(lvid)
+
         # Batch fetch statistics (viewCount, likeCount) & duration in chunks of 50 (only 1 unit per 50 videos!)
         rows_to_save: list[dict] = []
+        still_live_ids: set[str] = set()
+        checked_vids: set[str] = set()
         for i in range(0, len(video_ids), 50):
             chunk = video_ids[i : i + 50]
             v_resp = client.get(
@@ -424,6 +441,7 @@ def sync_channel_videos(
                     break
                 err_msg = v_data.get("error", {}).get("message", f"YouTube videos API error ({v_resp.status_code})")
                 raise RuntimeError(err_msg)
+            checked_vids.update(chunk)
             for v_item in v_data.get("items", []):
                 vid = v_item["id"]
                 snip = v_item.get("snippet", {})
@@ -434,6 +452,9 @@ def sync_channel_videos(
                     (thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url")
                     or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
                 )
+                is_live_val = 1 if snip.get("liveBroadcastContent") == "live" else 0
+                if is_live_val:
+                    still_live_ids.add(vid)
                 rows_to_save.append(
                     {
                         "video_id": vid,
@@ -447,10 +468,15 @@ def sync_channel_videos(
                         "like_count": int(stats.get("likeCount", 0)),
                         "duration": parse_iso_duration(cdet.get("duration", "")),
                         "is_demo": 0,
+                        "is_live": is_live_val,
                     }
                 )
 
-    return db.upsert_videos(rows_to_save)
+    saved_count = db.upsert_videos(rows_to_save)
+    ended_live = [lvid for lvid in existing_live_ids if lvid in checked_vids and lvid not in still_live_ids]
+    if ended_live:
+        db.mark_videos_not_live(ended_live)
+    return saved_count
 
 
 def refresh_all_channels_comprehensive(
@@ -476,41 +502,58 @@ def refresh_all_channels_comprehensive(
     ch_map = {c["channel_id"]: c for c in real_chs}
 
     # Ambil daftar video_id yang sudah ada di database (kecuali yang baru diupload 48 jam terakhir agar views/likes ikut ter-update)
+    # Serta seluruh video yang sebelumnya berstatus live (is_live=1) agar status selesai live langsung terhapus saat refresh!
     recent_cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+    live_rss_cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%S")
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT video_id, published_at FROM videos"
+            "SELECT video_id, channel_id, published_at, COALESCE(is_live, 0) AS is_live FROM videos"
         ).fetchall()
         all_existing_vids = {r["video_id"] for r in rows}
         known_old_vids = {r["video_id"] for r in rows if (r["published_at"] or "") < recent_cutoff}
+        existing_live_map = {r["video_id"]: r["channel_id"] for r in rows if int(r["is_live"] or 0) == 1 and r["channel_id"] in ch_map}
 
     done_count = 0
     newly_inserted_count = 0
 
-    # Cek 15 item RSS terbaru untuk seluruh channel sekaligus via pool 40 worker & keep-alive connection
+    entry_block_re = re.compile(r"<entry>.*?<yt:videoId>([^<]+)</yt:videoId>.*?(?:<updated>([^<]+)</updated>)?.*?</entry>", re.DOTALL)
+
+    # Cek 15 item RSS terbaru + feed live UULV untuk seluruh channel sekaligus via pool 40 worker & keep-alive connection
     vid_to_cid: dict[str, str] = {}
     limits = httpx.Limits(max_connections=60, max_keepalive_connections=40)
     with httpx.Client(timeout=4.0, limits=limits, follow_redirects=True) as rss_client:
-        def _check_channel(ch: dict) -> list[tuple[str, str]]:
-            cid = ch["channel_id"]
-            found: list[tuple[str, str]] = []
-            url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
+        def _fetch_rss(url: str) -> str:
             for attempt in range(2):
                 try:
                     r = rss_client.get(url)
                     if r.status_code == 200:
-                        vids = re.findall(r"<yt:videoId>([^<]+)</yt:videoId>", r.text)
-                        for v in vids:
-                            if v not in known_old_vids:
-                                found.append((v, cid))
-                        return found
+                        return r.text
                     if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
                         time.sleep(0.15)
                         continue
-                    return found
+                    return ""
                 except Exception:
                     if attempt == 0:
                         time.sleep(0.15)
+            return ""
+
+        def _check_channel(ch: dict) -> list[tuple[str, str]]:
+            cid = ch["channel_id"]
+            found: list[tuple[str, str]] = []
+            seen_local: set[str] = set()
+            xml_main = _fetch_rss(f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}")
+            if xml_main:
+                for v in re.findall(r"<yt:videoId>([^<]+)</yt:videoId>", xml_main):
+                    if v not in known_old_vids and v not in seen_local:
+                        seen_local.add(v)
+                        found.append((v, cid))
+            if cid.startswith("UC") and len(cid) > 2:
+                xml_live = _fetch_rss(f"https://www.youtube.com/feeds/videos.xml?playlist_id=UULV{cid[2:]}")
+                if xml_live:
+                    for v, upd in entry_block_re.findall(xml_live):
+                        if v not in seen_local and ((upd and upd >= live_rss_cutoff) or v not in known_old_vids):
+                            seen_local.add(v)
+                            found.append((v, cid))
             return found
 
         with ThreadPoolExecutor(max_workers=40) as pool:
@@ -522,9 +565,14 @@ def refresh_all_channels_comprehensive(
                 for vid, cid in fut.result():
                     vid_to_cid[vid] = cid
 
+    for lvid, lcid in existing_live_map.items():
+        vid_to_cid.setdefault(lvid, lcid)
+
     if not vid_to_cid:
         return 0
 
+    still_live_vids: set[str] = set()
+    checked_vids: set[str] = set()
     all_vids = list(vid_to_cid.keys())
     with httpx.Client(timeout=25.0) as client:
         for i in range(0, len(all_vids), 50):
@@ -542,6 +590,7 @@ def refresh_all_channels_comprehensive(
             if v_resp.status_code != 200 or "error" in v_data:
                 err_msg = v_data.get("error", {}).get("message", f"YouTube API error ({v_resp.status_code})")
                 raise RuntimeError(err_msg)
+            checked_vids.update(chunk)
             chunk_rows: list[dict] = []
             for v_item in v_data.get("items", []):
                 vid = v_item["id"]
@@ -555,6 +604,9 @@ def refresh_all_channels_comprehensive(
                     (thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url")
                     or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
                 )
+                is_live_val = 1 if snip.get("liveBroadcastContent") == "live" else 0
+                if is_live_val:
+                    still_live_vids.add(vid)
                 if vid not in all_existing_vids:
                     newly_inserted_count += 1
                     all_existing_vids.add(vid)
@@ -571,9 +623,14 @@ def refresh_all_channels_comprehensive(
                         "like_count": int(stats.get("likeCount", 0)),
                         "duration": parse_iso_duration(cdet.get("duration", "")),
                         "is_demo": 0,
+                        "is_live": is_live_val,
                     }
                 )
             db.upsert_videos(chunk_rows)
+
+    ended_live = [lvid for lvid in existing_live_map if lvid in checked_vids and lvid not in still_live_vids]
+    if ended_live:
+        db.mark_videos_not_live(ended_live)
 
     return newly_inserted_count
 
@@ -681,6 +738,7 @@ def search_and_cache_subscribed_videos(
                         "like_count": int(stats.get("likeCount", 0)),
                         "duration": parse_iso_duration(cdet.get("duration", "")),
                         "is_demo": 0,
+                        "is_live": 1 if snip.get("liveBroadcastContent") == "live" else 0,
                     }
                 )
             return db.upsert_videos(rows_to_save)

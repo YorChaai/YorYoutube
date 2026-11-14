@@ -356,15 +356,127 @@ def test_hidden_timestamp_isolated_from_watch_and_day_period_filter(isolated_cli
     out_ferry2 = next(c for c in sync_res2.json()["channels"] if c["channel_id"] == "UC_demo_ferry")
     assert out_ferry2["is_hidden"] == 0
 
-    # 4. Day period filter (2d / 3d) matches exact calendar day slice
+    # 4. Day period filter (Nd) includes all videos from N days ago up to today (day 0..N)
     r_2d = isolated_client.get("/api/videos?period=2d&limit=50")
     assert r_2d.status_code == 200
-    assert r_2d.json()["total"] == 1
-    assert "Tubuh Saat Makan Sekali Sehari" in r_2d.json()["items"][0]["title"]
+    assert r_2d.json()["total"] == 2
+    titles_2d = [it["title"] for it in r_2d.json()["items"]]
+    assert any("Kasus Ueno" in t for t in titles_2d)
+    assert any("Tubuh Saat Makan Sekali Sehari" in t for t in titles_2d)
 
     r_3d = isolated_client.get("/api/videos?period=3d&limit=50")
     assert r_3d.status_code == 200
-    assert r_3d.json()["total"] == 1
-    assert "Cara Berpikir Kritis" in r_3d.json()["items"][0]["title"]
+    assert r_3d.json()["total"] == 3
+    titles_3d = [it["title"] for it in r_3d.json()["items"]]
+    assert any("Cara Berpikir Kritis" in t for t in titles_3d)
+
+    r_40d = isolated_client.get("/api/videos?period=40d&limit=50")
+    assert r_40d.status_code == 200
+    assert r_40d.json()["total"] == 12
+    titles_40d = [it["title"] for it in r_40d.json()["items"]]
+    assert any("Perang Dunia II" in t for t in titles_40d)
+    assert not any("Tur Rumah Baru" in t for t in titles_40d)
+
+
+def test_live_streaming_detection_and_refresh_cleanup(isolated_client, monkeypatch):
+    from datetime import datetime, timezone
+    import youtube_sync
+
+    db.upsert_channel(
+        channel_id="UC_live_streamer",
+        title="Live Gamer",
+        handle="@livegamer",
+        uploads_playlist_id="UU_live_streamer",
+        source="manual",
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    db.upsert_videos(
+        [
+            {
+                "video_id": "vid_live_1",
+                "channel_id": "UC_live_streamer",
+                "channel_title": "Live Gamer",
+                "channel_thumbnail": "",
+                "title": "Live Malam Ini!",
+                "thumbnail_url": "https://i.ytimg.com/vi/vid_live_1/hqdefault.jpg",
+                "published_at": now_iso,
+                "view_count": 100,
+                "like_count": 20,
+                "duration": "0:00",
+                "is_demo": 0,
+                "is_live": 1,
+            }
+        ]
+    )
+
+    state_data = isolated_client.get("/api/state").json()
+    assert len(state_data["live_streams"]) == 1
+    assert state_data["live_streams"][0]["channel_id"] == "UC_live_streamer"
+    assert state_data["live_streams"][0]["video_id"] == "vid_live_1"
+
+    vid_data = isolated_client.get("/api/videos?hide_filter=unhide").json()
+    assert len(vid_data["live_streams"]) == 1
+
+    # Hidden channel must follow hide_filter on live_streams
+    isolated_client.post("/api/channels/UC_live_streamer/hide", json={"hidden": True})
+    vid_unhide = isolated_client.get("/api/videos?hide_filter=unhide").json()
+    assert vid_unhide["live_streams"] == []
+    vid_hide = isolated_client.get("/api/videos?hide_filter=hide").json()
+    assert len(vid_hide["live_streams"]) == 1
+    isolated_client.post("/api/channels/UC_live_streamer/hide", json={"hidden": False})
+
+    # Verify comprehensive refresh calls videos.list for previously-live video IDs
+    # and clears is_live=0 when YouTube returns liveBroadcastContent == "none"
+    class _FakeResp:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = ""
+
+        def json(self):
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, params=None, headers=None):
+            if "feeds/videos.xml" in url:
+                return _FakeResp(404, {})
+            if url.endswith("/videos"):
+                return _FakeResp(
+                    200,
+                    {
+                        "items": [
+                            {
+                                "id": "vid_live_1",
+                                "snippet": {
+                                    "channelId": "UC_live_streamer",
+                                    "channelTitle": "Live Gamer",
+                                    "title": "Live Malam Ini! (VOD)",
+                                    "publishedAt": now_iso,
+                                    "liveBroadcastContent": "none",
+                                    "thumbnails": {},
+                                },
+                                "statistics": {"viewCount": "500", "likeCount": "50"},
+                                "contentDetails": {"duration": "PT1H10M"},
+                            }
+                        ]
+                    },
+                )
+            return _FakeResp(404, {})
+
+    monkeypatch.setattr(youtube_sync.httpx, "Client", _FakeClient)
+    youtube_sync.refresh_all_channels_comprehensive(db.list_channels(), api_key="FAKE_KEY")
+
+    after_state = isolated_client.get("/api/state").json()
+    assert after_state["live_streams"] == []
+
 
 
