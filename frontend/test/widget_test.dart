@@ -169,11 +169,11 @@ void main() {
       expect(find.text('Filter & Urutan Video'), findsNothing);
 
       expect(find.text('Tab 1 (1–25)'), findsWidgets);
-      expect(find.text('Sebelumnya'), findsWidgets);
-      expect(find.text('Berikutnya'), findsWidgets);
+      expect(find.byTooltip('Sebelumnya'), findsWidgets);
+      expect(find.byTooltip('Berikutnya'), findsWidgets);
 
-      // Klik Berikutnya -> pindah ke Tab 2 (26–36)
-      await tester.tap(find.text('Berikutnya').first);
+      // Klik Berikutnya (>) -> pindah ke Tab 2 (26–36)
+      await tester.tap(find.byTooltip('Berikutnya').first);
       await tester.pumpAndSettle();
       expect(find.text('Tab 2 (26–36)'), findsWidgets);
 
@@ -872,12 +872,21 @@ void main() {
       await tester.tap(find.text('Fajrul Fx').first);
       await tester.pumpAndSettle();
 
-      // Navigasi Tab tetap muncul penuh meski cuma 1 halaman di dalam 1 creator
-      expect(find.text('Navigasi Tab:'), findsOneWidget);
-      expect(find.text('Sebelumnya'), findsOneWidget);
+      // Navigasi Tab ringkas 1 baris (<, Tab 1 (1–6), >) tetap muncul di dalam 1 creator
+      expect(find.text('Nav Tab :'), findsOneWidget);
+      expect(find.byKey(const Key('tab_prev_btn')), findsOneWidget);
       expect(find.text('Tab 1 (1–6)'), findsOneWidget);
-      expect(find.text('Berikutnya'), findsOneWidget);
+      expect(find.byKey(const Key('tab_next_btn')), findsOneWidget);
       expect(find.text('Halaman 1 dari 1 (6 video)'), findsOneWidget);
+
+      // Pastikan Nav Tab :, <, Tab 1 (1–6), dan > sejajar 1 baris di lebar mobile 390px
+      final navTabRect = tester.getRect(find.text('Nav Tab :'));
+      final prevRect = tester.getRect(find.byKey(const Key('tab_prev_btn')));
+      final tabBtnRect = tester.getRect(find.byKey(const Key('tab_selector_btn')));
+      final nextRect = tester.getRect(find.byKey(const Key('tab_next_btn')));
+      expect((navTabRect.center.dy - prevRect.center.dy).abs(), lessThan(4.0));
+      expect((prevRect.center.dy - tabBtnRect.center.dy).abs(), lessThan(4.0));
+      expect((tabBtnRect.center.dy - nextRect.center.dy).abs(), lessThan(4.0));
 
       // Scrollbar Home Page juga tetap aktif di dalam tampilan 1 creator saat list overflow
       expect(find.byKey(const Key('home_fast_scrollbar')), findsOneWidget);

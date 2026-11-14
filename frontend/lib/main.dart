@@ -7658,105 +7658,143 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final safeCurrent = currentPage.clamp(1, totalPages);
 
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
       child: Wrap(
-        spacing: 10,
-        runSpacing: 8,
+        spacing: 8,
+        runSpacing: 6,
         crossAxisAlignment: WrapCrossAlignment.center,
         children: [
-          const Text(
-            'Navigasi Tab:',
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              fontSize: 13,
-              color: Colors.white70,
-            ),
-          ),
-          // Tombol Kiri (Sebelumnya)
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF272727),
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            ),
-            onPressed: safeCurrent > 1
-                ? () {
-                    setState(() => currentPage = safeCurrent - 1);
-                    _fetchVideos();
-                  }
-                : null,
-            icon: const Icon(Icons.chevron_left, size: 18),
-            label: const Text('Sebelumnya'),
-          ),
-          // Tombol Daftar Tab Halaman (Dialog + Interactive Fast Scrollbar)
-          Builder(
-            builder: (ctx) {
-              final startItem = (safeCurrent - 1) * limit + 1;
-              final endItem = (safeCurrent * limit > totalVideos)
-                  ? totalVideos
-                  : safeCurrent * limit;
-              return InkWell(
-                key: const Key('tab_selector_btn'),
-                borderRadius: BorderRadius.circular(8),
-                onTap: () async {
-                  final selected = await showDialog<int>(
-                    context: ctx,
-                    builder: (_) => TabPickerDialog(
-                      totalPages: totalPages,
-                      limit: limit,
-                      totalVideos: totalVideos,
-                      currentPage: safeCurrent,
-                    ),
-                  );
-                  if (selected != null && selected != currentPage) {
-                    setState(() => currentPage = selected);
-                    _fetchVideos();
-                  }
-                },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 11,
-                  ),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF212121),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: const Color(0xFFFF0033)),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        'Tab $safeCurrent ($startItem–$endItem)',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 13.5,
-                          fontWeight: FontWeight.w600,
-                        ),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+              const Text(
+                'Nav Tab :',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 13,
+                  color: Colors.white70,
+                ),
+              ),
+              const SizedBox(width: 8),
+              // Tombol Kiri (< Sebelumnya)
+              Tooltip(
+                message: 'Sebelumnya',
+                child: SizedBox(
+                  width: 36,
+                  height: 36,
+                  child: ElevatedButton(
+                    key: const Key('tab_prev_btn'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF272727),
+                      foregroundColor: Colors.white,
+                      padding: EdgeInsets.zero,
+                      minimumSize: const Size(36, 36),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(18),
                       ),
-                      const SizedBox(width: 8),
-                      const Icon(Icons.arrow_drop_down, color: Colors.white),
-                    ],
+                    ),
+                    onPressed: safeCurrent > 1
+                        ? () {
+                            setState(() => currentPage = safeCurrent - 1);
+                            _fetchVideos();
+                          }
+                        : null,
+                    child: const Icon(Icons.chevron_left, size: 20),
                   ),
                 ),
-              );
-            },
-          ),
-          // Tombol Kanan (Berikutnya)
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF272727),
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              ),
+              const SizedBox(width: 6),
+              // Tombol Daftar Tab Halaman (Dialog + Interactive Fast Scrollbar)
+              Builder(
+                builder: (ctx) {
+                  final startItem = (safeCurrent - 1) * limit + 1;
+                  final endItem = (safeCurrent * limit > totalVideos)
+                      ? totalVideos
+                      : safeCurrent * limit;
+                  return InkWell(
+                    key: const Key('tab_selector_btn'),
+                    borderRadius: BorderRadius.circular(8),
+                    onTap: () async {
+                      final selected = await showDialog<int>(
+                        context: ctx,
+                        builder: (_) => TabPickerDialog(
+                          totalPages: totalPages,
+                          limit: limit,
+                          totalVideos: totalVideos,
+                          currentPage: safeCurrent,
+                        ),
+                      );
+                      if (selected != null && selected != currentPage) {
+                        setState(() => currentPage = selected);
+                        _fetchVideos();
+                      }
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 7,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF212121),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: const Color(0xFFFF0033)),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            'Tab $safeCurrent ($startItem–$endItem)',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          const Icon(
+                            Icons.arrow_drop_down,
+                            size: 20,
+                            color: Colors.white,
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+              const SizedBox(width: 6),
+              // Tombol Kanan (> Berikutnya)
+              Tooltip(
+                message: 'Berikutnya',
+                child: SizedBox(
+                  width: 36,
+                  height: 36,
+                  child: ElevatedButton(
+                    key: const Key('tab_next_btn'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF272727),
+                      foregroundColor: Colors.white,
+                      padding: EdgeInsets.zero,
+                      minimumSize: const Size(36, 36),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                    ),
+                    onPressed: safeCurrent < totalPages
+                        ? () {
+                            setState(() => currentPage = safeCurrent + 1);
+                            _fetchVideos();
+                          }
+                        : null,
+                    child: const Icon(Icons.chevron_right, size: 20),
+                  ),
+                ),
+              ),
+              ],
             ),
-            onPressed: safeCurrent < totalPages
-                ? () {
-                    setState(() => currentPage = safeCurrent + 1);
-                    _fetchVideos();
-                  }
-                : null,
-            icon: const Icon(Icons.chevron_right, size: 18),
-            label: const Text('Berikutnya'),
           ),
           Text(
             'Halaman $safeCurrent dari $totalPages ($totalVideos video)',

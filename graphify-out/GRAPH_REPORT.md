@@ -1,7 +1,7 @@
 # Graph Report - youtube  (2026-11-14)
 
 ## Corpus Check
-- 49 files · ~121,782 words
+- 49 files · ~121,904 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 29 file(s) not represented in the graph (top: .xml 7, (none) 6, .bat 6)
 
