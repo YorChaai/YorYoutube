@@ -48,8 +48,7 @@ class YouTubeHomeScreen extends StatefulWidget {
   State<YouTubeHomeScreen> createState() => _YouTubeHomeScreenState();
 }
 
-class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
-    with WidgetsBindingObserver {
+class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   String baseUrl = Uri.base.port == 8000
       ? Uri.base.origin
       : 'http://127.0.0.1:8000';
@@ -105,7 +104,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
   List<Map<String, dynamic>> channels = [];
   List<Map<String, dynamic>> liveStreams = [];
   List<Map<String, dynamic>> videos = [];
-  bool _wasBackgrounded = false;
+  bool _didInitialAutoRefresh = false;
   bool hasApiKey = false;
   String apiKeyPreview = '';
   String localApiKey = '';
@@ -134,25 +133,12 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
     _initLocalSeedData();
     _restoreSessionAndFetch();
   }
 
   @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.hidden) {
-      _wasBackgrounded = true;
-    } else if (state == AppLifecycleState.resumed && _wasBackgrounded) {
-      _wasBackgrounded = false;
-      _triggerAutoRefreshYouTube();
-    }
-  }
-
-  @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
     _refreshPollTimer?.cancel();
     _usbSyncResetTimer?.cancel();
     _dayInputDebounce?.cancel();
@@ -1065,16 +1051,12 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
     final endIdx = (startIdx + limit > total) ? total : startIdx + limit;
 
     final localLive = <Map<String, dynamic>>[];
-    final seenLiveCids = <String>{};
+    final liveBestByCid = <String, Map<String, dynamic>>{};
     for (final v in _localVideos) {
-      final isLive = v['is_live'] == 1 ||
-          v['is_live'] == true ||
-          v['is_live']?.toString() == '1';
+      final isLive = _isLiveFlag(v['is_live']);
       if (!isLive) continue;
       final vCid = (v['channel_id'] ?? '').toString();
       if (vCid.isEmpty || unfollowedCids.contains(vCid)) continue;
-      if (seenLiveCids.contains(vCid)) continue;
-      seenLiveCids.add(vCid);
       Map<String, dynamic>? chMeta;
       for (final c in _localChannels) {
         if ((c['channel_id'] ?? '').toString() == vCid) {
@@ -1082,7 +1064,12 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
           break;
         }
       }
-      localLive.add({
+      final wc = int.tryParse(
+            (chMeta?['views_total'] ?? chMeta?['watched_count'] ?? 0)
+                .toString(),
+          ) ??
+          0;
+      final candidate = {
         ...v,
         'channel_title':
             (chMeta?['title'] ?? v['channel_title'] ?? '').toString(),
@@ -1091,8 +1078,26 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
                 .toString(),
         'channel_is_hidden':
             chMeta?['is_hidden'] ?? v['channel_is_hidden'] ?? 0,
-      });
+        'watched_count': wc,
+      };
+      final prev = liveBestByCid[vCid];
+      if (prev == null ||
+          (candidate['published_at'] ?? '').toString().compareTo(
+                (prev['published_at'] ?? '').toString(),
+              ) >
+              0) {
+        liveBestByCid[vCid] = candidate;
+      }
     }
+    localLive.addAll(liveBestByCid.values);
+    localLive.sort((a, b) {
+      final wa = int.tryParse((a['watched_count'] ?? 0).toString()) ?? 0;
+      final wb = int.tryParse((b['watched_count'] ?? 0).toString()) ?? 0;
+      if (wb != wa) return wb.compareTo(wa);
+      return (b['published_at'] ?? '').toString().compareTo(
+            (a['published_at'] ?? '').toString(),
+          );
+    });
 
     setState(() {
       isStandaloneMode = true;
@@ -1229,11 +1234,17 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
   }
 
   void _triggerAutoRefreshYouTube() {
-    if (!mounted || refreshingYouTube || refreshReadyGreen) return;
+    if (_didInitialAutoRefresh ||
+        !mounted ||
+        refreshingYouTube ||
+        refreshReadyGreen) {
+      return;
+    }
     final hasCreds = isStandaloneMode
         ? localApiKey.trim().isNotEmpty
         : hasApiKey;
     if (!hasCreds) return;
+    _didInitialAutoRefresh = true;
     _manualRefreshYouTube(isAuto: true);
   }
 
@@ -1708,9 +1719,18 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
         .map((c) => (c['channel_id'] ?? '').toString())
         .where((c) => c.isNotEmpty)
         .toSet();
-    final existingVidIds = _localVideos
-        .map((v) => (v['video_id'] ?? '').toString())
-        .toSet();
+    final recentCutoff = DateTime.now()
+        .toUtc()
+        .subtract(const Duration(hours: 48))
+        .toIso8601String();
+    final liveRssCutoff = DateTime.now()
+        .toUtc()
+        .subtract(const Duration(days: 14))
+        .toIso8601String();
+
+    final knownOldVidIds = <String>{};
+    final zeroDurVidIds = <String>{};
+    final existingVidIds = <String>{};
     final existingLiveIds = <String>{};
     final chMetaMap = <String, Map<String, String>>{};
     for (final ch in targetChs) {
@@ -1725,46 +1745,58 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
     for (final v in _localVideos) {
       final vCid = (v['channel_id'] ?? '').toString();
       final vid = (v['video_id'] ?? '').toString();
-      if (_isLiveFlag(v['is_live']) &&
-          vid.isNotEmpty &&
-          targetCids.contains(vCid)) {
+      if (vid.isEmpty) continue;
+      existingVidIds.add(vid);
+      final pubAt = (v['published_at'] ?? '').toString().trim();
+      final durSec =
+          int.tryParse((v['duration_seconds'] ?? 0).toString()) ?? 0;
+      final isLive = _isLiveFlag(v['is_live']);
+      if (durSec <= 0) {
+        zeroDurVidIds.add(vid);
+      }
+      if (pubAt.isNotEmpty &&
+          pubAt.compareTo(recentCutoff) < 0 &&
+          durSec > 0 &&
+          !isLive) {
+        knownOldVidIds.add(vid);
+      }
+      if (isLive && targetCids.contains(vCid)) {
         existingLiveIds.add(vid);
         newVidMeta[vid] = chMetaMap[vCid] ?? {'channel_id': vCid};
       }
     }
 
+    final entryBlockRegex = RegExp(r'<entry>(.*?)</entry>', dotAll: true);
     final vidRegex = RegExp(r'<yt:videoId>([^<]+)</yt:videoId>');
-    final entryRegex = RegExp(
-      r'<entry>.*?<yt:videoId>([^<]+)</yt:videoId>.*?(?:<updated>([^<]+)</updated>)?.*?</entry>',
-      dotAll: true,
-    );
-    final liveRssCutoff = DateTime.now()
-        .toUtc()
-        .subtract(const Duration(days: 14))
-        .toIso8601String();
+    final updRegex = RegExp(r'<updated>([^<]+)</updated>');
+    final pubRegex = RegExp(r'<published>([^<]+)</published>');
 
     final client = http.Client();
     try {
       var nextIdx = 0;
       var doneCount = 0;
-      final concurrency = targetChs.length < 25 ? targetChs.length : 25;
+      final concurrency = targetChs.length < 18 ? targetChs.length : 18;
 
       Future<String?> fetchRss(Uri uri) async {
-        for (var attempt = 0; attempt < 2; attempt++) {
+        for (var attempt = 0; attempt < 3; attempt++) {
           try {
             final res = await client
                 .get(uri)
-                .timeout(const Duration(seconds: 4));
+                .timeout(const Duration(seconds: 6));
             if (res.statusCode == 200) return res.body;
             if ((res.statusCode == 429 || res.statusCode >= 500) &&
-                attempt == 0) {
-              await Future.delayed(const Duration(milliseconds: 150));
+                attempt < 2) {
+              await Future.delayed(
+                Duration(milliseconds: 250 * (attempt + 1)),
+              );
               continue;
             }
             return null;
           } catch (_) {
-            if (attempt == 0) {
-              await Future.delayed(const Duration(milliseconds: 150));
+            if (attempt < 2) {
+              await Future.delayed(
+                Duration(milliseconds: 250 * (attempt + 1)),
+              );
             }
           }
         }
@@ -1790,7 +1822,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
             if (mainXml != null) {
               for (final m in vidRegex.allMatches(mainXml)) {
                 final vid = (m.group(1) ?? '').trim();
-                if (vid.isNotEmpty && !existingVidIds.contains(vid)) {
+                if (vid.isNotEmpty && !knownOldVidIds.contains(vid)) {
                   newVidMeta[vid] = meta;
                 }
               }
@@ -1803,16 +1835,23 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
                 ),
               );
               if (liveXml != null) {
-                for (final m in entryRegex.allMatches(liveXml)) {
-                  final vid = (m.group(1) ?? '').trim();
-                  final upd = (m.group(2) ?? '').trim();
+                for (final blockMatch in entryBlockRegex.allMatches(liveXml)) {
+                  final block = blockMatch.group(1) ?? '';
+                  final vid = (vidRegex.firstMatch(block)?.group(1) ?? '')
+                      .trim();
+                  if (vid.isEmpty) continue;
+                  final upd =
+                      (updRegex.firstMatch(block)?.group(1) ??
+                              pubRegex.firstMatch(block)?.group(1) ??
+                              '')
+                          .trim();
                   final recentEnough =
                       upd.isNotEmpty && upd.compareTo(liveRssCutoff) >= 0;
-                  if (vid.isNotEmpty &&
-                      (recentEnough || !existingVidIds.contains(vid))) {
-                    if (recentEnough || existingLiveIds.contains(vid)) {
-                      newVidMeta[vid] = meta;
-                    }
+                  if (recentEnough ||
+                      !knownOldVidIds.contains(vid) ||
+                      zeroDurVidIds.contains(vid) ||
+                      existingLiveIds.contains(vid)) {
+                    newVidMeta[vid] = meta;
                   }
                 }
               }
@@ -1834,6 +1873,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
       await Future.wait(List.generate(concurrency, (_) => worker()));
 
       final stillLiveIds = <String>{};
+      final checkedIds = <String>{};
       final newIds = newVidMeta.keys.toList();
       final detailSlices = <List<String>>[];
       for (var i = 0; i < newIds.length; i += 50) {
@@ -1841,99 +1881,125 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
           newIds.sublist(i, (i + 50 > newIds.length) ? newIds.length : i + 50),
         );
       }
-      if (detailSlices.isNotEmpty) {
-        await Future.wait(
-          detailSlices.map((slice) async {
-            final vUri = Uri.https('www.googleapis.com', '/youtube/v3/videos', {
-              'part': 'snippet,statistics,contentDetails',
-              'id': slice.join(','),
-              'key': localApiKey,
-            });
-            final vRes = await client
-                .get(vUri)
-                .timeout(const Duration(seconds: 10));
-            final vData = jsonDecode(vRes.body);
-            if (vRes.statusCode != 200 || vData['error'] != null) {
-              final msg =
-                  (vData['error']?['message'] ??
-                          'YouTube API error (${vRes.statusCode})')
+      var nextSliceIdx = 0;
+      Future<void> detailWorker() async {
+        while (true) {
+          if (nextSliceIdx >= detailSlices.length) return;
+          final slice = detailSlices[nextSliceIdx++];
+          final vUri = Uri.https('www.googleapis.com', '/youtube/v3/videos', {
+            'part': 'snippet,statistics,contentDetails',
+            'id': slice.join(','),
+            'key': localApiKey,
+          });
+          http.Response? vRes;
+          for (var attempt = 0; attempt < 2; attempt++) {
+            try {
+              vRes = await client.get(vUri).timeout(const Duration(seconds: 15));
+              if (vRes.statusCode == 200 || attempt == 1) break;
+            } catch (e) {
+              if (attempt == 1) rethrow;
+            }
+            await Future.delayed(const Duration(milliseconds: 250));
+          }
+          if (vRes == null) continue;
+          final vData = jsonDecode(vRes.body);
+          if (vRes.statusCode != 200 || vData['error'] != null) {
+            final msg =
+                (vData['error']?['message'] ??
+                        'YouTube API error (${vRes.statusCode})')
+                    .toString();
+            throw Exception(msg);
+          }
+          checkedIds.addAll(slice);
+          final vItems = (vData['items'] as List?) ?? [];
+          for (final v in vItems) {
+            final vid = (v['id'] ?? '').toString();
+            if (vid.isEmpty) continue;
+            final vsnip = v['snippet'] ?? {};
+            final vstats = v['statistics'] ?? {};
+            final meta = newVidMeta[vid] ?? {};
+            final cid = (vsnip['channelId'] ?? meta['channel_id'] ?? '')
+                .toString();
+            final durStr = _parseIsoDuration(
+              (v['contentDetails']?['duration'] ?? '').toString(),
+            );
+            final isLiveVal =
+                (vsnip['liveBroadcastContent'] ?? '').toString() == 'live'
+                    ? 1
+                    : 0;
+            if (isLiveVal == 1) {
+              stillLiveIds.add(vid);
+            }
+            final thumbUrl =
+                (vsnip['thumbnails']?['high']?['url'] ??
+                        vsnip['thumbnails']?['medium']?['url'] ??
+                        'https://i.ytimg.com/vi/$vid/hqdefault.jpg')
+                    .toString();
+            final existingIdx = _localVideos.indexWhere(
+              (old) => old['video_id'] == vid,
+            );
+            if (existingIdx >= 0) {
+              _localVideos[existingIdx]['title'] =
+                  (vsnip['title'] ?? _localVideos[existingIdx]['title'] ?? '')
                       .toString();
-              throw Exception(msg);
-            }
-            final vItems = (vData['items'] as List?) ?? [];
-            for (final v in vItems) {
-              final vid = (v['id'] ?? '').toString();
-              if (vid.isEmpty) continue;
-              final vsnip = v['snippet'] ?? {};
-              final vstats = v['statistics'] ?? {};
-              final meta = newVidMeta[vid] ?? {};
-              final cid = (vsnip['channelId'] ?? meta['channel_id'] ?? '')
-                  .toString();
-              final durStr = _parseIsoDuration(
-                (v['contentDetails']?['duration'] ?? '').toString(),
-              );
-              final isLiveVal =
-                  (vsnip['liveBroadcastContent'] ?? '').toString() == 'live'
-                      ? 1
-                      : 0;
-              if (isLiveVal == 1) {
-                stillLiveIds.add(vid);
+              _localVideos[existingIdx]['thumbnail_url'] = thumbUrl;
+              if (vsnip['publishedAt'] != null) {
+                _localVideos[existingIdx]['published_at'] =
+                    vsnip['publishedAt'].toString();
               }
-              final existingIdx = _localVideos.indexWhere(
-                (old) => old['video_id'] == vid,
-              );
-              if (existingIdx >= 0) {
-                _localVideos[existingIdx]['title'] =
-                    (vsnip['title'] ?? _localVideos[existingIdx]['title'] ?? '')
-                        .toString();
-                _localVideos[existingIdx]['view_count'] =
-                    int.tryParse((vstats['viewCount'] ?? '0').toString()) ?? 0;
-                _localVideos[existingIdx]['like_count'] =
-                    int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0;
-                _localVideos[existingIdx]['duration'] = durStr;
-                _localVideos[existingIdx]['duration_seconds'] =
-                    _durationToSeconds(durStr);
-                _localVideos[existingIdx]['is_live'] = isLiveVal;
-                continue;
-              }
-              if (existingVidIds.contains(vid)) continue;
-              existingVidIds.add(vid);
-              _localVideos.insert(0, {
-                'video_id': vid,
-                'channel_id': cid,
-                'channel_title':
-                    (vsnip['channelTitle'] ?? meta['channel_title'] ?? '')
-                        .toString(),
-                'channel_thumbnail': (meta['channel_thumbnail'] ?? '')
-                    .toString(),
-                'title': (vsnip['title'] ?? 'Untitled').toString(),
-                'thumbnail_url':
-                    (vsnip['thumbnails']?['high']?['url'] ??
-                            vsnip['thumbnails']?['medium']?['url'] ??
-                            'https://i.ytimg.com/vi/$vid/hqdefault.jpg')
-                        .toString(),
-                'published_at':
-                    (vsnip['publishedAt'] ??
-                            DateTime.now().toUtc().toIso8601String())
-                        .toString(),
-                'view_count':
-                    int.tryParse((vstats['viewCount'] ?? '0').toString()) ?? 0,
-                'like_count':
-                    int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0,
-                'duration': durStr,
-                'duration_seconds': _durationToSeconds(durStr),
-                'watched_count': _getCreatorWatchedCount(cid),
-                'is_demo': 0,
-                'is_live': isLiveVal,
-              });
+              _localVideos[existingIdx]['view_count'] =
+                  int.tryParse((vstats['viewCount'] ?? '0').toString()) ?? 0;
+              _localVideos[existingIdx]['like_count'] =
+                  int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0;
+              _localVideos[existingIdx]['duration'] = durStr;
+              _localVideos[existingIdx]['duration_seconds'] =
+                  _durationToSeconds(durStr);
+              _localVideos[existingIdx]['is_live'] = isLiveVal;
+              continue;
             }
-          }),
+            if (existingVidIds.contains(vid)) continue;
+            existingVidIds.add(vid);
+            _localVideos.insert(0, {
+              'video_id': vid,
+              'channel_id': cid,
+              'channel_title':
+                  (vsnip['channelTitle'] ?? meta['channel_title'] ?? '')
+                      .toString(),
+              'channel_thumbnail': (meta['channel_thumbnail'] ?? '').toString(),
+              'title': (vsnip['title'] ?? 'Untitled').toString(),
+              'thumbnail_url': thumbUrl,
+              'published_at':
+                  (vsnip['publishedAt'] ??
+                          DateTime.now().toUtc().toIso8601String())
+                      .toString(),
+              'view_count':
+                  int.tryParse((vstats['viewCount'] ?? '0').toString()) ?? 0,
+              'like_count':
+                  int.tryParse((vstats['likeCount'] ?? '0').toString()) ?? 0,
+              'duration': durStr,
+              'duration_seconds': _durationToSeconds(durStr),
+              'watched_count': _getCreatorWatchedCount(cid),
+              'is_demo': 0,
+              'is_live': isLiveVal,
+            });
+          }
+        }
+      }
+
+      if (detailSlices.isNotEmpty) {
+        final detailConcurrency = detailSlices.length < 4
+            ? detailSlices.length
+            : 4;
+        await Future.wait(
+          List.generate(detailConcurrency, (_) => detailWorker()),
         );
       }
       if (existingLiveIds.isNotEmpty) {
         for (final v in _localVideos) {
           final vid = (v['video_id'] ?? '').toString();
-          if (existingLiveIds.contains(vid) && !stillLiveIds.contains(vid)) {
+          if (existingLiveIds.contains(vid) &&
+              checkedIds.contains(vid) &&
+              !stillLiveIds.contains(vid)) {
             v['is_live'] = 0;
           }
         }
@@ -4396,10 +4462,14 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
     bool busy = false;
     String? modalError;
 
-    try {
-      await showDialog<void>(
-        context: context,
-        builder: (ctx) => StatefulBuilder(
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => _DisposeOnUnmount(
+        onDispose: () {
+          handleCtrl.dispose();
+          csvCtrl.dispose();
+        },
+        child: StatefulBuilder(
           builder: (ctx, setModalState) => AlertDialog(
             backgroundColor: const Color(0xFF212121),
             title: const Text('Tambah Channel Follower / Import Excel CSV'),
@@ -4632,11 +4702,8 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
             ],
           ),
         ),
-      );
-    } finally {
-      handleCtrl.dispose();
-      csvCtrl.dispose();
-    }
+      ),
+    );
   }
 
   Future<void> _showApiSettingsModal() async {
@@ -4646,10 +4713,15 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
     bool syncing = false;
     String? statusMsg;
 
-    try {
-      await showDialog<void>(
-        context: context,
-        builder: (ctx) => StatefulBuilder(
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => _DisposeOnUnmount(
+        onDispose: () {
+          apiKeyCtrl.dispose();
+          oauthCtrl.dispose();
+          serverCtrl.dispose();
+        },
+        child: StatefulBuilder(
           builder: (ctx, setModalState) => AlertDialog(
             backgroundColor: const Color(0xFF212121),
             title: const Text(
@@ -4899,12 +4971,8 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
             ],
           ),
         ),
-      );
-    } finally {
-      apiKeyCtrl.dispose();
-      oauthCtrl.dispose();
-      serverCtrl.dispose();
-    }
+      ),
+    );
   }
 
   void _cycleSidebarMode() {
@@ -4914,7 +4982,6 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
   }
 
   void _selectChannelTab(String cid) {
-    final wasInsideCreator = selectedChannelId.isNotEmpty;
     final tabKey = cid.isEmpty ? 'home' : cid;
     final savedLimit = tabLimits[tabKey] ?? defaultLimit;
     final isMobileScreen = MediaQuery.of(context).size.width < 750;
@@ -4931,11 +4998,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen>
     if (isMobileScreen && Navigator.of(context).canPop()) {
       Navigator.of(context).pop();
     }
-    _fetchVideos().then((_) {
-      if (wasInsideCreator && cid.isEmpty) {
-        _triggerAutoRefreshYouTube();
-      }
-    });
+    _fetchVideos();
   }
 
   void _resetHomeAndClearSearch() {
@@ -8937,4 +9000,24 @@ class _HomeScrollWithBarState extends State<_HomeScrollWithBar> {
       ),
     );
   }
+}
+
+class _DisposeOnUnmount extends StatefulWidget {
+  final VoidCallback onDispose;
+  final Widget child;
+  const _DisposeOnUnmount({required this.onDispose, required this.child});
+
+  @override
+  State<_DisposeOnUnmount> createState() => _DisposeOnUnmountState();
+}
+
+class _DisposeOnUnmountState extends State<_DisposeOnUnmount> {
+  @override
+  void dispose() {
+    widget.onDispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }

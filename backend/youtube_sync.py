@@ -502,39 +502,49 @@ def refresh_all_channels_comprehensive(
     ch_map = {c["channel_id"]: c for c in real_chs}
 
     # Ambil daftar video_id yang sudah ada di database (kecuali yang baru diupload 48 jam terakhir agar views/likes ikut ter-update)
-    # Serta seluruh video yang sebelumnya berstatus live (is_live=1) agar status selesai live langsung terhapus saat refresh!
+    # Serta video berdurasi 0 / upcoming dan seluruh video yang sebelumnya berstatus live (is_live=1) agar status live akurat!
     recent_cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
     live_rss_cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%S")
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT video_id, channel_id, published_at, COALESCE(is_live, 0) AS is_live FROM videos"
+            "SELECT video_id, channel_id, published_at, COALESCE(duration_seconds, 0) AS dur_sec, COALESCE(is_live, 0) AS is_live FROM videos"
         ).fetchall()
         all_existing_vids = {r["video_id"] for r in rows}
-        known_old_vids = {r["video_id"] for r in rows if (r["published_at"] or "") < recent_cutoff}
+        known_old_vids = {
+            r["video_id"]
+            for r in rows
+            if (r["published_at"] or "") < recent_cutoff
+            and int(r["dur_sec"] or 0) > 0
+            and int(r["is_live"] or 0) == 0
+        }
         existing_live_map = {r["video_id"]: r["channel_id"] for r in rows if int(r["is_live"] or 0) == 1 and r["channel_id"] in ch_map}
+        zero_dur_vids = {r["video_id"] for r in rows if int(r["dur_sec"] or 0) == 0}
 
     done_count = 0
     newly_inserted_count = 0
 
-    entry_block_re = re.compile(r"<entry>.*?<yt:videoId>([^<]+)</yt:videoId>.*?(?:<updated>([^<]+)</updated>)?.*?</entry>", re.DOTALL)
+    entry_block_re = re.compile(r"<entry>(.*?)</entry>", re.DOTALL)
+    vid_tag_re = re.compile(r"<yt:videoId>([^<]+)</yt:videoId>")
+    upd_tag_re = re.compile(r"<updated>([^<]+)</updated>")
+    pub_tag_re = re.compile(r"<published>([^<]+)</published>")
 
     # Cek 15 item RSS terbaru + feed live UULV untuk seluruh channel sekaligus via pool 40 worker & keep-alive connection
     vid_to_cid: dict[str, str] = {}
     limits = httpx.Limits(max_connections=60, max_keepalive_connections=40)
-    with httpx.Client(timeout=4.0, limits=limits, follow_redirects=True) as rss_client:
+    with httpx.Client(timeout=6.0, limits=limits, follow_redirects=True) as rss_client:
         def _fetch_rss(url: str) -> str:
-            for attempt in range(2):
+            for attempt in range(3):
                 try:
                     r = rss_client.get(url)
                     if r.status_code == 200:
                         return r.text
-                    if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-                        time.sleep(0.15)
+                    if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                        time.sleep(0.2 * (attempt + 1))
                         continue
                     return ""
                 except Exception:
-                    if attempt == 0:
-                        time.sleep(0.15)
+                    if attempt < 2:
+                        time.sleep(0.2 * (attempt + 1))
             return ""
 
         def _check_channel(ch: dict) -> list[tuple[str, str]]:
@@ -543,15 +553,28 @@ def refresh_all_channels_comprehensive(
             seen_local: set[str] = set()
             xml_main = _fetch_rss(f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}")
             if xml_main:
-                for v in re.findall(r"<yt:videoId>([^<]+)</yt:videoId>", xml_main):
-                    if v not in known_old_vids and v not in seen_local:
+                for v in vid_tag_re.findall(xml_main):
+                    v = v.strip()
+                    if v and v not in known_old_vids and v not in seen_local:
                         seen_local.add(v)
                         found.append((v, cid))
             if cid.startswith("UC") and len(cid) > 2:
                 xml_live = _fetch_rss(f"https://www.youtube.com/feeds/videos.xml?playlist_id=UULV{cid[2:]}")
                 if xml_live:
-                    for v, upd in entry_block_re.findall(xml_live):
-                        if v not in seen_local and ((upd and upd >= live_rss_cutoff) or v not in known_old_vids):
+                    blocks = entry_block_re.findall(xml_live)
+                    for block in blocks:
+                        vm = vid_tag_re.search(block)
+                        if not vm:
+                            continue
+                        v = vm.group(1).strip()
+                        um = upd_tag_re.search(block)
+                        pm = pub_tag_re.search(block)
+                        upd = (um.group(1).strip() if um else "") or (pm.group(1).strip() if pm else "")
+                        if v and v not in seen_local and (
+                            (upd and upd >= live_rss_cutoff)
+                            or v not in known_old_vids
+                            or v in zero_dur_vids
+                        ):
                             seen_local.add(v)
                             found.append((v, cid))
             return found

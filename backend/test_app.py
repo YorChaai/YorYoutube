@@ -479,4 +479,105 @@ def test_live_streaming_detection_and_refresh_cleanup(isolated_client, monkeypat
     assert after_state["live_streams"] == []
 
 
+def test_live_uulv_xml_parses_real_updated_tag_and_zero_duration_transition(isolated_client, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    import youtube_sync
+
+    db.upsert_channel(
+        channel_id="UC_uulv_test",
+        title="24x7 Radio",
+        handle="@radio247",
+        uploads_playlist_id="UU_uulv_test",
+        source="manual",
+    )
+    old_iso = (datetime.now(timezone.utc) - timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    upd_iso = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    db.upsert_videos(
+        [
+            {
+                "video_id": "vid_uulv_live",
+                "channel_id": "UC_uulv_test",
+                "channel_title": "24x7 Radio",
+                "channel_thumbnail": "",
+                "title": "Upcoming 24/7 Stream",
+                "thumbnail_url": "https://i.ytimg.com/vi/vid_uulv_live/hqdefault.jpg",
+                "published_at": old_iso,
+                "view_count": 0,
+                "like_count": 0,
+                "duration": "",
+                "duration_seconds": 0,
+                "is_demo": 0,
+                "is_live": 0,
+            }
+        ]
+    )
+
+    class _FakeResp:
+        def __init__(self, status_code, text="", payload=None):
+            self.status_code = status_code
+            self.text = text
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, params=None, headers=None):
+            if "playlist_id=UULV_uulv_test" in str(url):
+                return _FakeResp(
+                    200,
+                    text=(
+                        "<feed>"
+                        "<entry>"
+                        "<yt:videoId>vid_uulv_live</yt:videoId>"
+                        "<title>Live 24/7</title>"
+                        "<author><name>24x7 Radio</name></author>"
+                        f"<published>{old_iso}</published>"
+                        f"<updated>{upd_iso}</updated>"
+                        "</entry>"
+                        "</feed>"
+                    ),
+                )
+            if "feeds/videos.xml" in str(url):
+                return _FakeResp(200, text="<feed></feed>")
+            if str(url).endswith("/videos"):
+                return _FakeResp(
+                    200,
+                    payload={
+                        "items": [
+                            {
+                                "id": "vid_uulv_live",
+                                "snippet": {
+                                    "channelId": "UC_uulv_test",
+                                    "channelTitle": "24x7 Radio",
+                                    "title": "Live 24/7 Now",
+                                    "publishedAt": old_iso,
+                                    "liveBroadcastContent": "live",
+                                    "thumbnails": {},
+                                },
+                                "statistics": {"viewCount": "900", "likeCount": "80"},
+                                "contentDetails": {"duration": "P0D"},
+                            }
+                        ]
+                    },
+                )
+            return _FakeResp(404)
+
+    monkeypatch.setattr(youtube_sync.httpx, "Client", _FakeClient)
+    youtube_sync.refresh_all_channels_comprehensive(db.list_channels(), api_key="FAKE_KEY")
+    st = isolated_client.get("/api/state").json()
+    assert len(st["live_streams"]) == 1
+    assert st["live_streams"][0]["video_id"] == "vid_uulv_live"
+    assert st["live_streams"][0]["title"] == "Live 24/7 Now"
+
+
 

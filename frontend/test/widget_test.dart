@@ -877,7 +877,7 @@ void main() {
   );
 
   testWidgets(
-    'Live Streaming: posisi di bawah Subscriptions & Navigasi Tab, update saat Refresh & auto-refresh saat buka/kembali ke aplikasi/Following',
+    'Live Streaming: posisi di bawah Subscriptions & Navigasi Tab, update saat Refresh manual & auto-refresh hanya 1x saat cold launch (tidak saat pindah halaman/background)',
     (WidgetTester tester) async {
       int refreshCalls = 0;
       bool liveActive = false;
@@ -1042,25 +1042,24 @@ void main() {
           );
           expect(mainLiveRect.top, greaterThanOrEqualTo(halamanRect.bottom - 1));
 
-          // Sebelum refresh baru, akun masih tampil live.
-          // Pindah ke 1 creator lalu kembali ke Semua Follower -> auto-refresh berjalan & menghapus status live yang sudah selesai
+          // Sebelum refresh manual, akun masih tampil live.
+          // Pindah ke 1 creator lalu kembali ke Semua Follower -> TIDAK memicu auto-refresh
           await tester.tap(find.text('MALAKA').first);
           await tester.pumpAndSettle();
           expect(find.text('Live Streaming (0)'), findsWidgets);
 
-          // Tunggu lewat cooldown 4 detik lalu kembali ke Semua Follower
           await tester.pump(const Duration(seconds: 5));
           await tester.tap(find.textContaining('Semua Follower').first);
           await tester.pumpAndSettle();
           await tester.pump(const Duration(milliseconds: 700));
           await tester.pumpAndSettle();
 
-          expect(refreshCalls, 2);
-          expect(find.byKey(const Key('sidebar_live_item_UC_demo_fajrul')), findsNothing);
-          expect(find.byKey(const Key('main_live_item_UC_demo_fajrul')), findsNothing);
-          expect(find.text('Live Streaming (0)'), findsNWidgets(2));
+          expect(refreshCalls, 1);
+          expect(find.byKey(const Key('sidebar_live_item_UC_demo_fajrul')), findsOneWidget);
+          expect(find.byKey(const Key('main_live_item_UC_demo_fajrul')), findsOneWidget);
+          expect(find.text('Live Streaming (1)'), findsNWidgets(2));
 
-          // Simulasikan keluar dari aplikasi (inactive->hidden->paused) lalu masuk kembali (hidden->inactive->resumed) -> auto-refresh berjalan lagi
+          // Simulasikan keluar ke background / link YouTube (inactive->hidden->paused->resumed) -> TIDAK memicu auto-refresh
           tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
           tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
           tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
@@ -1070,10 +1069,182 @@ void main() {
           await tester.pumpAndSettle();
           await tester.pump(const Duration(milliseconds: 700));
           await tester.pumpAndSettle();
-          expect(refreshCalls, 3);
+          expect(refreshCalls, 1);
+
+          // Klik tombol merah Refresh YouTube secara manual -> refresh berjalan & menghapus live yang sudah selesai
+          await tester.tap(find.byTooltip('Refresh YouTube'));
+          await tester.pumpAndSettle();
+          await tester.pump(const Duration(milliseconds: 700));
+          await tester.pumpAndSettle();
+          expect(refreshCalls, 2);
+          expect(find.byKey(const Key('sidebar_live_item_UC_demo_fajrul')), findsNothing);
+          expect(find.byKey(const Key('main_live_item_UC_demo_fajrul')), findsNothing);
+          expect(find.text('Live Streaming (0)'), findsNWidgets(2));
           expect(tester.takeException(), isNull);
         },
         createHttpClient: (_) => _TestBackendHttpClient(handleBackend),
+      );
+    },
+  );
+
+  testWidgets(
+    'Standalone Mode parses UULV Atom <entry> <updated> after <published> and transitions 0:00 stream to LIVE',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1280, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      var nowLive = false;
+      final tenDaysAgoIso = DateTime.now()
+          .toUtc()
+          .subtract(const Duration(days: 10))
+          .toIso8601String();
+      final freshUpdatedIso = DateTime.now().toUtc().toIso8601String();
+      const cid = 'UCTestLiveChannel000001';
+      const uulv = 'UULVTestLiveChannel000001';
+      const vid = 'vid_upcoming_old';
+      var uulvRssHits = 0;
+
+      ({int statusCode, String body})? handleRaw(String method, Uri uri) {
+        final host = uri.host;
+        final path = uri.path;
+        if (host == '127.0.0.1' ||
+            host == 'localhost' ||
+            host == '172.18.164.232' ||
+            host == '192.168.68.54') {
+          // Force Standalone Mode fallback
+          return (statusCode: 404, body: '{}');
+        }
+        if (host == 'www.googleapis.com' && path == '/youtube/v3/channels') {
+          return (
+            statusCode: 200,
+            body: jsonEncode({
+              'items': [
+                {
+                  'id': cid,
+                  'snippet': {
+                    'title': 'Ryzen Test Live',
+                    'customUrl': '@RyzenTestLive',
+                    'thumbnails': {
+                      'default': {'url': 'https://i.ytimg.com/avatar.jpg'},
+                    },
+                  },
+                  'contentDetails': {
+                    'relatedPlaylists': {'uploads': 'UUTestLiveChannel000001'},
+                  },
+                },
+              ],
+            }),
+          );
+        }
+        if (host == 'www.googleapis.com' &&
+            path == '/youtube/v3/playlistItems') {
+          return (
+            statusCode: 200,
+            body: jsonEncode({
+              'items': [
+                {
+                  'contentDetails': {'videoId': vid},
+                },
+              ],
+            }),
+          );
+        }
+        if (host == 'www.googleapis.com' && path == '/youtube/v3/videos') {
+          return (
+            statusCode: 200,
+            body: jsonEncode({
+              'items': [
+                {
+                  'id': vid,
+                  'snippet': {
+                    'channelId': cid,
+                    'channelTitle': 'Ryzen Test Live',
+                    'title': 'Turnamen PUBG Mobile Live',
+                    'publishedAt': nowLive ? freshUpdatedIso : tenDaysAgoIso,
+                    'liveBroadcastContent': nowLive ? 'live' : 'none',
+                    'thumbnails': {
+                      'high': {'url': 'https://i.ytimg.com/vi/$vid/hqdefault.jpg'},
+                    },
+                  },
+                  'statistics': {'viewCount': '1200', 'likeCount': '85'},
+                  'contentDetails': {'duration': 'PT0S'},
+                },
+              ],
+            }),
+          );
+        }
+        if (host == 'www.youtube.com' && path == '/feeds/videos.xml') {
+          final pid = uri.queryParameters['playlist_id'] ?? '';
+          if (pid == uulv) {
+            uulvRssHits += 1;
+            return (
+              statusCode: 200,
+              body: '''<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015">
+  <entry>
+    <yt:videoId>$vid</yt:videoId>
+    <title>Turnamen PUBG Mobile Live</title>
+    <published>$tenDaysAgoIso</published>
+    <updated>$freshUpdatedIso</updated>
+  </entry>
+</feed>''',
+            );
+          }
+          return (
+            statusCode: 200,
+            body: '<?xml version="1.0" encoding="UTF-8"?><feed></feed>',
+          );
+        }
+        return (statusCode: 404, body: '{}');
+      }
+
+      await HttpOverrides.runZoned(
+        () async {
+          await tester.pumpWidget(const PersonalYouTubeApp());
+          await tester.pumpAndSettle();
+
+          // 1. Set API Key & clear server URL to ensure Standalone Mode
+          await tester.tap(find.byTooltip('Pengaturan API & Sync'));
+          await tester.pumpAndSettle();
+          final dialogFields = find.descendant(
+            of: find.byType(AlertDialog),
+            matching: find.byType(TextField),
+          );
+          await tester.enterText(dialogFields.at(0), 'AIzaTestStandaloneKey');
+          await tester.enterText(dialogFields.at(2), '');
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('Simpan & Sync Sekarang'));
+          await tester.pumpAndSettle();
+
+          // 2. Add channel with a 10-day-old 0:00 upcoming stream (not live yet)
+          await tester.tap(find.byTooltip('Tambah Channel'));
+          await tester.pumpAndSettle();
+          final addField = find
+              .descendant(
+                of: find.byType(AlertDialog),
+                matching: find.byType(TextField),
+              )
+              .first;
+          await tester.enterText(addField, '@RyzenTestLive');
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('Tambah'));
+          await tester.pumpAndSettle();
+
+          expect(find.text('Live Streaming (1)'), findsNothing);
+
+          // 3. Channel goes LIVE on YouTube -> hit Refresh YouTube in Standalone Mode
+          nowLive = true;
+          await tester.tap(find.byTooltip('Refresh YouTube'));
+          await tester.pumpAndSettle();
+
+          expect(uulvRssHits, greaterThanOrEqualTo(1));
+          expect(find.text('Live Streaming (1)'), findsNWidgets(2));
+          expect(find.text('Ryzen Test Live'), findsWidgets);
+          expect(tester.takeException(), isNull);
+        },
+        createHttpClient: (_) =>
+            _TestBackendHttpClient((_, _) => {}, rawHandler: handleRaw),
       );
     },
   );
@@ -1081,11 +1252,13 @@ void main() {
 
 class _TestBackendHttpClient implements HttpClient {
   final Map<String, dynamic> Function(String method, Uri uri) handler;
-  _TestBackendHttpClient(this.handler);
+  final ({int statusCode, String body})? Function(String method, Uri uri)?
+      rawHandler;
+  _TestBackendHttpClient(this.handler, {this.rawHandler});
 
   @override
   Future<HttpClientRequest> openUrl(String method, Uri url) async =>
-      _TestHttpRequest(method, url, handler);
+      _TestHttpRequest(method, url, handler, rawHandler: rawHandler);
 
   @override
   Future<HttpClientRequest> getUrl(Uri url) => openUrl('GET', url);
@@ -1103,9 +1276,16 @@ class _TestHttpRequest implements HttpClientRequest {
   @override
   final Uri uri;
   final Map<String, dynamic> Function(String method, Uri uri) handler;
+  final ({int statusCode, String body})? Function(String method, Uri uri)?
+      rawHandler;
   final HttpHeaders _headers = _TestHttpHeaders();
 
-  _TestHttpRequest(this.method, this.uri, this.handler);
+  _TestHttpRequest(
+    this.method,
+    this.uri,
+    this.handler, {
+    this.rawHandler,
+  });
 
   @override
   HttpHeaders get headers => _headers;
@@ -1133,6 +1313,12 @@ class _TestHttpRequest implements HttpClientRequest {
 
   @override
   Future<HttpClientResponse> close() async {
+    if (rawHandler != null) {
+      final raw = rawHandler!(method, uri);
+      if (raw != null) {
+        return _TestHttpResponse(raw.statusCode, raw.body);
+      }
+    }
     if (uri.host != '127.0.0.1' && uri.host != 'localhost') {
       return _TestHttpResponse(404, '{}');
     }
