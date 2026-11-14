@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import threading
 from urllib.parse import parse_qs, urlparse
 import httpx
@@ -834,6 +836,70 @@ def remove_channel(channel_id: str) -> dict:
         if SESSION_UI_STATE.get("channel_id") == channel_id:
             SESSION_UI_STATE["channel_id"] = ""
     return {"status": "ok"}
+
+
+@app.post("/api/sync/usb-prepare")
+def prepare_usb_sync_bridge() -> dict:
+    """Siapkan bridge kabel USB (adb reverse tcp:8000 tcp:8000) untuk HP Android."""
+    adb_bin = shutil.which("adb")
+    if not adb_bin:
+        return {
+            "connected": False,
+            "devices": [],
+            "reverse_ok": False,
+            "error": "ADB tidak ditemukan di Laptop.",
+        }
+    try:
+        dev_res = subprocess.run(
+            [adb_bin, "devices"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+        )
+    except Exception as exc:
+        return {
+            "connected": False,
+            "devices": [],
+            "reverse_ok": False,
+            "error": f"Gagal memeriksa perangkat USB: {exc}",
+        }
+
+    serials: list[str] = []
+    for line in (dev_res.stdout or "").splitlines()[1:]:
+        parts = line.strip().split()
+        if len(parts) >= 2 and parts[1] == "device":
+            serials.append(parts[0])
+
+    if not serials:
+        return {
+            "connected": False,
+            "devices": [],
+            "reverse_ok": False,
+            "error": "HP belum terdeteksi via USB (ADB).",
+        }
+
+    reversed_ok: list[str] = []
+    for serial in serials:
+        try:
+            rev = subprocess.run(
+                [adb_bin, "-s", serial, "reverse", "tcp:8000", "tcp:8000"],
+                capture_output=True,
+                text=True,
+                timeout=4,
+                check=False,
+            )
+            if rev.returncode == 0:
+                reversed_ok.append(serial)
+        except Exception:
+            pass
+
+    return {
+        "connected": True,
+        "devices": serials,
+        "reverse_ok": len(reversed_ok) > 0,
+        "error": "" if reversed_ok else "Gagal membuka port adb reverse tcp:8000.",
+    }
 
 
 @app.post("/api/sync/exchange")

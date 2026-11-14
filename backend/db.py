@@ -727,6 +727,22 @@ def _is_newer_or_equal_ts(incoming_ts: str, existing_ts: str) -> bool:
     return incoming_ts >= existing_ts
 
 
+def _reconcile_hidden_state(
+    incoming_hidden: int,
+    incoming_ts: str,
+    existing_hidden: int,
+    existing_ts: str,
+) -> tuple[int, str]:
+    in_ts = (incoming_ts or "").strip()
+    ex_ts = (existing_ts or "").strip()
+    if _is_newer_or_equal_ts(in_ts, ex_ts):
+        return incoming_hidden, in_ts
+    # Kedua sisi belum punya timestamp Hide/Unhide (data legacy): pertahankan Hide eksplisit daripada default Unhide
+    if not in_ts and not ex_ts and incoming_hidden == 1 and existing_hidden == 0:
+        return 1, ""
+    return existing_hidden, ex_ts
+
+
 def _safe_nonneg_int(val: object) -> int:
     if val is None:
         return 0
@@ -823,9 +839,9 @@ def sync_device_data(payload: dict) -> dict:
                 if has_hidden_field:
                     eff_in_hid = c_hid_upd if has_hid_ts_key else c_upd
                     eff_ex_hid = new_hid_upd if has_hid_ts_key else (new_hid_upd or new_upd)
-                    if _is_newer_or_equal_ts(eff_in_hid, eff_ex_hid):
-                        new_hidden = c_is_hidden
-                        new_hid_upd = eff_in_hid
+                    new_hidden, new_hid_upd = _reconcile_hidden_state(
+                        c_is_hidden, eff_in_hid, new_hidden, eff_ex_hid
+                    )
 
                 conn.execute(
                     """

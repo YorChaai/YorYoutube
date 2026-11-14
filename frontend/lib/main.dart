@@ -7,6 +7,54 @@ import 'package:http/http.dart' as http;
 import 'package:sqflite/sqflite.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+bool parseChannelHiddenFlag(dynamic raw) {
+  if (raw == true || raw == 1) return true;
+  final s = (raw ?? '').toString().trim().toLowerCase();
+  return s == '1' || s == 'true';
+}
+
+bool isNewerOrEqualIsoTimestamp(String incomingTs, String existingTs) {
+  final inTrim = incomingTs.trim();
+  final exTrim = existingTs.trim();
+  if (inTrim.isEmpty) return false;
+  if (exTrim.isEmpty) return true;
+  final inDt = DateTime.tryParse(inTrim)?.toUtc();
+  final exDt = DateTime.tryParse(exTrim)?.toUtc();
+  if (inDt != null && exDt != null) {
+    return !inDt.isBefore(exDt);
+  }
+  return inTrim.compareTo(exTrim) >= 0;
+}
+
+void reconcileChannelHideState(
+  Map<String, dynamic> target,
+  Map<String, dynamic> incoming,
+) {
+  if (incoming['is_hidden'] == null) return;
+  final hasHidKey = incoming.containsKey('hidden_updated_at');
+  final inHidTs = (incoming['hidden_updated_at'] ?? '').toString().trim();
+  final exHidTs = (target['hidden_updated_at'] ?? '').toString().trim();
+  final effIn = hasHidKey
+      ? inHidTs
+      : (incoming['updated_at'] ?? '').toString().trim();
+  final effEx = hasHidKey
+      ? exHidTs
+      : (exHidTs.isNotEmpty
+            ? exHidTs
+            : (target['updated_at'] ?? '').toString().trim());
+  final inHidden = parseChannelHiddenFlag(incoming['is_hidden']) ? 1 : 0;
+  final exHidden = parseChannelHiddenFlag(target['is_hidden']) ? 1 : 0;
+  if (isNewerOrEqualIsoTimestamp(effIn, effEx)) {
+    target['is_hidden'] = inHidden;
+    if (effIn.isNotEmpty) {
+      target['hidden_updated_at'] = effIn;
+    }
+  } else if (effIn.isEmpty && effEx.isEmpty && inHidden == 1 && exHidden == 0) {
+    // Kedua sisi masih memakai data legacy tanpa timestamp Hide/Unhide: pertahankan status Hide.
+    target['is_hidden'] = 1;
+  }
+}
+
 void main() {
   runApp(const PersonalYouTubeApp());
 }
@@ -66,6 +114,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   int usbSyncProgress = 0; // 0..100 persen
   bool usbSyncReadyGreen = false;
   Timer? _usbSyncResetTimer;
+  Timer? _sidebarTooltipTimer;
   bool isStandaloneMode =
       false; // Otomatis aktif di HP jika tanpa backend Python
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
@@ -152,6 +201,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   void dispose() {
     _refreshPollTimer?.cancel();
     _usbSyncResetTimer?.cancel();
+    _sidebarTooltipTimer?.cancel();
     _dayInputDebounce?.cancel();
     if (_activeDayFocusListener != null) {
       _dayFocusNode.removeListener(_activeDayFocusListener!);
@@ -828,18 +878,13 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     return '$y-$m-${d}T$hh:$mm:${ss}Z';
   }
 
-  bool _isNewerOrEqualIso(String incomingTs, String existingTs) {
-    final inTrim = incomingTs.trim();
-    final exTrim = existingTs.trim();
-    if (inTrim.isEmpty) return false;
-    if (exTrim.isEmpty) return true;
-    final inDt = DateTime.tryParse(inTrim)?.toUtc();
-    final exDt = DateTime.tryParse(exTrim)?.toUtc();
-    if (inDt != null && exDt != null) {
-      return !inDt.isBefore(exDt);
-    }
-    return inTrim.compareTo(exTrim) >= 0;
-  }
+  bool _isNewerOrEqualIso(String incomingTs, String existingTs) =>
+      isNewerOrEqualIsoTimestamp(incomingTs, existingTs);
+
+  void _reconcileChannelHide(
+    Map<String, dynamic> target,
+    Map<String, dynamic> incoming,
+  ) => reconcileChannelHideState(target, incoming);
 
   bool _isCustomDayPeriod(String p) =>
       p.endsWith('d') && int.tryParse(p.substring(0, p.length - 1)) != null;
@@ -4344,17 +4389,33 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final hiddenInt = hide ? 1 : 0;
     final nowIso = DateTime.now().toUtc().toIso8601String();
     setState(() {
+      var foundLocal = false;
       for (final c in _localChannels) {
         if ((c['channel_id'] ?? '').toString() == channelId) {
           c['is_hidden'] = hiddenInt;
           c['hidden_updated_at'] = nowIso;
+          foundLocal = true;
         }
       }
+      Map<String, dynamic>? matchedChannel;
       for (final c in channels) {
         if ((c['channel_id'] ?? '').toString() == channelId) {
           c['is_hidden'] = hiddenInt;
           c['hidden_updated_at'] = nowIso;
+          matchedChannel ??= c;
         }
+      }
+      if (!foundLocal && _isHpDevice) {
+        final added = matchedChannel != null
+            ? Map<String, dynamic>.from(matchedChannel)
+            : <String, dynamic>{
+                'channel_id': channelId,
+                'title': channelTitle,
+                'status': 'subscribed',
+              };
+        added['is_hidden'] = hiddenInt;
+        added['hidden_updated_at'] = nowIso;
+        _localChannels.add(added);
       }
       for (final v in _localVideos) {
         if ((v['channel_id'] ?? '').toString() == channelId) {
@@ -4738,6 +4799,50 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       if (!mounted) return;
       setState(() => usbSyncProgress = 30);
 
+      // Di Laptop: siapkan jembatan ADB reverse ke HP, jangan mengirim data Laptop ke diri sendiri.
+      if (!_isHpDevice) {
+        final prepResp = await http
+            .post(Uri.parse('$baseUrl/api/sync/usb-prepare'))
+            .timeout(const Duration(seconds: 6));
+        if (!mounted) return;
+        if (prepResp.statusCode == 200) {
+          final prep = jsonDecode(prepResp.body) as Map<String, dynamic>;
+          final connected = prep['connected'] == true;
+          final reverseOk = prep['reverse_ok'] == true;
+          final devices = ((prep['devices'] as List?) ?? []).join(', ');
+          if (connected && reverseOk) {
+            setState(() {
+              usbSyncProgress = 100;
+              syncingUsb = false;
+              usbSyncReadyGreen = true;
+            });
+            _usbSyncResetTimer?.cancel();
+            _usbSyncResetTimer = Timer(const Duration(seconds: 6), () {
+              if (mounted) setState(() => usbSyncReadyGreen = false);
+            });
+            await _fetchVideos(silent: true);
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                backgroundColor: const Color(0xFF1B5E20),
+                duration: const Duration(seconds: 5),
+                content: Text(
+                  '🔌 Kabel USB terhubung ke HP ($devices) & port 8000 siap! Klik "Sync USB (HP ⇄ Laptop)" di aplikasi HP agar perubahan HP & Laptop bertukar.',
+                ),
+              ),
+            );
+            return;
+          }
+          final errMsg = (prep['error'] ?? '').toString().trim();
+          throw Exception(
+            errMsg.isNotEmpty
+                ? '$errMsg Aktifkan USB Debugging di HP atau gunakan Export/Import JSON.'
+                : 'HP belum terdeteksi lewat USB. Aktifkan USB Debugging di HP atau gunakan Export/Import JSON.',
+          );
+        }
+        throw Exception('Backend Laptop tidak merespons (${prepResp.statusCode}).');
+      }
+
       final payload = {
         'device': _deviceType,
         'videos': [
@@ -4861,13 +4966,12 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           cached['views_total'] = nextHp + nextLap;
           cached['watched_count'] = nextHp + nextLap;
           if (rc['status'] != null) cached['status'] = rc['status'];
-          if (rc['is_hidden'] != null) {
-            cached['is_hidden'] = _isHiddenFlag(rc['is_hidden']) ? 1 : 0;
+          _reconcileChannelHide(cached, Map<String, dynamic>.from(rc as Map));
+          final rcUpd = (rc['updated_at'] ?? '').toString();
+          final exUpd = (cached['updated_at'] ?? '').toString();
+          if (rcUpd.isNotEmpty && _isNewerOrEqualIso(rcUpd, exUpd)) {
+            cached['updated_at'] = rcUpd;
           }
-          if (rc['hidden_updated_at'] != null) {
-            cached['hidden_updated_at'] = rc['hidden_updated_at'];
-          }
-          if (rc['updated_at'] != null) cached['updated_at'] = rc['updated_at'];
           if (rc['title'] != null) cached['title'] = rc['title'];
           if (rc['thumbnail_url'] != null) {
             cached['thumbnail_url'] = rc['thumbnail_url'];
@@ -5094,25 +5198,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             c['views_total'] = nextHp + nextLap;
             c['watched_count'] = nextHp + nextLap;
             if (rc['status'] != null) c['status'] = rc['status'];
-            if (rc['is_hidden'] != null) {
-              final hasHidKey = rc.containsKey('hidden_updated_at');
-              final inHidTs = (rc['hidden_updated_at'] ?? '').toString().trim();
-              final exHidTs = (c['hidden_updated_at'] ?? '').toString().trim();
-              final effIn = hasHidKey
-                  ? inHidTs
-                  : (rc['updated_at'] ?? '').toString().trim();
-              final effEx = hasHidKey
-                  ? exHidTs
-                  : (exHidTs.isNotEmpty
-                        ? exHidTs
-                        : (c['updated_at'] ?? '').toString().trim());
-              if (_isNewerOrEqualIso(effIn, effEx)) {
-                c['is_hidden'] = _isHiddenFlag(rc['is_hidden']) ? 1 : 0;
-                if (effIn.isNotEmpty) {
-                  c['hidden_updated_at'] = effIn;
-                }
-              }
-            }
+            _reconcileChannelHide(c, Map<String, dynamic>.from(rc as Map));
           }
         }
         for (final entry in remoteChMap.entries) {
@@ -6661,13 +6747,37 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     );
   }
 
+  void _dismissSidebarTooltip() {
+    _sidebarTooltipTimer?.cancel();
+    _sidebarTooltipTimer = null;
+    Tooltip.dismissAllToolTips();
+  }
+
+  void _scheduleSidebarTooltipAutoClose() {
+    _sidebarTooltipTimer?.cancel();
+    _sidebarTooltipTimer = Timer(const Duration(seconds: 5), () {
+      _sidebarTooltipTimer = null;
+      if (mounted) {
+        Tooltip.dismissAllToolTips();
+      }
+    });
+  }
+
   Widget _buildSidebar({bool forceFull = false}) {
     final sidebarChannels = channels
         .where((ch) => _matchesHideFilter(_isHiddenFlag(ch['is_hidden'])))
         .toList();
 
     Widget buildCreatorListBody({double? fixedHeight}) {
-      final listBlock = _HomeScrollWithBar(
+      final listBlock = NotificationListener<ScrollNotification>(
+        onNotification: (notification) {
+          if (notification is ScrollStartNotification ||
+              notification is ScrollUpdateNotification) {
+            _dismissSidebarTooltip();
+          }
+          return false;
+        },
+        child: _HomeScrollWithBar(
         controller: _sidebarScrollController,
         itemCount: sidebarChannels.length,
         railKey: const Key('sidebar_fast_scrollbar'),
@@ -6697,9 +6807,38 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
               return Tooltip(
                 message:
                     '$title${isHidden ? ' (Hidden)' : ''}\nTotal: $watchedCount view (📱 HP: $cHp | 💻 Laptop: $cLap)',
+                triggerMode: _isHpDevice ? TooltipTriggerMode.longPress : null,
+                showDuration: const Duration(seconds: 5),
+                preferBelow: true,
+                onTriggered: _scheduleSidebarTooltipAutoClose,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 7,
+                ),
+                margin: const EdgeInsets.symmetric(horizontal: 12),
+                decoration: BoxDecoration(
+                  color: const Color(0xF2202020),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.white24, width: 0.8),
+                  boxShadow: const [
+                    BoxShadow(
+                      color: Colors.black54,
+                      blurRadius: 8,
+                      offset: Offset(0, 3),
+                    ),
+                  ],
+                ),
+                textStyle: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  height: 1.35,
+                ),
                 child: InkWell(
                   borderRadius: BorderRadius.circular(10),
-                  onTap: () => _selectChannelTab(cid),
+                  onTap: () {
+                    _dismissSidebarTooltip();
+                    _selectChannelTab(cid);
+                  },
                   child: Container(
                     padding: const EdgeInsets.symmetric(
                       horizontal: 10,
@@ -6790,6 +6929,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             },
           ),
         ),
+      ),
       );
       if (fixedHeight != null) {
         return SizedBox(height: fixedHeight, child: listBlock);

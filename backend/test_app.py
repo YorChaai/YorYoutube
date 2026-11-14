@@ -1035,6 +1035,85 @@ def test_fallback_refresh_fails_closed_when_short_probe_errors(isolated_client, 
     assert "vid_short_err" not in ids
 
 
+def test_sync_device_data_reconciles_hidden_state_with_legacy_and_timestamps(isolated_client):
+    """Hide dari HP (baik timestamp lebih baru maupun legacy kosong) tidak boleh kalah oleh default Unhide kosong di Laptop."""
+    db.upsert_channel(channel_id="UC_luxxy", title="Luxxy Gaming", uploads_playlist_id="UU_luxxy")
+    db.upsert_channel(channel_id="UC_unhid_new", title="Explicit Unhid", uploads_playlist_id="UU_unhid_new")
+    db.set_channel_hidden("UC_unhid_new", False)  # sets non-empty hidden_updated_at
+
+    # 1. HP punya legacy pre-timestamp Hide ('') vs Laptop default Unhide ('') -> Hide menang
+    # 2. HP punya legacy pre-timestamp Hide ('') vs Laptop explicit Unhide (non-empty) -> Unhide baru di Laptop menang
+    # 3. HP punya timestamp Hide lebih baru terhadap channel baru/unhid -> Hide HP menang
+    db.upsert_channel(channel_id="UC_hid_new", title="Timestamped Hide", uploads_playlist_id="UU_hid_new")
+    res = isolated_client.post(
+        "/api/sync/exchange",
+        json={
+            "device": "hp",
+            "videos": [],
+            "channels": [
+                {
+                    "channel_id": "UC_luxxy",
+                    "title": "Luxxy Gaming",
+                    "is_hidden": 1,
+                    "hidden_updated_at": "",
+                    "updated_at": "2026-11-14T10:00:00Z",
+                },
+                {
+                    "channel_id": "UC_unhid_new",
+                    "title": "Explicit Unhid",
+                    "is_hidden": 1,
+                    "hidden_updated_at": "",
+                    "updated_at": "2026-11-14T10:00:00Z",
+                },
+                {
+                    "channel_id": "UC_hid_new",
+                    "title": "Timestamped Hide",
+                    "is_hidden": 1,
+                    "hidden_updated_at": "2099-01-01T00:00:00Z",
+                    "updated_at": "2099-01-01T00:00:00Z",
+                },
+            ],
+        },
+    )
+    assert res.status_code == 200
+    by_id = {c["channel_id"]: c for c in res.json()["channels"]}
+    assert by_id["UC_luxxy"]["is_hidden"] == 1
+    assert by_id["UC_unhid_new"]["is_hidden"] == 0
+    assert by_id["UC_hid_new"]["is_hidden"] == 1
+    assert by_id["UC_hid_new"]["hidden_updated_at"] == "2099-01-01T00:00:00Z"
+
+
+def test_usb_prepare_endpoint_sets_adb_reverse(isolated_client, monkeypatch):
+    """Endpoint /api/sync/usb-prepare menjalankan adb reverse tcp:8000 bila HP terhubung."""
+    import main as app_main
+
+    monkeypatch.setattr(app_main.shutil, "which", lambda name: "adb" if name == "adb" else None)
+
+    class _Proc:
+        def __init__(self, returncode=0, stdout=""):
+            self.returncode = returncode
+            self.stdout = stdout
+
+    calls = []
+
+    def _fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ["adb", "devices"]:
+            return _Proc(0, "List of devices attached\nSERIAL123\tdevice\n")
+        if cmd[:4] == ["adb", "-s", "SERIAL123", "reverse"]:
+            return _Proc(0, "")
+        return _Proc(1, "")
+
+    monkeypatch.setattr(app_main.subprocess, "run", _fake_run)
+    resp = isolated_client.post("/api/sync/usb-prepare")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["connected"] is True
+    assert body["reverse_ok"] is True
+    assert body["devices"] == ["SERIAL123"]
+    assert ["adb", "-s", "SERIAL123", "reverse", "tcp:8000", "tcp:8000"] in calls
+
+
 
 
 

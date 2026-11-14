@@ -1591,6 +1591,179 @@ void main() {
       );
     },
   );
+
+  testWidgets(
+    'Sync USB HP mempertahankan Hide dengan timestamp lebih baru & Desktop memanggil /api/sync/usb-prepare',
+    variant: const TargetPlatformVariant(<TargetPlatform>{TargetPlatform.windows}),
+    (WidgetTester tester) async {
+      // 1. Desktop (Windows): tombol Sync USB memanggil /api/sync/usb-prepare, bukan /api/sync/exchange ke diri sendiri
+      tester.view.physicalSize = const Size(1280, 800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      int prepareCalls = 0;
+      int exchangeCalls = 0;
+
+      Map<String, dynamic> handleDesktop(String method, Uri uri) {
+        if (uri.path == '/api/state') {
+          return {
+            'channels': [
+              {
+                'channel_id': 'UC_demo_fajrul',
+                'title': 'Fajrul Fx',
+                'handle': '@FajrulFx',
+                'thumbnail_url': '',
+                'watched_count': 0,
+                'views_hp': 0,
+                'views_laptop': 0,
+                'views_total': 0,
+                'is_hidden': 0,
+                'hidden_updated_at': '',
+              },
+            ],
+            'live_streams': [],
+            'has_api_key': false,
+            'session_state': {},
+            'refresh_state': {'running': false},
+          };
+        }
+        if (uri.path == '/api/videos') {
+          return {'items': [], 'total': 0, 'page': 1, 'total_pages': 1};
+        }
+        if (uri.path == '/api/sync/usb-prepare') {
+          prepareCalls++;
+          return {
+            'connected': true,
+            'devices': ['DEIVYTAMMJNJPR85'],
+            'reverse_ok': true,
+            'error': '',
+          };
+        }
+        if (uri.path == '/api/sync/exchange') {
+          exchangeCalls++;
+          return {'videos': [], 'channels': []};
+        }
+        return {'status': 'ok'};
+      }
+
+      await HttpOverrides.runZoned(
+        () async {
+          await tester.pumpWidget(const PersonalYouTubeApp());
+          await tester.pumpAndSettle();
+
+          await tester.tap(find.byTooltip('Sync HP (USB)'));
+          await tester.pump(const Duration(milliseconds: 250));
+          await tester.pumpAndSettle();
+
+          expect(prepareCalls, equals(1));
+          expect(exchangeCalls, equals(0));
+          expect(find.textContaining('port 8000 siap'), findsOneWidget);
+        },
+        createHttpClient: (_) => _TestBackendHttpClient(handleDesktop),
+      );
+
+      // 2. Unit verifikasi rekonsiliasi status Hide/Unhide saat Sync USB & Import JSON
+      // A: HP Hide (timestamp baru) vs Laptop Unhide kosong -> tetap Hide
+      final localWithTimestamp = <String, dynamic>{
+        'channel_id': 'UC_luxxy',
+        'is_hidden': 1,
+        'hidden_updated_at': '2026-11-14T16:50:00Z',
+      };
+      reconcileChannelHideState(localWithTimestamp, {
+        'channel_id': 'UC_luxxy',
+        'is_hidden': 0,
+        'hidden_updated_at': '',
+      });
+      expect(localWithTimestamp['is_hidden'], equals(1));
+      expect(
+        localWithTimestamp['hidden_updated_at'],
+        equals('2026-11-14T16:50:00Z'),
+      );
+
+      // B: HP Unhide (timestamp lama) vs Laptop Hide (timestamp baru) -> ikut Hide
+      final localFollowsRemoteHide = <String, dynamic>{
+        'channel_id': 'UC_malaka',
+        'is_hidden': 0,
+        'hidden_updated_at': '2026-11-14T10:00:00Z',
+      };
+      reconcileChannelHideState(localFollowsRemoteHide, {
+        'channel_id': 'UC_malaka',
+        'is_hidden': 1,
+        'hidden_updated_at': '2026-11-14T16:51:00Z',
+      });
+      expect(localFollowsRemoteHide['is_hidden'], equals(1));
+      expect(
+        localFollowsRemoteHide['hidden_updated_at'],
+        equals('2026-11-14T16:51:00Z'),
+      );
+
+      // C: Legacy kosong di kedua sisi -> Hide eksplisit dipertahankan vs Unhide default
+      final localLegacyUnhide = <String, dynamic>{
+        'channel_id': 'UC_legacy',
+        'is_hidden': 0,
+        'hidden_updated_at': '',
+      };
+      reconcileChannelHideState(localLegacyUnhide, {
+        'channel_id': 'UC_legacy',
+        'is_hidden': 1,
+        'hidden_updated_at': '',
+      });
+      expect(localLegacyUnhide['is_hidden'], equals(1));
+
+      // D: Explicit Unhide ber-timestamp mengalahkan legacy Hide kosong
+      final localLegacyHide = <String, dynamic>{
+        'channel_id': 'UC_legacy_unhide',
+        'is_hidden': 1,
+        'hidden_updated_at': '',
+      };
+      reconcileChannelHideState(localLegacyHide, {
+        'channel_id': 'UC_legacy_unhide',
+        'is_hidden': 0,
+        'hidden_updated_at': '2026-11-14T16:55:00Z',
+      });
+      expect(localLegacyHide['is_hidden'], equals(0));
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'Tooltip sidebar creator tertutup maksimal 5 detik dan langsung hilang saat sidebar di-scroll',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1280, 360);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      await tester.pumpWidget(const PersonalYouTubeApp());
+      await tester.pumpAndSettle();
+
+      // Long press item creator pertama di sidebar memunculkan tooltip info views
+      await tester.longPress(find.text('Fajrul Fx').first);
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Total: 0 view (📱 HP:'), findsOneWidget);
+
+      // Scroll sidebar ke bawah -> tooltip langsung hilang seketika
+      await tester.drag(
+        find.byKey(const Key('sidebar_fast_scrollbar')),
+        const Offset(0, 60),
+      );
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Total: 0 view (📱 HP:'), findsNothing);
+
+      // Kembalikan ke atas lalu munculkan lagi & biarkan selama 5 detik -> tooltip otomatis hilang
+      await tester.drag(
+        find.byKey(const Key('sidebar_fast_scrollbar')),
+        const Offset(0, -120),
+      );
+      await tester.pumpAndSettle();
+      await tester.longPress(find.text('Fajrul Fx').first);
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Total: 0 view (📱 HP:'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Total: 0 view (📱 HP:'), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
 }
 
 class _TestBackendHttpClient implements HttpClient {
