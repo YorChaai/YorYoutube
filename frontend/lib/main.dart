@@ -114,6 +114,8 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   String localOauthToken = '';
   String localMyChannelId = '';
   bool _bundledDataLoaded = false;
+  bool _exitDialogOpen = false;
+  bool _purgingShorts = false;
   final Set<String> _localUnsubscribedIds = {};
   final Set<String> _reloadingChannelIds = {};
 
@@ -1208,6 +1210,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     } catch (_) {}
     await _fetchVideos();
     _triggerAutoRefreshYouTube();
+    if (isStandaloneMode) {
+      unawaited(_maybeAutoPurgeStandaloneShorts());
+    }
   }
 
   bool _isLiveFlag(dynamic val) =>
@@ -5562,6 +5567,230 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     _selectChannelTab('');
   }
 
+  List<Map<String, dynamic>> _standaloneShortCandidates() {
+    return _localVideos.where((v) {
+      if (v['is_demo'] == 1) return false;
+      if (_isLiveFlag(v['is_live'])) return false;
+      if ((v['format_checked'] ?? 0) == 1) return false;
+      final dsec =
+          int.tryParse((v['duration_seconds'] ?? 0).toString()) ?? 0;
+      return dsec > 0 && dsec <= 185;
+    }).toList();
+  }
+
+  Future<void> _maybeAutoPurgeStandaloneShorts() async {
+    if (kIsWeb || _purgingShorts) return;
+    if (_standaloneShortCandidates().length <= 20) return;
+    await _purgeStandaloneShorts(showFeedback: false);
+  }
+
+  Future<int> _purgeStandaloneShorts({bool showFeedback = false}) async {
+    if (kIsWeb || _purgingShorts) return 0;
+    final candidates = _standaloneShortCandidates();
+    if (candidates.isEmpty) {
+      if (showFeedback && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            backgroundColor: Color(0xFF1B5E20),
+            content: Text('✅ Tidak ada video Shorts tersimpan — semua video reguler aman.'),
+          ),
+        );
+      }
+      return 0;
+    }
+
+    _purgingShorts = true;
+    var deletedTotal = 0;
+    final client = http.Client();
+    try {
+      const batchSize = 12;
+      final shortIds = <String>{};
+      for (var i = 0; i < candidates.length; i += batchSize) {
+        if (!mounted) break;
+        final slice = candidates.sublist(
+          i,
+          (i + batchSize > candidates.length) ? candidates.length : i + batchSize,
+        );
+        final results = await Future.wait(
+          slice.map((v) async {
+            final vid = (v['video_id'] ?? '').toString();
+            final isShort = await _isYoutubeShort(client, vid);
+            return MapEntry(v, isShort);
+          }),
+        );
+        for (final entry in results) {
+          final v = entry.key;
+          final vid = (v['video_id'] ?? '').toString();
+          if (entry.value) {
+            if (vid.isNotEmpty) shortIds.add(vid);
+          } else {
+            v['format_checked'] = 1;
+          }
+        }
+        if (shortIds.length >= 60) {
+          final beforeLen = _localVideos.length;
+          _localVideos.removeWhere(
+            (v) => shortIds.contains((v['video_id'] ?? '').toString()),
+          );
+          deletedTotal += (beforeLen - _localVideos.length).clamp(0, 999999);
+          shortIds.clear();
+          await _saveStandaloneData();
+          if (mounted) _applyLocalFilterAndPagination();
+        }
+      }
+      if (shortIds.isNotEmpty) {
+        final beforeLen = _localVideos.length;
+        _localVideos.removeWhere(
+          (v) => shortIds.contains((v['video_id'] ?? '').toString()),
+        );
+        deletedTotal += (beforeLen - _localVideos.length).clamp(0, 999999);
+      }
+      await _saveStandaloneData();
+      if (mounted) {
+        _applyLocalFilterAndPagination();
+        if (showFeedback) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              backgroundColor: const Color(0xFF1B5E20),
+              content: Text(
+                '✅ $deletedTotal video Shorts dibersihkan (video reguler < 1 menit tetap aman).',
+              ),
+            ),
+          );
+        }
+      }
+      return deletedTotal;
+    } finally {
+      _purgingShorts = false;
+      client.close();
+    }
+  }
+
+  Future<void> _triggerPurgeShortsAction() async {
+    if (isStandaloneMode) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('🧹 Mengecek format video & membersihkan Shorts...'),
+          ),
+        );
+      }
+      await _purgeStandaloneShorts(showFeedback: true);
+      return;
+    }
+    try {
+      final res = await http
+          .post(Uri.parse('$baseUrl/api/videos/purge-shorts?sync=true'))
+          .timeout(const Duration(minutes: 3));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final delCount = data['deleted'] ?? 0;
+        await _fetchVideos();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              backgroundColor: const Color(0xFF1B5E20),
+              content: Text(
+                '✅ $delCount video Shorts dibersihkan dari database (video reguler < 1 menit aman).',
+              ),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: Colors.redAccent,
+            content: Text('⚠️ Gagal membersihkan Shorts: $e'),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _handleSystemBackNavigation() async {
+    if (_scaffoldKey.currentState?.isDrawerOpen ?? false) {
+      _scaffoldKey.currentState?.closeDrawer();
+      return;
+    }
+    // Jika sedang membuka 1 creator tertentu, Back kembali ke Semua Follower
+    if (selectedChannelId.isNotEmpty) {
+      _selectChannelTab('');
+      return;
+    }
+    await _showExitConfirmDialog();
+  }
+
+  Future<void> _showExitConfirmDialog() async {
+    if (_exitDialogOpen || !mounted) return;
+    _exitDialogOpen = true;
+    try {
+      final shouldExit = await showDialog<bool>(
+        context: context,
+        barrierDismissible: true,
+        builder: (ctx) => AlertDialog(
+          key: const Key('exit_confirm_dialog'),
+          backgroundColor: const Color(0xFF212121),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+            side: const BorderSide(color: Color(0xFF333333)),
+          ),
+          titlePadding: const EdgeInsets.fromLTRB(20, 14, 10, 6),
+          title: Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  'Keluar Aplikasi?',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+              IconButton(
+                key: const Key('exit_dialog_close_btn'),
+                tooltip: 'Batal',
+                icon: const Icon(Icons.close, color: Colors.white70, size: 22),
+                onPressed: () => Navigator.of(ctx).pop(false),
+              ),
+            ],
+          ),
+          content: const Text(
+            'Apakah Anda ingin keluar dan menutup aplikasi Yor Follower?\n\n'
+            'Jika hanya ingin ke layar utama HP tanpa menutup aplikasi, tekan tombol Home.',
+            style: TextStyle(fontSize: 13.5, color: Colors.white70, height: 1.4),
+          ),
+          actions: [
+            TextButton(
+              key: const Key('exit_dialog_cancel_btn'),
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text(
+                'Batal',
+                style: TextStyle(color: Colors.white70),
+              ),
+            ),
+            ElevatedButton(
+              key: const Key('exit_dialog_confirm_btn'),
+              onPressed: () => Navigator.of(ctx).pop(true),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFFFF0033),
+                foregroundColor: Colors.white,
+              ),
+              child: const Text('Keluar'),
+            ),
+          ],
+        ),
+      );
+      if (shouldExit == true && mounted) {
+        await SystemNavigator.pop();
+      }
+    } finally {
+      _exitDialogOpen = false;
+    }
+  }
+
   void _scrollToTop() {
     if (!_videoScrollController.hasClients) return;
     _videoScrollController.animateTo(
@@ -5801,7 +6030,13 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final isMobile = screenWidth < 750;
     final isCompactHeader = screenWidth < 1150;
 
-    return Scaffold(
+    return PopScope<Object?>(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        _handleSystemBackNavigation();
+      },
+      child: Scaffold(
       key: _scaffoldKey,
       drawer: isMobile
           ? Drawer(
@@ -6014,6 +6249,15 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                         ),
                       ),
                       IconButton(
+                        tooltip: 'Bersihkan Video Shorts',
+                        onPressed: _triggerPurgeShortsAction,
+                        icon: const Icon(
+                          Icons.cleaning_services_outlined,
+                          size: 20,
+                          color: Colors.orangeAccent,
+                        ),
+                      ),
+                      IconButton(
                         tooltip: 'Pengaturan API & Sync',
                         onPressed: _showApiSettingsModal,
                         icon: Icon(
@@ -6038,6 +6282,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                         onSelected: (val) {
                           if (val == 'usb') _performDirectUsbSync();
                           if (val == 'add') _showAddChannelModal();
+                          if (val == 'purge_shorts') _triggerPurgeShortsAction();
                           if (val == 'csv') _exportExcelCsv();
                           if (val == 'export_sync') _exportSyncJson();
                           if (val == 'import_sync') _importSyncJson();
@@ -6067,6 +6312,12 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                               Icons.person_add_alt_1,
                               Colors.white,
                               'Tambah Channel',
+                            ),
+                            (
+                              'purge_shorts',
+                              Icons.cleaning_services_outlined,
+                              Colors.orangeAccent,
+                              'Bersihkan Video Shorts',
                             ),
                             (
                               'csv',
@@ -6157,6 +6408,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             child: const SizedBox.shrink(),
           ),
         ),
+      ),
       ),
     );
   }

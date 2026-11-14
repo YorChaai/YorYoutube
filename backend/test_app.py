@@ -866,5 +866,82 @@ def test_shorts_excluded_by_format_and_under_60s_regular_kept(isolated_client, m
     assert "vid_short_search" not in saved_ids
 
 
+def test_purge_existing_shorts_endpoint_preserves_regular_short_videos(isolated_client, monkeypatch):
+    """Pembersihan Shorts lama wajib menghapus Shorts (200 di /shorts) tetapi tetap mempertahankan video reguler < 1 menit (303)."""
+    import youtube_sync
+
+    db.upsert_channel(channel_id="UC_purge_test", title="Purge Creator", uploads_playlist_id="UU_purge_test")
+    db.upsert_videos(
+        [
+            {
+                "video_id": "vid_old_short_1",
+                "channel_id": "UC_purge_test",
+                "channel_title": "Purge Creator",
+                "channel_thumbnail": "",
+                "title": "Old Short 45s",
+                "thumbnail_url": "https://i.ytimg.com/vi/vid_old_short_1/hqdefault.jpg",
+                "published_at": "2026-11-10T10:00:00Z",
+                "view_count": 100,
+                "like_count": 10,
+                "duration": "0:45",
+                "duration_seconds": 45,
+                "is_demo": 0,
+                "is_live": 0,
+                "format_checked": 0,
+            },
+            {
+                "video_id": "vid_old_reg_under1m",
+                "channel_id": "UC_purge_test",
+                "channel_title": "Purge Creator",
+                "channel_thumbnail": "",
+                "title": "Regular 20s Video",
+                "thumbnail_url": "https://i.ytimg.com/vi/vid_old_reg_under1m/hqdefault.jpg",
+                "published_at": "2026-11-09T10:00:00Z",
+                "view_count": 200,
+                "like_count": 20,
+                "duration": "0:20",
+                "duration_seconds": 20,
+                "is_demo": 0,
+                "is_live": 0,
+                "format_checked": 0,
+            },
+        ]
+    )
+
+    class _HeadResp:
+        def __init__(self, status_code, url=""):
+            self.status_code = status_code
+            self.url = url
+
+    class _FakeHeadClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def head(self, url, follow_redirects=False):
+            if url.endswith("/shorts/vid_old_short_1"):
+                return _HeadResp(200, url=url)
+            return _HeadResp(303, url="https://www.youtube.com/watch?v=vid_old_reg_under1m")
+
+    monkeypatch.setattr(youtube_sync.httpx, "Client", _FakeHeadClient)
+    res = isolated_client.post("/api/videos/purge-shorts?sync=true")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["deleted"] == 1
+    assert body["kept_regular"] == 1
+
+    remaining_ids = {v["video_id"] for v in db.query_videos(channel_id="UC_purge_test", limit=50)["items"]}
+    assert "vid_old_short_1" not in remaining_ids
+    assert "vid_old_reg_under1m" in remaining_ids
+    # Re-running finds 0 unchecked candidates
+    assert db.list_unchecked_short_candidates() == []
+
+
+
 
 

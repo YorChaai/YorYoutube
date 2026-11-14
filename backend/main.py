@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 import csv
 import io
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -18,10 +19,60 @@ import db
 import youtube_sync
 
 
+SHORT_PURGE_STATE: dict = {
+    "running": False,
+    "checked": 0,
+    "total": 0,
+    "deleted": 0,
+    "done": False,
+    "error": "",
+}
+
+
+def _run_short_purge_bg() -> dict:
+    def _on_prog(checked: int, total: int, deleted: int) -> None:
+        with _STATE_LOCK:
+            SHORT_PURGE_STATE["checked"] = checked
+            SHORT_PURGE_STATE["total"] = total
+            SHORT_PURGE_STATE["deleted"] = deleted
+
+    try:
+        res = youtube_sync.purge_existing_shorts(on_progress=_on_prog)
+        if res.get("deleted", 0) > 0:
+            _sync_live_snapshot_in_place()
+        with _STATE_LOCK:
+            SHORT_PURGE_STATE["checked"] = res.get("checked", 0)
+            SHORT_PURGE_STATE["total"] = res.get("total", 0)
+            SHORT_PURGE_STATE["deleted"] = res.get("deleted", 0)
+            SHORT_PURGE_STATE["done"] = True
+            SHORT_PURGE_STATE["running"] = False
+            SHORT_PURGE_STATE["error"] = ""
+        return res
+    except Exception as e:
+        with _STATE_LOCK:
+            SHORT_PURGE_STATE["error"] = str(e)
+            SHORT_PURGE_STATE["running"] = False
+        return {"total": 0, "checked": 0, "deleted": 0, "kept_regular": 0}
+
+
+def _start_short_purge_bg() -> bool:
+    with _STATE_LOCK:
+        if SHORT_PURGE_STATE["running"]:
+            return False
+        SHORT_PURGE_STATE["running"] = True
+        SHORT_PURGE_STATE["done"] = False
+        SHORT_PURGE_STATE["error"] = ""
+    t = threading.Thread(target=_run_short_purge_bg, daemon=True)
+    t.start()
+    return True
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     db.init_db()
     db.seed_demo_if_empty()
+    if not os.environ.get("PYTEST_CURRENT_TEST") and db.list_unchecked_short_candidates():
+        _start_short_purge_bg()
     yield
 
 
@@ -586,6 +637,27 @@ def reload_single_channel(channel_id: str, payload: ChannelReloadPayload | None 
         raise HTTPException(status_code=502, detail=str(e))
     except (httpx.HTTPError, json.JSONDecodeError) as e:
         raise HTTPException(status_code=502, detail=f"Gagal menghubungi YouTube: {e}")
+
+
+@app.post("/api/videos/purge-shorts")
+def purge_shorts_endpoint(sync: bool = False) -> dict:
+    """Bersihkan video Shorts lama yang terlanjur tersimpan menggunakan cek format /shorts/{id}."""
+    if sync:
+        with _STATE_LOCK:
+            SHORT_PURGE_STATE["running"] = True
+            SHORT_PURGE_STATE["done"] = False
+            SHORT_PURGE_STATE["error"] = ""
+        res = _run_short_purge_bg()
+        return {"status": "ok", **res}
+    started = _start_short_purge_bg()
+    with _STATE_LOCK:
+        return {"status": "started" if started else "running", **SHORT_PURGE_STATE}
+
+
+@app.get("/api/videos/purge-shorts/status")
+def purge_shorts_status() -> dict:
+    with _STATE_LOCK:
+        return dict(SHORT_PURGE_STATE)
 
 
 @app.post("/api/videos/{video_id}/watch")

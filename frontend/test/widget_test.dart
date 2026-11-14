@@ -560,11 +560,12 @@ void main() {
       expect(searchRect.top, greaterThan(headerTitleRect.bottom));
       expect(filterInfoRectAfter.top, greaterThan(searchRect.bottom));
 
-      // Menu titik 3 tetap 6 item termasuk USB Sync
+      // Menu titik 3 berisi 7 item termasuk USB Sync & Bersihkan Video Shorts
       await tester.tap(find.byTooltip('Menu Lainnya'));
       await tester.pumpAndSettle();
-      expect(find.byType(PopupMenuItem<String>), findsNWidgets(6));
+      expect(find.byType(PopupMenuItem<String>), findsNWidgets(7));
       expect(find.textContaining('USB'), findsOneWidget);
+      expect(find.text('Bersihkan Video Shorts'), findsOneWidget);
       await tester.tapAt(const Offset(10, 400));
       await tester.pumpAndSettle();
 
@@ -1487,6 +1488,82 @@ void main() {
           await tester.pump(const Duration(milliseconds: 300));
 
           expect(reloadHits, equals(1));
+          expect(tester.takeException(), isNull);
+        },
+        createHttpClient: (_) => _TestBackendHttpClient(handleBackend),
+      );
+    },
+  );
+
+  testWidgets(
+    'Back from Creator returns to Semua Follower, and Back from Home shows Exit popup with top-right close button',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      final requestedChannelIds = <String>[];
+      Map<String, dynamic> handleBackend(String method, Uri uri) {
+        if (uri.path == '/api/state') {
+          return {
+            'status': 'ok',
+            'has_api_key': true,
+            'channels': [
+              {
+                'channel_id': 'UC_ferry',
+                'title': 'Ferry Irwandi',
+                'handle': '@FerryIrwandi',
+                'thumbnail_url': '',
+                'watched_count': 5,
+                'views_hp': 2,
+                'views_laptop': 3,
+                'views_total': 5,
+                'is_hidden': 0,
+              },
+            ],
+            'live_streams': [],
+            'session_state': {'channel_id': 'UC_ferry'},
+            'refresh_state': {'running': false},
+          };
+        }
+        if (uri.path == '/api/videos') {
+          requestedChannelIds.add(uri.queryParameters['channel_id'] ?? '');
+          return {
+            'items': [],
+            'total': 0,
+            'page': 1,
+            'total_pages': 1,
+          };
+        }
+        return {'status': 'ok'};
+      }
+
+      await HttpOverrides.runZoned(
+        () async {
+          await tester.pumpWidget(const PersonalYouTubeApp());
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+
+          // Initially inside Creator 'UC_ferry' -> Back must return to Semua Follower (''), NO exit dialog
+          expect(requestedChannelIds.last, equals('UC_ferry'));
+          await tester.binding.handlePopRoute();
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+          expect(requestedChannelIds.last, equals(''));
+          expect(find.byKey(const Key('exit_confirm_dialog')), findsNothing);
+
+          // Now at Semua Follower ('') -> Back opens Exit confirmation dialog
+          await tester.binding.handlePopRoute();
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+          expect(find.byKey(const Key('exit_confirm_dialog')), findsOneWidget);
+          expect(find.byKey(const Key('exit_dialog_close_btn')), findsOneWidget);
+          expect(find.byKey(const Key('exit_dialog_confirm_btn')), findsOneWidget);
+
+          // Tapping top-right X cancels and stays in app
+          await tester.tap(find.byKey(const Key('exit_dialog_close_btn')));
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+          expect(find.byKey(const Key('exit_confirm_dialog')), findsNothing);
           expect(tester.takeException(), isNull);
         },
         createHttpClient: (_) => _TestBackendHttpClient(handleBackend),

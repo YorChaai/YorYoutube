@@ -889,4 +889,78 @@ def search_and_cache_subscribed_videos(
         return 0
 
 
+def purge_existing_shorts(
+    on_progress: Callable[[int, int, int], None] | None = None,
+) -> dict:
+    """
+    Verifikasi dan hapus video Shorts lama yang sudah terlanjur tersimpan menggunakan endpoint format
+    HEAD /shorts/{id} (200 = Shorts -> hapus, 303 redirect = video reguler -> pertahankan).
+    Video reguler berdurasi < 1 menit TIDAK akan dihapus.
+    """
+    candidates = db.list_unchecked_short_candidates()
+    total = len(candidates)
+    if total == 0:
+        return {"total": 0, "checked": 0, "deleted": 0, "kept_regular": 0}
+
+    checked = 0
+    deleted = 0
+    kept_regular = 0
+    short_buf: list[str] = []
+    reg_buf: list[str] = []
+
+    limits = httpx.Limits(max_connections=60, max_keepalive_connections=40)
+    with httpx.Client(timeout=6.0, limits=limits, follow_redirects=False) as client:
+        head_fn = getattr(client, "head", None)
+
+        def _probe(vid: str) -> tuple[str, str]:
+            if not callable(head_fn):
+                return vid, "skip"
+            try:
+                try:
+                    r = head_fn(f"https://www.youtube.com/shorts/{vid}", follow_redirects=False)
+                except TypeError:
+                    r = head_fn(f"https://www.youtube.com/shorts/{vid}")
+                code = getattr(r, "status_code", 0)
+                if code in (301, 302, 303, 307, 308):
+                    return vid, "regular"
+                if code == 200:
+                    final_url = str(getattr(r, "url", "") or "")
+                    if final_url and "/watch" in final_url:
+                        return vid, "regular"
+                    return vid, "short"
+                if code == 404:
+                    return vid, "regular"
+            except Exception:
+                pass
+            return vid, "skip"
+
+        with ThreadPoolExecutor(max_workers=40) as pool:
+            futures = [pool.submit(_probe, vid) for vid in candidates]
+            for fut in as_completed(futures):
+                vid, kind = fut.result()
+                checked += 1
+                if kind == "short":
+                    short_buf.append(vid)
+                elif kind == "regular":
+                    reg_buf.append(vid)
+                    kept_regular += 1
+                if len(short_buf) + len(reg_buf) >= 200:
+                    deleted += db.apply_short_check_batch(short_buf, reg_buf)
+                    short_buf.clear()
+                    reg_buf.clear()
+                    if on_progress:
+                        on_progress(checked, total, deleted)
+
+    if short_buf or reg_buf:
+        deleted += db.apply_short_check_batch(short_buf, reg_buf)
+    if on_progress:
+        on_progress(checked, total, deleted)
+    return {
+        "total": total,
+        "checked": checked,
+        "deleted": deleted,
+        "kept_regular": kept_regular,
+    }
+
+
 

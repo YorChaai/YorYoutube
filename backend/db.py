@@ -97,6 +97,7 @@ def init_db() -> None:
             "ALTER TABLE videos ADD COLUMN views_total INTEGER GENERATED ALWAYS AS (COALESCE(views_hp, 0) + COALESCE(views_laptop, 0)) VIRTUAL",
             "ALTER TABLE videos ADD COLUMN updated_at TEXT DEFAULT ''",
             "ALTER TABLE videos ADD COLUMN is_live INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE videos ADD COLUMN format_checked INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 conn.execute(alter_sql)
@@ -284,6 +285,7 @@ def upsert_videos(videos: list[dict]) -> int:
             if not v.get("updated_at"):
                 v["updated_at"] = now_iso
             v["is_live"] = 1 if str(v.get("is_live", 0)).lower() in ("1", "true") else 0
+            v["format_checked"] = 1 if str(v.get("format_checked", 1)).lower() in ("1", "true") else 0
             filtered_videos.append(v)
 
         if not filtered_videos:
@@ -295,11 +297,11 @@ def upsert_videos(videos: list[dict]) -> int:
             INSERT INTO videos(
                 video_id, channel_id, channel_title, channel_thumbnail,
                 title, thumbnail_url, published_at, view_count, like_count,
-                duration, duration_seconds, is_demo, is_live, updated_at
+                duration, duration_seconds, is_demo, is_live, format_checked, updated_at
             ) VALUES (
                 :video_id, :channel_id, :channel_title, :channel_thumbnail,
                 :title, :thumbnail_url, :published_at, :view_count, :like_count,
-                :duration, :duration_seconds, :is_demo, :is_live, :updated_at
+                :duration, :duration_seconds, :is_demo, :is_live, :format_checked, :updated_at
             )
             ON CONFLICT(video_id) DO UPDATE SET
                 title=excluded.title,
@@ -310,7 +312,8 @@ def upsert_videos(videos: list[dict]) -> int:
                 duration_seconds=excluded.duration_seconds,
                 channel_title=excluded.channel_title,
                 channel_thumbnail=excluded.channel_thumbnail,
-                is_live=excluded.is_live
+                is_live=excluded.is_live,
+                format_checked=MAX(COALESCE(videos.format_checked, 0), excluded.format_checked)
             """,
             filtered_videos,
         )
@@ -328,6 +331,42 @@ def mark_videos_not_live(video_ids: list[str]) -> int:
             clean_ids,
         )
         return cur.rowcount or 0
+
+
+def list_unchecked_short_candidates() -> list[str]:
+    """Kandidat video lama <= 185 detik (batas maksimal Shorts = 3 menit) yang belum diverifikasi formatnya."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT video_id
+            FROM videos
+            WHERE COALESCE(format_checked, 0) = 0
+              AND COALESCE(is_demo, 0) = 0
+              AND COALESCE(is_live, 0) = 0
+              AND duration_seconds > 0
+              AND duration_seconds <= 185
+            ORDER BY published_at DESC
+            """
+        ).fetchall()
+        return [r["video_id"] for r in rows]
+
+
+def apply_short_check_batch(short_ids: list[str], regular_ids: list[str]) -> int:
+    """Hapus video Shorts yang terkonfirmasi dan tandai video reguler sebagai terverifikasi."""
+    clean_shorts = [vid for vid in short_ids if vid]
+    clean_regular = [vid for vid in regular_ids if vid]
+    deleted = 0
+    with get_conn() as conn:
+        for i in range(0, len(clean_shorts), 400):
+            chunk = clean_shorts[i : i + 400]
+            ph = ",".join("?" for _ in chunk)
+            cur = conn.execute(f"DELETE FROM videos WHERE video_id IN ({ph})", chunk)
+            deleted += cur.rowcount or 0
+        for i in range(0, len(clean_regular), 400):
+            chunk = clean_regular[i : i + 400]
+            ph = ",".join("?" for _ in chunk)
+            conn.execute(f"UPDATE videos SET format_checked = 1 WHERE video_id IN ({ph})", chunk)
+    return deleted
 
 
 def list_live_videos(hide_filter: str = "both", channel_id: str = "") -> list[dict]:
