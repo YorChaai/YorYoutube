@@ -2134,6 +2134,162 @@ void main() {
       );
     },
   );
+
+  testWidgets(
+    'Live Streaming follows creator watch count descending on Dashboard & Sidebar without displaying view count badge',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      final channelsPayload = [
+        {
+          'channel_id': 'UC_bean',
+          'title': 'Classic Mr Bean',
+          'thumbnail_url': '',
+          'video_count': 1,
+          'watched_count': 3,
+          'views_total': 3,
+          'views_hp': 3,
+          'views_laptop': 0,
+          'is_hidden': 0,
+          'status': 'subscribed',
+        },
+        {
+          'channel_id': 'UC_agus',
+          'title': 'Agusleo Halim',
+          'thumbnail_url': '',
+          'video_count': 1,
+          'watched_count': 1,
+          'views_total': 1,
+          'views_hp': 1,
+          'views_laptop': 0,
+          'is_hidden': 0,
+          'status': 'subscribed',
+        },
+      ];
+      final livePayload = [
+        {
+          'video_id': 'live_bean_1',
+          'channel_id': 'UC_bean',
+          'channel_title': 'Classic Mr Bean',
+          'channel_thumbnail': '',
+          'title': 'Mr Bean Live Stream',
+          'thumbnail_url': '',
+          'published_at': '2026-11-16T06:00:00Z',
+          'is_live': 1,
+          'watched_count': 3,
+        },
+        {
+          'video_id': 'live_agus_1',
+          'channel_id': 'UC_agus',
+          'channel_title': 'Agusleo Halim',
+          'channel_thumbnail': '',
+          'title': 'Agusleo Live QnA',
+          'thumbnail_url': '',
+          'published_at': '2026-11-16T07:00:00Z',
+          'is_live': 1,
+          'watched_count': 1,
+        },
+      ];
+      final videosPayload = [
+        {
+          'video_id': 'vid_agus_regular',
+          'channel_id': 'UC_agus',
+          'channel_title': 'Agusleo Halim',
+          'channel_thumbnail': '',
+          'title': 'Video Agusleo Halim',
+          'thumbnail_url': '',
+          'published_at': '2026-11-16T05:00:00Z',
+          'view_count': 1000,
+          'like_count': 50,
+          'duration': '10:00',
+          'duration_seconds': 600,
+          'watched_count': 1,
+          'views_total': 1,
+          'views_hp': 1,
+          'views_laptop': 0,
+          'is_live': 0,
+        },
+      ];
+
+      await HttpOverrides.runZoned(
+        () async {
+          await tester.pumpWidget(const PersonalYouTubeApp());
+          await tester.pumpAndSettle();
+
+          // Buka panel Live Streaming di Dashboard & Sidebar
+          await tester.tap(find.byKey(const Key('main_live_toggle')));
+          await tester.tap(find.byKey(const Key('sidebar_live_toggle')));
+          await tester.pumpAndSettle();
+
+          // Awal: Classic Mr Bean (3) di urutan pertama kiri & atas dibanding Agusleo (1)
+          final mainBean0 = tester.getTopLeft(find.byKey(const Key('main_live_item_UC_bean')));
+          final mainAgus0 = tester.getTopLeft(find.byKey(const Key('main_live_item_UC_agus')));
+          expect(mainBean0.dx, lessThan(mainAgus0.dx));
+
+          final sideBean0 = tester.getTopLeft(find.byKey(const Key('sidebar_live_item_UC_bean')));
+          final sideAgus0 = tester.getTopLeft(find.byKey(const Key('sidebar_live_item_UC_agus')));
+          expect(sideBean0.dy, lessThan(sideAgus0.dy));
+
+          // Pastikan tidak ada angka jumlah tonton ('3') di dalam kartu Live Streaming
+          expect(
+            find.descendant(
+              of: find.byKey(const Key('sidebar_live_item_UC_bean')),
+              matching: find.text('3'),
+            ),
+            findsNothing,
+          );
+          expect(
+            find.descendant(
+              of: find.byKey(const Key('main_live_item_UC_bean')),
+              matching: find.text('3'),
+            ),
+            findsNothing,
+          );
+
+          // Tonton video Agusleo Halim 3x -> total Agusleo jadi 4 (> Classic Mr Bean 3)
+          for (var i = 0; i < 3; i++) {
+            await tester.tap(find.text('Video Agusleo Halim'));
+            await tester.pumpAndSettle();
+          }
+
+          // Sekarang Agusleo Halim otomatis pindah ke kiri / paling atas di Live Streaming!
+          final mainAgus1 = tester.getTopLeft(find.byKey(const Key('main_live_item_UC_agus')));
+          final mainBean1 = tester.getTopLeft(find.byKey(const Key('main_live_item_UC_bean')));
+          expect(mainAgus1.dx, lessThan(mainBean1.dx));
+
+          final sideAgus1 = tester.getTopLeft(find.byKey(const Key('sidebar_live_item_UC_agus')));
+          final sideBean1 = tester.getTopLeft(find.byKey(const Key('sidebar_live_item_UC_bean')));
+          expect(sideAgus1.dy, lessThan(sideBean1.dy));
+        },
+        createHttpClient: (_) => _TestBackendHttpClient((method, uri) {
+          if (uri.path == '/api/state') {
+            return {
+              'status': 'ok',
+              'channels': channelsPayload,
+              'live_streams': livePayload,
+              'has_api_key': false,
+              'api_key_preview': '',
+              'has_oauth_token': false,
+              'session_state': {'hide_filter': 'unhide', 'sidebar_mode': 'full'},
+              'refresh_state': {'running': false, 'progress': 0, 'done_ready': false, 'new_videos': 0},
+            };
+          }
+          if (uri.path == '/api/videos') {
+            return {
+              'items': videosPayload,
+              'total': 1,
+              'page': 1,
+              'limit': 50,
+              'total_pages': 1,
+              'live_streams': livePayload,
+            };
+          }
+          return {'status': 'ok'};
+        }),
+      );
+    },
+  );
 }
 
 class _TestBackendHttpClient implements HttpClient {

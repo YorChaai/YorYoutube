@@ -1,17 +1,17 @@
 # Graph Report - youtube  (2026-11-16)
 
 ## Corpus Check
-- 30 files · ~132,239 words
+- 30 files · ~132,802 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 29 file(s) not represented in the graph (top: .xml 7, (none) 6, .bat 6)
 
 ## Summary
-- 789 nodes · 1178 edges · 49 communities (22 shown, 27 thin omitted)
+- 790 nodes · 1179 edges · 49 communities (22 shown, 27 thin omitted)
 - Extraction: 98% EXTRACTED · 2% INFERRED · 0% AMBIGUOUS · INFERRED: 26 edges (avg confidence: 0.85)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `aba8ef29`
+- Built from commit: `ff5fd163`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -90,7 +90,7 @@
 
 ### Community 0 - "Flutter App UI Core"
 Cohesion: 0.01
-Nodes (268): accentColor, activeBgColor, _activeDayFocusListener, _activeDurationThumb, apiKeyPreview, _applyLocalFilterAndPagination, _applyPeriodChoice, _applySyncDataString (+260 more)
+Nodes (269): accentColor, activeBgColor, _activeDayFocusListener, _activeDurationThumb, apiKeyPreview, _applyLocalFilterAndPagination, _applyPeriodChoice, _applySyncDataString (+261 more)
 
 ### Community 2 - "SQLite DB & Sync Logic"
 Cohesion: 0.04
@@ -113,7 +113,7 @@ Cohesion: 0.14
 Nodes (13): 1. Banner & Navigasi Modul, 2. Teks Narasi Lengkap (Penulisan Ulang Utuh & Mengalir), 3. Poin-Poin Analisis Mendalam & Terstruktur, 4. Prosedur, Visualisasi Alur, & Diagram Logika, 5. Toolkit Aksi, Template Siap Pakai, & Glosarium, 🏛️ ARSITEKTUR ISI SETIAP MODUL (STRUKTUR 5 PILAR ADAPTIF), Informasi tambahan yang tersirat dalam teks (OPSIONAL, pisahkan dari hasil utama, dan WAJIB tetap berbasis kutipan jika digunakan), MASTER PROMPT 2.0: TRANSFORMASI NASKAH & REKONSTRUKSI MODULAR DINAMIS (+5 more)
 
 ### Community 7 - "main.py"
-Cohesion: 0.13
+Cohesion: 0.12
 Nodes (4): disable_frontend_cache(), _extract_yt_video_id(), get_video_transcript(), prepare_usb_sync_bridge()
 
 ### Community 8 - "Win32 Window Lifecycle"
@@ -177,8 +177,8 @@ Cohesion: 0.50
 Nodes (3): Cara Menjalankan, Fitur Utama, Yorpersonal YouTube Subscriptions Hub
 
 ## Knowledge Gaps
-- **306 isolated node(s):** `s`, `inTrim`, `exTrim`, `inDt`, `exDt` (+301 more)
-  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 536 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+- **307 isolated node(s):** `s`, `inTrim`, `exTrim`, `inDt`, `exDt` (+302 more)
+  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 537 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
 - **27 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
@@ -187,9 +187,9 @@ _Questions this graph is uniquely positioned to answer:_
 - **Why does `upsert_channel()` connect `db.py` to `youtube_sync.py`, `test_sync_channel_videos_custom_range_cap_100_and_preserves_old`, `test_live_streaming_detection_and_refresh_cleanup`, `test_live_uulv_xml_parses_real_updated_tag_and_zero_duration_transition`, `get_setting`, `import_channels_csv`, `test_refresh_falls_back_to_web_tabs_when_rss_returns_404`, `test_search_and_cache_marks_failed_short_probe_unchecked`, `test_shorts_excluded_by_format_and_under_60s_regular_kept`, `test_fallback_refresh_fails_closed_when_short_probe_errors`?**
   _High betweenness centrality (0.017) - this node is a cross-community bridge._
 - **What connects `s`, `inTrim`, `exTrim` to the rest of the system?**
-  _306 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _307 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `Flutter App UI Core` be split into smaller, more focused modules?**
-  _Cohesion score 0.006734006734006734 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.006711409395973154 - nodes in this community are weakly interconnected._
 - **Why does `lifespan()` connect `db.py` to `3. Urutan Pengujian Lintas Tool (General Checklist)`, `Android Root Gradle Build`, `main.py`?**
   _High betweenness centrality (0.014) - this node is a cross-community bridge._
 - **Should `SQLite DB & Sync Logic` be split into smaller, more focused modules?**
@@ -197,4 +197,4 @@ _Questions this graph is uniquely positioned to answer:_
 - **Why does `Win32Window` connect `Frontend Docs Stub` to `Flutter Windows Host View`, `Win32 Window Lifecycle`, `Custom Dialogs & Hold Menus`, `YouTube Handle Metadata`, `Android Gradle Settings`?**
   _High betweenness centrality (0.013) - this node is a cross-community bridge._
 - **Should `db.py` be split into smaller, more focused modules?**
-  _Cohesion score 0.058445353594389245 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.06140350877192982 - nodes in this community are weakly interconnected._

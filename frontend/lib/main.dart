@@ -1130,11 +1130,9 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           break;
         }
       }
-      final wc = int.tryParse(
-            (chMeta?['views_total'] ?? chMeta?['watched_count'] ?? 0)
-                .toString(),
-          ) ??
-          0;
+      final wc = chMeta != null
+          ? _channelWatchCount(chMeta)
+          : _channelWatchCount(v);
       final candidate = {
         ...v,
         'channel_title':
@@ -1157,12 +1155,17 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     }
     localLive.addAll(liveBestByCid.values);
     localLive.sort((a, b) {
-      final wa = int.tryParse((a['watched_count'] ?? 0).toString()) ?? 0;
-      final wb = int.tryParse((b['watched_count'] ?? 0).toString()) ?? 0;
+      final wa = _channelWatchCount(a);
+      final wb = _channelWatchCount(b);
       if (wb != wa) return wb.compareTo(wa);
-      return (b['published_at'] ?? '').toString().compareTo(
+      final pubCmp = (b['published_at'] ?? '').toString().compareTo(
             (a['published_at'] ?? '').toString(),
           );
+      if (pubCmp != 0) return pubCmp;
+      return (a['channel_title'] ?? '')
+          .toString()
+          .toLowerCase()
+          .compareTo((b['channel_title'] ?? '').toString().toLowerCase());
     });
 
     setState(() {
@@ -1293,14 +1296,26 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   bool _isLiveFlag(dynamic val) =>
       val == 1 || val == true || val?.toString() == '1';
 
+  int _channelWatchCount(Map<String, dynamic> obj) {
+    final vt = int.tryParse((obj['views_total'] ?? 0).toString()) ?? 0;
+    final wc = int.tryParse((obj['watched_count'] ?? 0).toString()) ?? 0;
+    final hp = int.tryParse((obj['views_hp'] ?? 0).toString()) ?? 0;
+    final lap = int.tryParse((obj['views_laptop'] ?? 0).toString()) ?? 0;
+    var best = vt > wc ? vt : wc;
+    if (hp + lap > best) best = hp + lap;
+    return best;
+  }
+
   List<Map<String, dynamic>> _visibleLiveStreams({
     bool ignoreSelectedChannel = false,
   }) {
     final hiddenMap = <String, bool>{};
+    final watchMap = <String, int>{};
     final unfollowedSet = <String>{..._localUnsubscribedIds};
     for (final c in channels) {
       final cid = (c['channel_id'] ?? '').toString();
       hiddenMap[cid] = _isHiddenFlag(c['is_hidden']);
+      watchMap[cid] = _channelWatchCount(c);
       if ((c['status'] ?? 'subscribed') == 'unfollowed') {
         unfollowedSet.add(cid);
       }
@@ -1323,6 +1338,23 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       seenCids.add(cid);
       result.add(item);
     }
+    result.sort((a, b) {
+      final ca = (a['channel_id'] ?? '').toString();
+      final cb = (b['channel_id'] ?? '').toString();
+      final ia = _channelWatchCount(a);
+      final ib = _channelWatchCount(b);
+      final wa = (watchMap[ca] ?? 0) > ia ? (watchMap[ca] ?? 0) : ia;
+      final wb = (watchMap[cb] ?? 0) > ib ? (watchMap[cb] ?? 0) : ib;
+      if (wb != wa) return wb.compareTo(wa);
+      final pubCmp = (b['published_at'] ?? '').toString().compareTo(
+            (a['published_at'] ?? '').toString(),
+          );
+      if (pubCmp != 0) return pubCmp;
+      return (a['channel_title'] ?? '')
+          .toString()
+          .toLowerCase()
+          .compareTo((b['channel_title'] ?? '').toString().toLowerCase());
+    });
     return result;
   }
 
@@ -3396,8 +3428,8 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
 
   void _sortChannelsByWatchedDesc(List<Map<String, dynamic>> list) {
     list.sort((a, b) {
-      final wa = int.tryParse((a['watched_count'] ?? 0).toString()) ?? 0;
-      final wb = int.tryParse((b['watched_count'] ?? 0).toString()) ?? 0;
+      final wa = _channelWatchCount(a);
+      final wb = _channelWatchCount(b);
       if (wb != wa) return wb.compareTo(wa);
       final ta = (a['title'] ?? '').toString().toLowerCase();
       final tb = (b['title'] ?? '').toString().toLowerCase();
@@ -3408,11 +3440,11 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
   int _getCreatorWatchedCount(String channelId, [Map<String, dynamic>? v]) {
     for (final c in channels) {
       if ((c['channel_id'] ?? '').toString() == channelId) {
-        return int.tryParse((c['watched_count'] ?? 0).toString()) ?? 0;
+        return _channelWatchCount(c);
       }
     }
     if (v != null) {
-      return int.tryParse((v['watched_count'] ?? 0).toString()) ?? 0;
+      return _channelWatchCount(v);
     }
     return 0;
   }

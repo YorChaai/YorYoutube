@@ -391,11 +391,11 @@ def list_live_videos(hide_filter: str = "both", channel_id: str = "") -> list[di
                    COALESCE(c.is_hidden, 0) AS channel_is_hidden,
                    COALESCE(c.views_hp, 0) AS channel_views_hp,
                    COALESCE(c.views_laptop, 0) AS channel_views_laptop,
-                   COALESCE(c.views_total, c.watched_count, 0) AS watched_count
+                   MAX(COALESCE(c.views_total, 0), COALESCE(c.watched_count, 0)) AS watched_count
             FROM videos v
             JOIN channels c ON c.channel_id = v.channel_id
             WHERE {where_sql}
-            ORDER BY COALESCE(c.views_total, c.watched_count, 0) DESC, v.published_at DESC
+            ORDER BY MAX(COALESCE(c.views_total, 0), COALESCE(c.watched_count, 0)) DESC, v.published_at DESC, c.title COLLATE NOCASE ASC
             """,
             params,
         ).fetchall()
