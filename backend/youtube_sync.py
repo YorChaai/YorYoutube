@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
+import threading
 import time
 from typing import Callable
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,11 @@ import httpx
 import db
 
 YT_API_BASE = "https://www.googleapis.com/youtube/v3"
+_WEB_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cookie": "SOCS=CAI",
+}
 
 
 def parse_iso_duration(iso_dur: str) -> str:
@@ -412,6 +418,194 @@ def _rss_playlist_has_entries(client: httpx.Client, playlist_id: str) -> bool:
         return False
 
 
+def _extract_yt_initial_data(html: str) -> dict | None:
+    """Ekstrak objek JSON ytInitialData dari halaman tab channel YouTube."""
+    if not html:
+        return None
+    decoder = json.JSONDecoder()
+    for marker in ('var ytInitialData', 'window["ytInitialData"]', "window['ytInitialData']"):
+        pos = html.find(marker)
+        while pos != -1:
+            brace = html.find("{", pos)
+            if brace == -1:
+                break
+            try:
+                obj, _ = decoder.raw_decode(html, brace)
+                if isinstance(obj, dict) and "contents" in obj:
+                    return obj
+            except Exception:
+                pass
+            pos = html.find(marker, pos + len(marker))
+    return None
+
+
+def _extract_web_tab_videos(
+    html: str,
+    expected_suffix: str,
+    limit: int = 15,
+) -> tuple[list[tuple[str, bool]], bool, bool]:
+    """
+    Parse daftar video dari tab /videos atau /streams halaman channel YouTube (0 kuota API).
+    Mengembalikan ([(video_id, is_live_hint), ...], has_streams_tab, parse_ok).
+    """
+    data = _extract_yt_initial_data(html)
+    if not data:
+        return [], False, False
+    tabs = (
+        data.get("contents", {})
+        .get("twoColumnBrowseResultsRenderer", {})
+        .get("tabs", [])
+    )
+    if not isinstance(tabs, list) or not tabs:
+        return [], False, False
+
+    has_streams_tab = False
+    selected_tr: dict | None = None
+    for tab in tabs:
+        if not isinstance(tab, dict):
+            continue
+        tr = tab.get("tabRenderer")
+        if not isinstance(tr, dict):
+            continue
+        url = (
+            tr.get("endpoint", {})
+            .get("commandMetadata", {})
+            .get("webCommandMetadata", {})
+            .get("url", "")
+        ) or ""
+        if url.endswith("/streams"):
+            has_streams_tab = True
+        if tr.get("selected") and url.endswith(expected_suffix):
+            selected_tr = tr
+
+    if selected_tr is None:
+        return [], has_streams_tab, True
+
+    content_root = selected_tr.get("content", {})
+    raw_items: list = []
+    if isinstance(content_root, dict):
+        grid = content_root.get("richGridRenderer", {}).get("contents")
+        if isinstance(grid, list):
+            raw_items = grid
+        else:
+            for sec in content_root.get("sectionListRenderer", {}).get("contents", []) or []:
+                for sub in (sec.get("itemSectionRenderer", {}) or {}).get("contents", []) or []:
+                    g_items = (sub.get("gridRenderer", {}) or {}).get("items")
+                    if isinstance(g_items, list):
+                        raw_items.extend(g_items)
+
+    results: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    for entry in raw_items:
+        if not isinstance(entry, dict):
+            continue
+        item = entry.get("richItemRenderer", {}).get("content", entry)
+        if not isinstance(item, dict):
+            continue
+        if "reelItemRenderer" in item or "shortsLockupViewModel" in item:
+            continue
+
+        vid = ""
+        is_live_hint = False
+        vr = item.get("videoRenderer")
+        if isinstance(vr, dict):
+            vid = str(vr.get("videoId") or "").strip()
+            for b in vr.get("badges", []) or []:
+                if (b.get("metadataBadgeRenderer", {}) or {}).get("style") == "BADGE_STYLE_TYPE_LIVE_NOW":
+                    is_live_hint = True
+                    break
+            if not is_live_hint:
+                for ov in vr.get("thumbnailOverlays", []) or []:
+                    if (ov.get("thumbnailOverlayTimeStatusRenderer", {}) or {}).get("style") == "LIVE":
+                        is_live_hint = True
+                        break
+        else:
+            lv = item.get("lockupViewModel")
+            if isinstance(lv, dict):
+                if lv.get("contentType") == "LOCKUP_CONTENT_TYPE_SHORT":
+                    continue
+                vid = str(lv.get("contentId") or "").strip()
+                overlays = (
+                    lv.get("contentImage", {})
+                    .get("thumbnailViewModel", {})
+                    .get("overlays", [])
+                ) or []
+                for ov in overlays:
+                    for b in (ov.get("thumbnailBottomOverlayViewModel", {}) or {}).get("badges", []) or []:
+                        bv = b.get("thumbnailBadgeViewModel", {}) or {}
+                        if bv.get("badgeStyle") == "THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE" or str(bv.get("text") or "").upper() == "LIVE":
+                            is_live_hint = True
+                            break
+                    if is_live_hint:
+                        break
+
+        if vid and vid not in seen:
+            seen.add(vid)
+            results.append((vid, is_live_hint))
+            if len(results) >= limit:
+                break
+
+    return results, has_streams_tab, True
+
+
+def _fetch_web_tab_videos(
+    client: httpx.Client,
+    channel_id: str,
+    tab_suffix: str,
+    limit: int = 15,
+) -> tuple[list[tuple[str, bool]], bool, bool]:
+    url = f"https://www.youtube.com/channel/{channel_id}{tab_suffix}"
+    for attempt in range(2):
+        try:
+            r = client.get(url, headers=_WEB_HEADERS)
+            if r.status_code == 200:
+                return _extract_web_tab_videos(getattr(r, "text", "") or "", tab_suffix, limit=limit)
+            if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                time.sleep(0.2)
+                continue
+            return [], False, False
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.2)
+    return [], False, False
+
+
+def _fetch_playlist_items_ids(
+    client: httpx.Client,
+    playlist_id: str,
+    params: dict,
+    headers: dict,
+    max_results: int = 15,
+) -> tuple[list[str], int, bool]:
+    """Ambil ID video terbaru dari playlistItems API (1 kuota/channel). Return (vids, status_code, quota_exceeded)."""
+    if not playlist_id or (not params and not headers):
+        return [], 0, False
+    try:
+        r = client.get(
+            f"{YT_API_BASE}/playlistItems",
+            params={
+                **params,
+                "part": "contentDetails",
+                "playlistId": playlist_id,
+                "maxResults": max_results,
+            },
+            headers=headers,
+        )
+        data = _safe_json(r)
+        if r.status_code == 200 and "error" not in data:
+            vids = []
+            for it in data.get("items", []) or []:
+                vid = (it.get("contentDetails", {}) or {}).get("videoId", "")
+                if vid:
+                    vids.append(str(vid).strip())
+            return vids, 200, False
+        err_str = json.dumps(data).lower()
+        quota_hit = r.status_code == 403 and "quota" in err_str
+        return [], r.status_code, quota_hit
+    except Exception:
+        return [], 0, False
+
+
 def _parse_sync_bound(date_str: str, is_end: bool = False) -> datetime | None:
     raw = (date_str or "").strip()
     if not raw:
@@ -675,48 +869,111 @@ def refresh_all_channels_comprehensive(
     upd_tag_re = re.compile(r"<updated>([^<]+)</updated>")
     pub_tag_re = re.compile(r"<published>([^<]+)</published>")
 
-    # Cek 15 item RSS terbaru + feed live UULV untuk seluruh channel sekaligus via pool 40 worker & keep-alive connection
+    # Cek 15 item terbaru tiap channel (prioritas: RSS -> Web tab /videos & /streams -> playlistItems API fallback)
     vid_to_cid: dict[str, str] = {}
     fallback_vids: set[str] = set()
     uulv_vids: set[str] = set()
+    rss_lock = threading.Lock()
+    rss_state = {"ok": 0, "fail": 0, "dead": False, "quota_exceeded": False, "ok_channels": 0}
     limits = httpx.Limits(max_connections=60, max_keepalive_connections=40)
-    with httpx.Client(timeout=6.0, limits=limits, follow_redirects=True) as rss_client:
+    with httpx.Client(timeout=8.0, limits=limits, follow_redirects=True) as rss_client:
         def _fetch_rss(url: str) -> str:
-            for attempt in range(3):
+            with rss_lock:
+                if rss_state["dead"]:
+                    return ""
+            for attempt in range(2):
                 try:
                     r = rss_client.get(url)
                     if r.status_code == 200:
-                        return r.text
-                    if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
-                        time.sleep(0.2 * (attempt + 1))
+                        with rss_lock:
+                            rss_state["ok"] += 1
+                            rss_state["dead"] = False
+                        return getattr(r, "text", "") or ""
+                    if r.status_code == 404:
+                        with rss_lock:
+                            rss_state["fail"] += 1
+                            if rss_state["ok"] == 0 and rss_state["fail"] >= 12:
+                                rss_state["dead"] = True
+                        return ""
+                    if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                        time.sleep(0.15)
                         continue
+                    with rss_lock:
+                        rss_state["fail"] += 1
+                        if rss_state["ok"] == 0 and rss_state["fail"] >= 12:
+                            rss_state["dead"] = True
                     return ""
                 except Exception:
-                    if attempt < 2:
-                        time.sleep(0.2 * (attempt + 1))
+                    if attempt == 0:
+                        time.sleep(0.15)
+            with rss_lock:
+                rss_state["fail"] += 1
+                if rss_state["ok"] == 0 and rss_state["fail"] >= 12:
+                    rss_state["dead"] = True
             return ""
 
-        def _check_channel(ch: dict) -> list[tuple[str, str, bool, bool]]:
+        def _check_channel(ch: dict) -> tuple[list[tuple[str, str, bool, bool]], bool]:
             cid = ch["channel_id"]
             found: list[tuple[str, str, bool, bool]] = []
             seen_local: set[str] = set()
+            channel_ok = False
             uulf_pid = _youtube_longform_playlist_id(cid)
             xml_main = _fetch_rss(f"https://www.youtube.com/feeds/videos.xml?playlist_id={uulf_pid}") if uulf_pid else ""
             used_channel_fallback = False
             if not xml_main:
                 xml_main = _fetch_rss(f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}")
-                used_channel_fallback = True
+                if xml_main:
+                    used_channel_fallback = True
             if xml_main:
+                channel_ok = True
                 for v in vid_tag_re.findall(xml_main):
                     v = v.strip()
-                    if v and v not in known_old_vids and v not in seen_local:
+                    if v and (v not in known_old_vids or v in zero_dur_vids) and v not in seen_local:
                         if used_channel_fallback and _probe_short_kind(v, rss_client) == "short":
                             continue
                         seen_local.add(v)
                         found.append((v, cid, used_channel_fallback, False))
+
+            has_streams_tab = False
+            if not xml_main and cid.startswith("UC"):
+                web_vids, has_streams_tab, web_ok = _fetch_web_tab_videos(rss_client, cid, "/videos")
+                if web_ok:
+                    channel_ok = True
+                    for v, _ in web_vids:
+                        if v and (v not in known_old_vids or v in zero_dur_vids) and v not in seen_local:
+                            seen_local.add(v)
+                            found.append((v, cid, False, False))
+                else:
+                    with rss_lock:
+                        q_dead = rss_state["quota_exceeded"]
+                    if not q_dead:
+                        api_vids, st_code, q_hit = (
+                            _fetch_playlist_items_ids(rss_client, uulf_pid, params, headers)
+                            if uulf_pid
+                            else ([], 404, False)
+                        )
+                        used_uu_fb = False
+                        if st_code == 404 and not q_hit and len(cid) > 2:
+                            api_vids, st_code, q_hit = _fetch_playlist_items_ids(
+                                rss_client, f"UU{cid[2:]}", params, headers
+                            )
+                            used_uu_fb = st_code == 200
+                        if q_hit:
+                            with rss_lock:
+                                rss_state["quota_exceeded"] = True
+                        if st_code == 200:
+                            channel_ok = True
+                            for v in api_vids:
+                                if v and (v not in known_old_vids or v in zero_dur_vids) and v not in seen_local:
+                                    if used_uu_fb and _probe_short_kind(v, rss_client) == "short":
+                                        continue
+                                    seen_local.add(v)
+                                    found.append((v, cid, used_uu_fb, False))
+
             if cid.startswith("UC") and len(cid) > 2:
                 xml_live = _fetch_rss(f"https://www.youtube.com/feeds/videos.xml?playlist_id=UULV{cid[2:]}")
                 if xml_live:
+                    channel_ok = True
                     blocks = entry_block_re.findall(xml_live)
                     for block in blocks:
                         vm = vid_tag_re.search(block)
@@ -733,15 +990,31 @@ def refresh_all_channels_comprehensive(
                         ):
                             seen_local.add(v)
                             found.append((v, cid, False, True))
-            return found
+                elif has_streams_tab or any(lcid == cid for lcid in existing_live_map.values()):
+                    stream_vids, _, stream_ok = _fetch_web_tab_videos(rss_client, cid, "/streams")
+                    if stream_ok:
+                        channel_ok = True
+                        for v, is_live_hint in stream_vids:
+                            if v and v not in seen_local and (
+                                is_live_hint
+                                or v not in known_old_vids
+                                or v in zero_dur_vids
+                                or v in existing_live_map
+                            ):
+                                seen_local.add(v)
+                                found.append((v, cid, False, True))
+            return found, channel_ok
 
-        with ThreadPoolExecutor(max_workers=40) as pool:
+        with ThreadPoolExecutor(max_workers=25) as pool:
             futures = [pool.submit(_check_channel, ch) for ch in real_chs]
             for fut in as_completed(futures):
                 done_count += 1
                 if on_progress and (done_count % 10 == 0 or done_count == total_chs):
                     on_progress(done_count, total_chs)
-                for vid, cid, is_fb, is_uulv in fut.result():
+                items, ch_ok = fut.result()
+                if ch_ok:
+                    rss_state["ok_channels"] += 1
+                for vid, cid, is_fb, is_uulv in items:
                     vid_to_cid[vid] = cid
                     if is_fb:
                         fallback_vids.add(vid)
@@ -752,6 +1025,8 @@ def refresh_all_channels_comprehensive(
         vid_to_cid.setdefault(lvid, lcid)
 
     if not vid_to_cid:
+        if total_chs > 0 and rss_state["ok_channels"] == 0 and not existing_live_map:
+            raise RuntimeError("Gagal mengambil feed YouTube terbaru dari semua channel (RSS/Web/API gagal).")
         return 0
 
     still_live_vids: set[str] = set()

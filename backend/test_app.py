@@ -1230,6 +1230,167 @@ def test_background_refresh_counts_hidden_channel_new_videos(isolated_client, mo
     assert app_main.REFRESH_STATE["done_ready"] is True
 
 
+def test_refresh_falls_back_to_web_tabs_when_rss_returns_404(isolated_client, monkeypatch):
+    """Jika RSS feeds/videos.xml mengembalikan 404, refresh otomatis mengambil video baru dari tab /videos & /streams (ytInitialData)."""
+    import json as _json
+    import youtube_sync
+
+    db.set_setting("api_key", "FAKE_KEY")
+    db.upsert_channel(
+        channel_id="UC_web_1",
+        title="Web Fallback Creator",
+        handle="@webcreator",
+        uploads_playlist_id="UU_web_1",
+    )
+
+    videos_tab_data = {
+        "contents": {
+            "twoColumnBrowseResultsRenderer": {
+                "tabs": [
+                    {
+                        "tabRenderer": {
+                            "selected": True,
+                            "endpoint": {"commandMetadata": {"webCommandMetadata": {"url": "/@webcreator/videos"}}},
+                            "content": {
+                                "richGridRenderer": {
+                                    "contents": [
+                                        {
+                                            "richItemRenderer": {
+                                                "content": {
+                                                    "lockupViewModel": {
+                                                        "contentId": "vid_web_new_1",
+                                                        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        {
+                                            "richItemRenderer": {
+                                                "content": {
+                                                    "reelItemRenderer": {"videoId": "vid_web_short_skip"}
+                                                }
+                                            }
+                                        },
+                                    ]
+                                }
+                            },
+                        }
+                    },
+                    {
+                        "tabRenderer": {
+                            "selected": False,
+                            "endpoint": {"commandMetadata": {"webCommandMetadata": {"url": "/@webcreator/streams"}}},
+                        }
+                    },
+                ]
+            }
+        }
+    }
+    streams_tab_data = {
+        "contents": {
+            "twoColumnBrowseResultsRenderer": {
+                "tabs": [
+                    {
+                        "tabRenderer": {
+                            "selected": True,
+                            "endpoint": {"commandMetadata": {"webCommandMetadata": {"url": "/@webcreator/streams"}}},
+                            "content": {
+                                "richGridRenderer": {
+                                    "contents": [
+                                        {
+                                            "richItemRenderer": {
+                                                "content": {
+                                                    "videoRenderer": {"videoId": "vid_web_stream_1"}
+                                                }
+                                            }
+                                        }
+                                    ]
+                                }
+                            },
+                        }
+                    }
+                ]
+            }
+        }
+    }
+    videos_html = f"<html><script>var ytInitialData = {_json.dumps(videos_tab_data)};</script></html>"
+    streams_html = f"<html><script>var ytInitialData = {_json.dumps(streams_tab_data)};</script></html>"
+
+    class _Resp:
+        def __init__(self, status_code, text="", payload=None):
+            self.status_code = status_code
+            self.text = text
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def head(self, url, follow_redirects=False):
+            return _Resp(303)
+
+        def get(self, url, params=None, headers=None):
+            u = str(url)
+            if "feeds/videos.xml" in u:
+                return _Resp(404)
+            if u == "https://www.youtube.com/channel/UC_web_1/videos":
+                return _Resp(200, text=videos_html)
+            if u == "https://www.youtube.com/channel/UC_web_1/streams":
+                return _Resp(200, text=streams_html)
+            if u.endswith("/videos"):
+                return _Resp(
+                    200,
+                    payload={
+                        "items": [
+                            {
+                                "id": "vid_web_new_1",
+                                "snippet": {
+                                    "channelId": "UC_web_1",
+                                    "channelTitle": "Web Fallback Creator",
+                                    "title": "Video Baru Hari Ini",
+                                    "publishedAt": "2026-11-16T06:00:00Z",
+                                    "liveBroadcastContent": "none",
+                                    "thumbnails": {},
+                                },
+                                "statistics": {"viewCount": "500", "likeCount": "40"},
+                                "contentDetails": {"duration": "PT15M"},
+                            },
+                            {
+                                "id": "vid_web_stream_1",
+                                "snippet": {
+                                    "channelId": "UC_web_1",
+                                    "channelTitle": "Web Fallback Creator",
+                                    "title": "Stream VOD Hari Ini",
+                                    "publishedAt": "2026-11-16T07:00:00Z",
+                                    "liveBroadcastContent": "none",
+                                    "thumbnails": {},
+                                },
+                                "statistics": {"viewCount": "800", "likeCount": "90"},
+                                "contentDetails": {"duration": "PT2H10M"},
+                            },
+                        ]
+                    },
+                )
+            return _Resp(404)
+
+    monkeypatch.setattr(youtube_sync.httpx, "Client", _FakeClient)
+    added = youtube_sync.refresh_all_channels_comprehensive(db.list_channels(), api_key="FAKE_KEY")
+    assert added == 2
+    res = db.query_videos(limit=50, page=1)
+    ids = [v["video_id"] for v in res["items"]]
+    assert ids[:2] == ["vid_web_stream_1", "vid_web_new_1"]
+    assert "vid_web_short_skip" not in ids
+
+
 
 
 

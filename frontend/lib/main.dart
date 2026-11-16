@@ -778,13 +778,15 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
 
   Future<void> _saveStandaloneData() async {
     if (!_isHpDevice) return;
+    final channelsSnapshot = List<Map<String, dynamic>>.from(_localChannels);
+    final videosSnapshot = List<Map<String, dynamic>>.from(_localVideos);
     try {
       final db = await _openStandaloneDatabase();
       await db.transaction((txn) async {
         await txn.delete('channels');
         await txn.delete('videos');
         final channelBatch = txn.batch();
-        for (final channel in _localChannels) {
+        for (final channel in channelsSnapshot) {
           final cid = (channel['channel_id'] ?? '').toString();
           if (cid.isEmpty) continue;
           channelBatch.insert('channels', {
@@ -794,7 +796,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
         }
         await channelBatch.commit(noResult: true);
         final videoBatch = txn.batch();
-        for (final video in _localVideos) {
+        for (final video in videosSnapshot) {
           final vid = (video['video_id'] ?? '').toString();
           if (vid.isEmpty) continue;
           videoBatch.insert('videos', {
@@ -1533,10 +1535,12 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           }
           return selectedChannelId.isEmpty || cid == selectedChannelId;
         }).toList();
-        await _standaloneFastRefreshChannels(targetChs);
-        unawaited(_maybeAutoPurgeStandaloneShorts());
+        final insertedVids = await _standaloneFastRefreshChannels(targetChs);
         await _saveStandaloneData();
-        final newVids = (_localVideos.length - beforeCount).clamp(0, 999999);
+        unawaited(_maybeAutoPurgeStandaloneShorts());
+        final newVids = insertedVids > 0
+            ? insertedVids
+            : (_localVideos.length - beforeCount).clamp(0, 999999);
         if (!mounted) return;
         setState(() {
           refreshingYouTube = false;
@@ -1857,10 +1861,259 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     return (await _probeYoutubeShortKind(client, videoId)) == 'short';
   }
 
-  Future<void> _standaloneFastRefreshChannels(
+  static const Map<String, String> _ytWebHeaders = {
+    'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cookie': 'SOCS=CAI',
+  };
+
+  Map<String, dynamic>? _extractYtInitialData(String html) {
+    if (html.isEmpty) return null;
+    for (final marker in const [
+      'var ytInitialData',
+      'window["ytInitialData"]',
+      "window['ytInitialData']",
+    ]) {
+      var searchFrom = 0;
+      while (true) {
+        final pos = html.indexOf(marker, searchFrom);
+        if (pos < 0) break;
+        final start = html.indexOf('{', pos);
+        if (start < 0) break;
+        var depth = 0;
+        var inStr = false;
+        var escaped = false;
+        var end = -1;
+        for (var i = start; i < html.length; i++) {
+          final code = html.codeUnitAt(i);
+          if (inStr) {
+            if (escaped) {
+              escaped = false;
+            } else if (code == 92) {
+              escaped = true;
+            } else if (code == 34) {
+              inStr = false;
+            }
+          } else {
+            if (code == 34) {
+              inStr = true;
+            } else if (code == 123) {
+              depth++;
+            } else if (code == 125) {
+              depth--;
+              if (depth == 0) {
+                end = i;
+                break;
+              }
+            }
+          }
+        }
+        if (end > start) {
+          try {
+            final decoded = jsonDecode(html.substring(start, end + 1));
+            if (decoded is Map<String, dynamic> &&
+                decoded.containsKey('contents')) {
+              return decoded;
+            }
+          } catch (_) {}
+        }
+        searchFrom = pos + marker.length;
+      }
+    }
+    return null;
+  }
+
+  ({List<(String vid, bool isLiveHint)> items, bool hasStreamsTab, bool ok})
+      _extractWebTabVideos(String html, String expectedSuffix, {int limit = 15}) {
+    final data = _extractYtInitialData(html);
+    if (data == null) {
+      return (items: const [], hasStreamsTab: false, ok: false);
+    }
+    final tabs = (data['contents']?['twoColumnBrowseResultsRenderer']?['tabs']
+            as List?) ??
+        const [];
+    if (tabs.isEmpty) {
+      return (items: const [], hasStreamsTab: false, ok: false);
+    }
+
+    var hasStreamsTab = false;
+    Map? selectedTr;
+    for (final tab in tabs) {
+      if (tab is! Map) continue;
+      final tr = tab['tabRenderer'];
+      if (tr is! Map) continue;
+      final url = (tr['endpoint']?['commandMetadata']?['webCommandMetadata']
+                  ?['url'] ??
+              '')
+          .toString();
+      if (url.endsWith('/streams')) {
+        hasStreamsTab = true;
+      }
+      if (tr['selected'] == true && url.endsWith(expectedSuffix)) {
+        selectedTr = tr;
+      }
+    }
+    if (selectedTr == null) {
+      return (items: const [], hasStreamsTab: hasStreamsTab, ok: true);
+    }
+
+    final rawItems = <dynamic>[];
+    final contentRoot = selectedTr['content'];
+    if (contentRoot is Map) {
+      final grid = contentRoot['richGridRenderer']?['contents'];
+      if (grid is List) {
+        rawItems.addAll(grid);
+      } else {
+        final secs = (contentRoot['sectionListRenderer']?['contents'] as List?) ??
+            const [];
+        for (final sec in secs) {
+          if (sec is! Map) continue;
+          final subs =
+              (sec['itemSectionRenderer']?['contents'] as List?) ?? const [];
+          for (final sub in subs) {
+            if (sub is! Map) continue;
+            final gItems = sub['gridRenderer']?['items'];
+            if (gItems is List) rawItems.addAll(gItems);
+          }
+        }
+      }
+    }
+
+    final results = <(String, bool)>[];
+    final seen = <String>{};
+    for (final entry in rawItems) {
+      if (entry is! Map) continue;
+      final item = entry['richItemRenderer']?['content'] ?? entry;
+      if (item is! Map) continue;
+      if (item.containsKey('reelItemRenderer') ||
+          item.containsKey('shortsLockupViewModel')) {
+        continue;
+      }
+      var vid = '';
+      var isLiveHint = false;
+      final vr = item['videoRenderer'];
+      if (vr is Map) {
+        vid = (vr['videoId'] ?? '').toString().trim();
+        for (final b in (vr['badges'] as List?) ?? const []) {
+          if (b is Map &&
+              b['metadataBadgeRenderer']?['style'] ==
+                  'BADGE_STYLE_TYPE_LIVE_NOW') {
+            isLiveHint = true;
+            break;
+          }
+        }
+        if (!isLiveHint) {
+          for (final ov in (vr['thumbnailOverlays'] as List?) ?? const []) {
+            if (ov is Map &&
+                ov['thumbnailOverlayTimeStatusRenderer']?['style'] == 'LIVE') {
+              isLiveHint = true;
+              break;
+            }
+          }
+        }
+      } else {
+        final lv = item['lockupViewModel'];
+        if (lv is Map) {
+          if (lv['contentType'] == 'LOCKUP_CONTENT_TYPE_SHORT') continue;
+          vid = (lv['contentId'] ?? '').toString().trim();
+          final overlays = (lv['contentImage']?['thumbnailViewModel']
+                  ?['overlays'] as List?) ??
+              const [];
+          for (final ov in overlays) {
+            if (ov is! Map) continue;
+            final badges = (ov['thumbnailBottomOverlayViewModel']?['badges']
+                    as List?) ??
+                const [];
+            for (final b in badges) {
+              if (b is! Map) continue;
+              final bv = b['thumbnailBadgeViewModel'];
+              if (bv is Map &&
+                  (bv['badgeStyle'] == 'THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE' ||
+                      (bv['text'] ?? '').toString().toUpperCase() == 'LIVE')) {
+                isLiveHint = true;
+                break;
+              }
+            }
+            if (isLiveHint) break;
+          }
+        }
+      }
+      if (vid.isNotEmpty && seen.add(vid)) {
+        results.add((vid, isLiveHint));
+        if (results.length >= limit) break;
+      }
+    }
+    return (items: results, hasStreamsTab: hasStreamsTab, ok: true);
+  }
+
+  Future<({List<(String vid, bool isLiveHint)> items, bool hasStreamsTab, bool ok})>
+      _fetchStandaloneWebTabVideos(
+    http.Client client,
+    String cid,
+    String tabSuffix,
+  ) async {
+    final uri = Uri.parse('https://www.youtube.com/channel/$cid$tabSuffix');
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        final res = await client
+            .get(uri, headers: _ytWebHeaders)
+            .timeout(const Duration(seconds: 10));
+        if (res.statusCode == 200) {
+          return _extractWebTabVideos(res.body, tabSuffix);
+        }
+        if ((res.statusCode == 429 || res.statusCode >= 500) && attempt == 0) {
+          await Future.delayed(const Duration(milliseconds: 200));
+          continue;
+        }
+        return (items: const <(String, bool)>[], hasStreamsTab: false, ok: false);
+      } catch (_) {
+        if (attempt == 0) {
+          await Future.delayed(const Duration(milliseconds: 200));
+        }
+      }
+    }
+    return (items: const <(String, bool)>[], hasStreamsTab: false, ok: false);
+  }
+
+  Future<({List<String> vids, int statusCode, bool quotaExceeded})>
+      _fetchStandalonePlaylistItemIds(
+    http.Client client,
+    String playlistId,
+  ) async {
+    if (playlistId.isEmpty || localApiKey.isEmpty) {
+      return (vids: const <String>[], statusCode: 0, quotaExceeded: false);
+    }
+    try {
+      final uri = Uri.https('www.googleapis.com', '/youtube/v3/playlistItems', {
+        'part': 'contentDetails',
+        'playlistId': playlistId,
+        'maxResults': '15',
+        'key': localApiKey,
+      });
+      final res = await client.get(uri).timeout(const Duration(seconds: 10));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final items = (data['items'] as List?) ?? const [];
+        final vids = <String>[];
+        for (final it in items) {
+          final vid = (it['contentDetails']?['videoId'] ?? '').toString().trim();
+          if (vid.isNotEmpty) vids.add(vid);
+        }
+        return (vids: vids, statusCode: 200, quotaExceeded: false);
+      }
+      final bodyLower = res.body.toLowerCase();
+      final qHit = res.statusCode == 403 && bodyLower.contains('quota');
+      return (vids: const <String>[], statusCode: res.statusCode, quotaExceeded: qHit);
+    } catch (_) {
+      return (vids: const <String>[], statusCode: 0, quotaExceeded: false);
+    }
+  }
+
+  Future<int> _standaloneFastRefreshChannels(
     List<Map<String, dynamic>> targetChs,
   ) async {
-    if (targetChs.isEmpty) return;
+    if (targetChs.isEmpty) return 0;
     final targetCids = targetChs
         .map((c) => (c['channel_id'] ?? '').toString())
         .where((c) => c.isNotEmpty)
@@ -1878,6 +2131,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final zeroDurVidIds = <String>{};
     final existingVidIds = <String>{};
     final existingLiveIds = <String>{};
+    final existingLiveCids = <String>{};
     final chMetaMap = <String, Map<String, String>>{};
     for (final ch in targetChs) {
       final cid = (ch['channel_id'] ?? '').toString();
@@ -1908,6 +2162,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       }
       if (isLive && targetCids.contains(vCid)) {
         existingLiveIds.add(vid);
+        existingLiveCids.add(vCid);
         newVidMeta[vid] = chMetaMap[vCid] ?? {'channel_id': vCid};
       }
     }
@@ -1920,34 +2175,51 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     final client = http.Client();
     final fallbackVidIds = <String>{};
     final uulvVidIds = <String>{};
+    var newlyInsertedCount = 0;
     try {
       var nextIdx = 0;
       var doneCount = 0;
-      final concurrency = targetChs.length < 18 ? targetChs.length : 18;
+      var rssOkCount = 0;
+      var rssFailCount = 0;
+      var rssDead = false;
+      var quotaExceeded = false;
+      var okChannels = 0;
+      final maxConc = kIsWeb ? 18 : 12;
+      final concurrency = targetChs.length < maxConc ? targetChs.length : maxConc;
 
       Future<String?> fetchRss(Uri uri) async {
-        for (var attempt = 0; attempt < 3; attempt++) {
+        if (rssDead) return null;
+        for (var attempt = 0; attempt < 2; attempt++) {
           try {
             final res = await client
                 .get(uri)
                 .timeout(const Duration(seconds: 6));
-            if (res.statusCode == 200) return res.body;
+            if (res.statusCode == 200) {
+              rssOkCount++;
+              rssDead = false;
+              return res.body;
+            }
+            if (res.statusCode == 404) {
+              rssFailCount++;
+              if (rssOkCount == 0 && rssFailCount >= 12) rssDead = true;
+              return null;
+            }
             if ((res.statusCode == 429 || res.statusCode >= 500) &&
-                attempt < 2) {
-              await Future.delayed(
-                Duration(milliseconds: 250 * (attempt + 1)),
-              );
+                attempt == 0) {
+              await Future.delayed(const Duration(milliseconds: 200));
               continue;
             }
+            rssFailCount++;
+            if (rssOkCount == 0 && rssFailCount >= 12) rssDead = true;
             return null;
           } catch (_) {
-            if (attempt < 2) {
-              await Future.delayed(
-                Duration(milliseconds: 250 * (attempt + 1)),
-              );
+            if (attempt == 0) {
+              await Future.delayed(const Duration(milliseconds: 200));
             }
           }
         }
+        rssFailCount++;
+        if (rssOkCount == 0 && rssFailCount >= 12) rssDead = true;
         return null;
       }
 
@@ -1956,6 +2228,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
           if (nextIdx >= targetChs.length) return;
           final ch = targetChs[nextIdx++];
           final cid = (ch['channel_id'] ?? '').toString();
+          var channelOk = false;
           if (cid.startsWith('UC')) {
             final meta = {
               'channel_id': cid,
@@ -1972,17 +2245,22 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                   )
                 : null;
             if (mainXml == null) {
-              usedChannelFallback = true;
               mainXml = await fetchRss(
                 Uri.parse(
                   'https://www.youtube.com/feeds/videos.xml?channel_id=$cid',
                 ),
               );
+              if (mainXml != null) {
+                usedChannelFallback = true;
+              }
             }
             if (mainXml != null) {
+              channelOk = true;
               for (final m in vidRegex.allMatches(mainXml)) {
                 final vid = (m.group(1) ?? '').trim();
-                if (vid.isNotEmpty && !knownOldVidIds.contains(vid)) {
+                if (vid.isNotEmpty &&
+                    (!knownOldVidIds.contains(vid) ||
+                        zeroDurVidIds.contains(vid))) {
                   if (usedChannelFallback) {
                     final kind = await _probeYoutubeShortKind(client, vid);
                     if (kind == 'short') continue;
@@ -1992,6 +2270,65 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                 }
               }
             }
+
+            var hasStreamsTab = false;
+            if (mainXml == null) {
+              var webOk = false;
+              if (!kIsWeb) {
+                final webRes = await _fetchStandaloneWebTabVideos(
+                  client,
+                  cid,
+                  '/videos',
+                );
+                hasStreamsTab = webRes.hasStreamsTab;
+                webOk = webRes.ok;
+                if (webOk) {
+                  channelOk = true;
+                  for (final entry in webRes.items) {
+                    final vid = entry.$1;
+                    if (vid.isNotEmpty &&
+                        (!knownOldVidIds.contains(vid) ||
+                            zeroDurVidIds.contains(vid))) {
+                      newVidMeta[vid] = meta;
+                    }
+                  }
+                }
+              }
+              if (!webOk && !quotaExceeded) {
+                var apiRes = uulfPid.isNotEmpty
+                    ? await _fetchStandalonePlaylistItemIds(client, uulfPid)
+                    : (vids: const <String>[], statusCode: 404, quotaExceeded: false);
+                var usedUuFallback = false;
+                if (apiRes.statusCode == 404 &&
+                    !apiRes.quotaExceeded &&
+                    cid.length > 2) {
+                  apiRes = await _fetchStandalonePlaylistItemIds(
+                    client,
+                    'UU${cid.substring(2)}',
+                  );
+                  usedUuFallback = apiRes.statusCode == 200;
+                }
+                if (apiRes.quotaExceeded) {
+                  quotaExceeded = true;
+                }
+                if (apiRes.statusCode == 200) {
+                  channelOk = true;
+                  for (final vid in apiRes.vids) {
+                    if (vid.isNotEmpty &&
+                        (!knownOldVidIds.contains(vid) ||
+                            zeroDurVidIds.contains(vid))) {
+                      if (usedUuFallback && !kIsWeb) {
+                        final kind = await _probeYoutubeShortKind(client, vid);
+                        if (kind == 'short') continue;
+                        fallbackVidIds.add(vid);
+                      }
+                      newVidMeta[vid] = meta;
+                    }
+                  }
+                }
+              }
+            }
+
             if (cid.length > 2) {
               final uulv = 'UULV${cid.substring(2)}';
               final liveXml = await fetchRss(
@@ -2000,6 +2337,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                 ),
               );
               if (liveXml != null) {
+                channelOk = true;
                 for (final blockMatch in entryBlockRegex.allMatches(liveXml)) {
                   final block = blockMatch.group(1) ?? '';
                   final vid = (vidRegex.firstMatch(block)?.group(1) ?? '')
@@ -2020,9 +2358,32 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
                     newVidMeta[vid] = meta;
                   }
                 }
+              } else if (!kIsWeb &&
+                  (hasStreamsTab || existingLiveCids.contains(cid))) {
+                final streamRes = await _fetchStandaloneWebTabVideos(
+                  client,
+                  cid,
+                  '/streams',
+                );
+                if (streamRes.ok) {
+                  channelOk = true;
+                  for (final entry in streamRes.items) {
+                    final vid = entry.$1;
+                    final isLiveHint = entry.$2;
+                    if (vid.isNotEmpty &&
+                        (isLiveHint ||
+                            !knownOldVidIds.contains(vid) ||
+                            zeroDurVidIds.contains(vid) ||
+                            existingLiveIds.contains(vid))) {
+                      uulvVidIds.add(vid);
+                      newVidMeta[vid] = meta;
+                    }
+                  }
+                }
               }
             }
           }
+          if (channelOk) okChannels++;
           doneCount++;
           if (mounted &&
               (doneCount % 15 == 0 || doneCount == targetChs.length)) {
@@ -2037,6 +2398,15 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
       }
 
       await Future.wait(List.generate(concurrency, (_) => worker()));
+
+      if (targetChs.isNotEmpty &&
+          newVidMeta.isEmpty &&
+          okChannels == 0 &&
+          existingLiveIds.isEmpty) {
+        throw Exception(
+          'Gagal mengambil feed YouTube terbaru. Periksa koneksi internet atau API Key.',
+        );
+      }
 
       final stillLiveIds = <String>{};
       final checkedIds = <String>{};
@@ -2169,6 +2539,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
             }
             if (existingVidIds.contains(vid)) continue;
             existingVidIds.add(vid);
+            newlyInsertedCount++;
             _localVideos.insert(0, {
               'video_id': vid,
               'channel_id': cid,
@@ -2218,6 +2589,7 @@ class _YouTubeHomeScreenState extends State<YouTubeHomeScreen> {
     } finally {
       client.close();
     }
+    return newlyInsertedCount;
   }
 
   // Fungsi Mandiri (Standalone di HP) untuk langsung memanggil API YouTube tanpa Backend Python

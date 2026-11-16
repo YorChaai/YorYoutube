@@ -1861,6 +1861,279 @@ void main() {
       });
     },
   );
+
+  testWidgets(
+    'Standalone Refresh falls back to /videos and /streams ytInitialData when RSS returns 404',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1280, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      const cid = 'UC_web_fallback_1';
+      var showNewOnWeb = false;
+      final videosHtmlBefore = '''
+<html><script>var ytInitialData = ${jsonEncode({
+        'contents': {
+          'twoColumnBrowseResultsRenderer': {
+            'tabs': [
+              {
+                'tabRenderer': {
+                  'selected': true,
+                  'endpoint': {
+                    'commandMetadata': {
+                      'webCommandMetadata': {'url': '/@webdemo/videos'},
+                    },
+                  },
+                  'content': {
+                    'richGridRenderer': {
+                      'contents': [
+                        {
+                          'richItemRenderer': {
+                            'content': {
+                              'lockupViewModel': {
+                                'contentId': 'vid_web_old',
+                                'contentType': 'LOCKUP_CONTENT_TYPE_VIDEO',
+                              },
+                            },
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      })};</script></html>''';
+      final videosHtmlAfter = '''
+<html><script>var ytInitialData = ${jsonEncode({
+        'contents': {
+          'twoColumnBrowseResultsRenderer': {
+            'tabs': [
+              {
+                'tabRenderer': {
+                  'selected': true,
+                  'endpoint': {
+                    'commandMetadata': {
+                      'webCommandMetadata': {'url': '/@webdemo/videos'},
+                    },
+                  },
+                  'content': {
+                    'richGridRenderer': {
+                      'contents': [
+                        {
+                          'richItemRenderer': {
+                            'content': {
+                              'lockupViewModel': {
+                                'contentId': 'vid_web_fresh',
+                                'contentType': 'LOCKUP_CONTENT_TYPE_VIDEO',
+                              },
+                            },
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+              {
+                'tabRenderer': {
+                  'selected': false,
+                  'endpoint': {
+                    'commandMetadata': {
+                      'webCommandMetadata': {'url': '/@webdemo/streams'},
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      })};</script></html>''';
+      final streamsHtmlAfter = '''
+<html><script>var ytInitialData = ${jsonEncode({
+        'contents': {
+          'twoColumnBrowseResultsRenderer': {
+            'tabs': [
+              {
+                'tabRenderer': {
+                  'selected': true,
+                  'endpoint': {
+                    'commandMetadata': {
+                      'webCommandMetadata': {'url': '/@webdemo/streams'},
+                    },
+                  },
+                  'content': {
+                    'richGridRenderer': {
+                      'contents': [
+                        {
+                          'richItemRenderer': {
+                            'content': {
+                              'videoRenderer': {'videoId': 'vid_stream_fresh'},
+                            },
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      })};</script></html>''';
+
+      ({int statusCode, String body})? handleRaw(String method, Uri uri) {
+        final host = uri.host;
+        final path = uri.path;
+        if (host == '127.0.0.1' || host.startsWith('192.168.') || host.startsWith('172.')) {
+          return null;
+        }
+        if (host == 'www.googleapis.com' && path == '/youtube/v3/channels') {
+          return (
+            statusCode: 200,
+            body: jsonEncode({
+              'items': [
+                {
+                  'id': cid,
+                  'snippet': {
+                    'title': 'Web Demo Creator',
+                    'customUrl': '@webdemo',
+                    'thumbnails': {'default': {'url': ''}},
+                  },
+                  'contentDetails': {
+                    'relatedPlaylists': {'uploads': 'UU_web_fallback_1'},
+                  },
+                },
+              ],
+            }),
+          );
+        }
+        if (host == 'www.googleapis.com' && path == '/youtube/v3/playlistItems') {
+          return (
+            statusCode: 200,
+            body: jsonEncode({
+              'items': [
+                {
+                  'contentDetails': {'videoId': 'vid_web_old'},
+                },
+              ],
+            }),
+          );
+        }
+        if (host == 'www.googleapis.com' && path == '/youtube/v3/videos') {
+          final reqIds = (uri.queryParameters['id'] ?? '').split(',');
+          final catalog = <String, Map<String, dynamic>>{
+            'vid_web_old': {
+              'id': 'vid_web_old',
+              'snippet': {
+                'channelId': cid,
+                'channelTitle': 'Web Demo Creator',
+                'title': 'Video Lama 2 Hari Lalu',
+                'publishedAt': '2026-11-14T10:00:00Z',
+                'liveBroadcastContent': 'none',
+                'thumbnails': {'high': {'url': 'https://i.ytimg.com/vi/vid_web_old/hqdefault.jpg'}},
+              },
+              'statistics': {'viewCount': '100', 'likeCount': '5'},
+              'contentDetails': {'duration': 'PT10M'},
+            },
+            'vid_web_fresh': {
+              'id': 'vid_web_fresh',
+              'snippet': {
+                'channelId': cid,
+                'channelTitle': 'Web Demo Creator',
+                'title': 'Video Terbaru Hari Ini',
+                'publishedAt': '2026-11-16T06:00:00Z',
+                'liveBroadcastContent': 'none',
+                'thumbnails': {'high': {'url': 'https://i.ytimg.com/vi/vid_web_fresh/hqdefault.jpg'}},
+              },
+              'statistics': {'viewCount': '250', 'likeCount': '20'},
+              'contentDetails': {'duration': 'PT12M'},
+            },
+            'vid_stream_fresh': {
+              'id': 'vid_stream_fresh',
+              'snippet': {
+                'channelId': cid,
+                'channelTitle': 'Web Demo Creator',
+                'title': 'Live Stream VOD Hari Ini',
+                'publishedAt': '2026-11-16T07:00:00Z',
+                'liveBroadcastContent': 'none',
+                'thumbnails': {'high': {'url': 'https://i.ytimg.com/vi/vid_stream_fresh/hqdefault.jpg'}},
+              },
+              'statistics': {'viewCount': '400', 'likeCount': '45'},
+              'contentDetails': {'duration': 'PT1H30M'},
+            },
+          };
+          return (
+            statusCode: 200,
+            body: jsonEncode({
+              'items': [
+                for (final id in reqIds)
+                  if (catalog.containsKey(id)) catalog[id],
+              ],
+            }),
+          );
+        }
+        if (host == 'www.youtube.com' && path == '/feeds/videos.xml') {
+          return (statusCode: 404, body: '');
+        }
+        if (host == 'www.youtube.com' && path == '/channel/$cid/videos') {
+          return (
+            statusCode: 200,
+            body: showNewOnWeb ? videosHtmlAfter : videosHtmlBefore,
+          );
+        }
+        if (host == 'www.youtube.com' && path == '/channel/$cid/streams') {
+          return (statusCode: 200, body: streamsHtmlAfter);
+        }
+        return (statusCode: 404, body: '{}');
+      }
+
+      await HttpOverrides.runZoned(
+        () async {
+          await tester.pumpWidget(const PersonalYouTubeApp());
+          await tester.pumpAndSettle();
+
+          await tester.tap(find.byTooltip('Pengaturan API & Sync'));
+          await tester.pumpAndSettle();
+          final dialogFields = find.descendant(
+            of: find.byType(AlertDialog),
+            matching: find.byType(TextField),
+          );
+          await tester.enterText(dialogFields.at(0), 'AIzaTestWebFallback');
+          await tester.enterText(dialogFields.at(2), '');
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('Simpan & Sync Sekarang'));
+          await tester.pumpAndSettle();
+
+          await tester.tap(find.byTooltip('Tambah Channel'));
+          await tester.pumpAndSettle();
+          final addField = find
+              .descendant(
+                of: find.byType(AlertDialog),
+                matching: find.byType(TextField),
+              )
+              .first;
+          await tester.enterText(addField, '@webdemo');
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('Tambah'));
+          await tester.pumpAndSettle();
+
+          expect(find.text('Video Lama 2 Hari Lalu'), findsOneWidget);
+
+          showNewOnWeb = true;
+          await tester.tap(find.byTooltip('Refresh YouTube'));
+          await tester.pumpAndSettle();
+
+          expect(find.text('Video Terbaru Hari Ini'), findsOneWidget);
+          expect(find.text('Live Stream VOD Hari Ini'), findsOneWidget);
+          expect(tester.takeException(), isNull);
+        },
+        createHttpClient: (_) =>
+            _TestBackendHttpClient((_, _) => {}, rawHandler: handleRaw),
+      );
+    },
+  );
 }
 
 class _TestBackendHttpClient implements HttpClient {
